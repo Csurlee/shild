@@ -7,7 +7,7 @@ plugin.py's module docstring for the phase-1 read-only boundary.
 import supybot
 from supybot import world
 
-__version__ = "1.0"
+__version__ = "1.1"
 __author__ = supybot.authors.unknown
 __contributors__ = {}
 __url__ = "https://github.com/Csurlee/shild"

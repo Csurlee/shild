@@ -61,40 +61,87 @@ say() { echo "==> $*"; }
 # --------------------------------------------------------------------
 # 1. Preflight
 # --------------------------------------------------------------------
+# Note on scope: this installs Limnoria itself (the IRC bot framework
+# shild's plugins run under), NOT just shild's own code -- via
+# `pip install -e ".[bot]"` in section 3 below, which pulls the
+# `limnoria` package as a pinned dependency (see pyproject.toml's `bot`
+# extra). Everything lands inside this install's own .venv, never a
+# system-wide Limnoria package, so it can't collide with anything else
+# on the box and always matches the exact version shild's plugins were
+# tested against.
 say "Checking prerequisites..."
 
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "python3 not found. Install Python 3.11+ first." >&2
-    exit 1
-fi
+# Try newest-first so a distro that ships an old default `python3` (e.g.
+# Ubuntu 22.04's 3.10) but also offers an installable newer interpreter
+# (python3.11/3.12/3.13, common on Debian/Ubuntu/Fedora/openSUSE/Arch)
+# still works without the user having to know which binary to name.
+PYTHON_BIN=""
+for candidate in python3.13 python3.12 python3.11 python3; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        ver_ok=$("$candidate" -c 'import sys; print(1 if sys.version_info >= (3, 11) else 0)' 2>/dev/null || echo 0)
+        if [ "$ver_ok" = "1" ]; then
+            PYTHON_BIN="$candidate"
+            break
+        fi
+    fi
+done
 
-PY_VERSION=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
-PY_OK=$(python3 -c 'import sys; print(1 if sys.version_info >= (3, 11) else 0)')
-if [ "$PY_OK" != "1" ]; then
-    echo "python3 is $PY_VERSION; shild-py needs 3.11 or newer." >&2
+if [ -z "$PYTHON_BIN" ]; then
+    echo "No Python 3.11+ interpreter found (checked python3.13, python3.12, python3.11, python3)." >&2
+    echo "Install one via your distro's package manager, then re-run:" >&2
+    echo "  Debian/Ubuntu:    sudo apt install python3.12 python3.12-venv" >&2
+    echo "  Fedora/RHEL/Rocky: sudo dnf install python3.12" >&2
+    echo "  Arch/Manjaro:      sudo pacman -S python" >&2
+    echo "  openSUSE:          sudo zypper install python312" >&2
+    echo "  Alpine:            sudo apk add python3" >&2
     exit 1
 fi
-say "python3 $PY_VERSION OK"
+PY_VERSION=$("$PYTHON_BIN" -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+say "Using $PYTHON_BIN ($PY_VERSION)"
+
+# Detect the system package manager -- covers, in order, Debian/Ubuntu
+# and derivatives (apt), Fedora/current RHEL/Rocky/Alma (dnf), older
+# RHEL/CentOS 7 (yum), Arch/Manjaro (pacman), openSUSE (zypper), and
+# Alpine (apk). Each needs a different name for "give me venv support
+# for this specific Python" (or, on several of them, venv is already
+# bundled with the interpreter package and there's nothing extra to
+# install at all) -- PKG_VENV is intentionally left blank in those
+# cases rather than guessing a package name that doesn't exist.
+PKG_MANAGER=""
+PKG_INSTALL=""
+PKG_VENV=""
+PY_MINOR="${PY_VERSION#*.}"
+if command -v apt >/dev/null 2>&1; then
+    PKG_MANAGER="apt"; PKG_INSTALL="sudo apt install -y"
+    PKG_VENV="${PYTHON_BIN}-venv"   # Debian/Ubuntu split venv out per-version
+elif command -v dnf >/dev/null 2>&1; then
+    PKG_MANAGER="dnf"; PKG_INSTALL="sudo dnf install -y"   # venv bundled in python3
+elif command -v yum >/dev/null 2>&1; then
+    PKG_MANAGER="yum"; PKG_INSTALL="sudo yum install -y"   # venv bundled in python3
+elif command -v pacman >/dev/null 2>&1; then
+    PKG_MANAGER="pacman"; PKG_INSTALL="sudo pacman -S --needed --noconfirm"   # bundled
+elif command -v zypper >/dev/null 2>&1; then
+    PKG_MANAGER="zypper"; PKG_INSTALL="sudo zypper install -y"   # bundled
+elif command -v apk >/dev/null 2>&1; then
+    PKG_MANAGER="apk"; PKG_INSTALL="sudo apk add"
+    PKG_VENV="py3-virtualenv"   # Alpine's python3 package doesn't bundle venv
+fi
 
 MISSING_PKGS=()
 command -v git >/dev/null 2>&1 || MISSING_PKGS+=("git")
 command -v curl >/dev/null 2>&1 || MISSING_PKGS+=("curl")
-if ! python3 -c "import venv" >/dev/null 2>&1; then
-    MISSING_PKGS+=("python3-venv")
+if ! "$PYTHON_BIN" -c "import venv" >/dev/null 2>&1 && [ -n "$PKG_VENV" ]; then
+    MISSING_PKGS+=("$PKG_VENV")
 fi
 
 if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
     say "Missing: ${MISSING_PKGS[*]}"
-    if command -v apt >/dev/null 2>&1; then
-        CMD="sudo apt install -y ${MISSING_PKGS[*]}"
-    elif command -v dnf >/dev/null 2>&1; then
-        CMD="sudo dnf install -y ${MISSING_PKGS[*]/python3-venv/python3}"
-    elif command -v pacman >/dev/null 2>&1; then
-        CMD="sudo pacman -S --needed ${MISSING_PKGS[*]/python3-venv/python}"
-    else
+    if [ -z "$PKG_MANAGER" ]; then
+        echo "Couldn't detect a supported package manager (apt/dnf/yum/pacman/zypper/apk)." >&2
         echo "Please install manually: ${MISSING_PKGS[*]}" >&2
         exit 1
     fi
+    CMD="$PKG_INSTALL ${MISSING_PKGS[*]}"
     echo "About to run:"
     echo "    $CMD"
     read -r -p "Proceed? [y/N] " REPLY
@@ -136,18 +183,27 @@ cd "$INSTALL_DIR"
 # --------------------------------------------------------------------
 # 3. Venv + dependencies
 # --------------------------------------------------------------------
-say "Setting up the virtual environment..."
+say "Setting up the virtual environment ($PYTHON_BIN)..."
 if [ ! -d .venv ]; then
-    run python3 -m venv .venv
+    run "$PYTHON_BIN" -m venv .venv
 fi
 # shellcheck disable=SC1091
 if [ "$DRY_RUN" != "1" ]; then
     source .venv/bin/activate
 fi
 
-say "Installing shild-py (this does NOT install torch by default)..."
+say "Installing shild + Limnoria (the IRC bot framework) into the venv..."
+say "(this does NOT install torch by default -- pass --with-training if you want it)"
 run pip install --upgrade pip
 run pip install -e ".[bot]"
+
+if [ "$DRY_RUN" != "1" ]; then
+    if ! python -c "import supybot" >/dev/null 2>&1; then
+        echo "Limnoria (supybot) failed to import after install -- something went wrong above." >&2
+        exit 1
+    fi
+    say "Limnoria installed: $(python -c 'import supybot.conf as conf; print(conf.version)')"
+fi
 
 if [ "$WITH_TRAINING" = "1" ]; then
     say "Installing torch (CPU wheel) for shildml.train..."
