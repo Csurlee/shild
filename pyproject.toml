@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shildml"
+version = "1.0"
+description = "SHILD's AI-decision fusion and ML classifier — pure Python, no IRC dependency"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+]
+
+[project.optional-dependencies]
+train = [
+    "torch",
+]
+bot = [
+    "limnoria",
+    "aiohttp",
+]
+
+[tool.setuptools.packages.find]
+include = ["shildml*"]
+
+[project.scripts]
+shildml-train = "shildml.train:main"
+shildml-evaluate = "shildml.evaluate:main"
+shildml-replay = "shildml.replay:main"

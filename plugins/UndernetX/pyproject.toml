@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools"]
+
+[project]
+name = "limnoria-undernetx"
+version = "2020.02.24+git"
+authors = [
+    { name = "Ken Spencer" },
+    { name = "oddluck <oddluck@riseup.net>" },
+]
+readme = "README.md"
+dependencies = [
+    "limnoria",
+]
+classifiers = [
+    'Environment :: Plugins',
+    'Programming Language :: Python :: 3',
+    'Topic :: Communications :: Chat',
+]
+
+[project.entry-points.'limnoria.plugins']
+UndernetX = "limnoria_undernetx"
+
+[tool.setuptools.package-dir]
+"limnoria_undernetx" = "."
+"limnoria_undernetx.local" = "local/"
+
+[tool.setuptools.package-data]
+"limnoria_undernetx" = ["locales/*.po"]

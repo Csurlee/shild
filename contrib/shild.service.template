@@ -1,0 +1,15 @@
+[Unit]
+Description=shild-py IRC guardian bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__INSTALL_DIR__/runtime
+ExecStart=__INSTALL_DIR__/.venv/bin/supybot shildpy.conf
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
