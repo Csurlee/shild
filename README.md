@@ -28,8 +28,9 @@ opped) it can't do for you.
 
 ## Version
 
-1.4 -- see [`CHANGELOG.md`](CHANGELOG.md).
+1.5 -- see [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License
 
-MIT -- see [LICENSE](LICENSE).
+MIT for this project's own code -- see [LICENSE](LICENSE). A few files are vendored from other
+projects under their own licenses; see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
