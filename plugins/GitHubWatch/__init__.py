@@ -6,7 +6,7 @@ opened issues, and opened/merged pull requests to a channel.
 import supybot
 from supybot import world
 
-__version__ = "1.5"
+__version__ = "1.6"
 __author__ = supybot.authors.unknown
 __contributors__ = {}
 __url__ = "https://github.com/Csurlee/shild"

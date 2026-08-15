@@ -482,12 +482,26 @@ def main() -> None:
     # do376 handler checks for a username+password before attempting
     # login and just logs a warning otherwise; Services' password command
     # equivalent below is simply skipped when no password is configured.
+    #
+    # noJoinsUntilIdentified/noJoinsUntilAuthed (2026-08-15): only turned
+    # ON when real credentials are actually configured for that network.
+    # With no credentials, self.identified/being-identified can never
+    # become True, so forcing this on would silently block every join on
+    # that network forever -- the exact trap already documented for
+    # UndernetX above. But once real credentials ARE present, joining
+    # BEFORE identify/auth completes is its own real problem: a channel
+    # that auto-ops on join only if you're already identified (a common
+    # ChanServ/X access-list setup) will let the bot in unopped, and it
+    # won't get op until a later rejoin. Gating joins on
+    # identify/auth-first avoids that race entirely.
     for n in spec.networks:
         if n.services_type == "nickserv":
             nick, password = _load_nickserv_secrets(n.name, spec.nick)
             if password:
                 conf.supybot.plugins.Services.nicks.get(":" + n.name).setValue([nick])
                 supybot.plugins.Services.config.registerNick(nick, password)
+            conf.supybot.plugins.Services.noJoinsUntilIdentified.get(
+                ":" + n.name).setValue(bool(password))
             for channel in n.op_channels:
                 conf.supybot.plugins.Services.ChanServ.op.get(channel).setValue(True)
         elif n.services_type == "undernet_x":
@@ -496,11 +510,8 @@ def main() -> None:
                 conf.supybot.plugins.UndernetX.auth.username.setValue(username)
             if password:
                 conf.supybot.plugins.UndernetX.auth.password.setValue(password)
-            # Upstream default True would silently block EVERY join on
-            # this network forever while credentials are blank (since
-            # self.identified can never become True without them) --
-            # overridden so join coverage is unaffected either way.
-            conf.supybot.plugins.UndernetX.auth.noJoinsUntilAuthed.setValue(False)
+            conf.supybot.plugins.UndernetX.auth.noJoinsUntilAuthed.setValue(
+                bool(username and password))
 
     # Arbitrary escape hatch: any registry dotted-path this script's own
     # schema doesn't cover. Applied last so it can override anything set
