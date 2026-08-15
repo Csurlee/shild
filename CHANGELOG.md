@@ -1,3 +1,7 @@
+## 1.3
+
+Initial public release.
+
 ## 1.2
 
 Initial public release.

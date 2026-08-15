@@ -7,7 +7,7 @@ module docstring for the motivating example and design.
 import supybot
 from supybot import world
 
-__version__ = "1.2"
+__version__ = "1.3"
 __author__ = supybot.authors.unknown
 __contributors__ = {}
 __url__ = "https://github.com/Csurlee/shild"

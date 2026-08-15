@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shildml"
-version = "1.2"
+version = "1.3"
 description = "SHILD's AI-decision fusion and ML classifier — pure Python, no IRC dependency"
 requires-python = ">=3.11"
 dependencies = [

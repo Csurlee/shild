@@ -37,7 +37,7 @@ import supybot.world as world
 
 # Use this for the version of this plugin.  You may wish to put a CVS keyword
 # in here if you\'re keeping the plugin in CVS or some similar system.
-__version__ = "1.2"
+__version__ = "1.3"
 
 __author__ = supybot.authors.jemfinch
 __maintainer__ = supybot.authors.limnoria_core

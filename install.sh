@@ -155,14 +155,19 @@ fi
 # 2. Fetch
 # --------------------------------------------------------------------
 if [ -d "$INSTALL_DIR/.git" ]; then
-    say "Existing checkout found at $INSTALL_DIR -- updating."
+    # Hard reset to origin/<branch> rather than `git pull` -- this
+    # directory is meant to always mirror the release, never carry local
+    # commits, so there's nothing to merge. A plain `pull` also breaks
+    # outright if the checkout has no configured upstream tracking (e.g.
+    # a prior run that didn't set one) or if the remote's history was
+    # ever rewritten (a force-push, which this project's own release
+    # process can legitimately do) -- both real cases hit live, not
+    # hypothetical. runtime/ is gitignored, so this never touches your
+    # existing install.json/secrets.json/shildpy.conf.
+    UPDATE_BRANCH="${BRANCH:-main}"
+    say "Existing checkout found at $INSTALL_DIR -- updating to origin/$UPDATE_BRANCH."
     run git -C "$INSTALL_DIR" fetch origin
-    if [ -n "$BRANCH" ]; then
-        run git -C "$INSTALL_DIR" checkout "$BRANCH"
-        run git -C "$INSTALL_DIR" pull origin "$BRANCH"
-    else
-        run git -C "$INSTALL_DIR" pull
-    fi
+    run git -C "$INSTALL_DIR" checkout -B "$UPDATE_BRANCH" "origin/$UPDATE_BRANCH"
 elif [ -d "$INSTALL_DIR" ] && [ -f "$INSTALL_DIR/pyproject.toml" ]; then
     say "Found an existing (non-git) checkout at $INSTALL_DIR -- using it as-is."
 elif [ -d "$INSTALL_DIR" ] && [ -n "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]; then
