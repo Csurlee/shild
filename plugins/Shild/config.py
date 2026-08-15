@@ -442,26 +442,30 @@ conf.registerGlobalValue(
 )
 conf.registerGlobalValue(
     Shild.scamalytics, "dailyLimit",
-    registry.PositiveInteger(150, _(
+    registry.PositiveInteger(161, _(
         """Scamalytics' free tier is 5,000 credits/MONTH, not daily, and
         unused credits do not roll over -- BudgetManager only supports
-        daily/lifetime windows, so this is a deliberately conservative
-        daily approximation (150/day * 30 = 4,500, leaving headroom under
-        5,000 even on a 31-day month) rather than an exact monthly cap.
-        Raise only alongside a paid plan.""")),
+        daily/lifetime windows, so this is a daily approximation of that
+        cap rather than an exact monthly one. 161/day is the tightest
+        daily rate that still guarantees the monthly total never exceeds
+        5,000 even in a worst-case 31-day month (161*31=4,991); raised
+        2026-08-15 from the earlier, more conservative 150/day (4,500/mo)
+        once real usage showed 150 was being hit well before end of day.
+        Raise further only alongside a paid plan.""")),
 )
 conf.registerGlobalValue(
     Shild.scamalytics, "dailyLimit2",
-    registry.PositiveInteger(150, _(
+    registry.PositiveInteger(161, _(
         """Same budget shape as scamalytics.dailyLimit, but for the OPTIONAL
         second Scamalytics account (scamalytics_username2/scamalytics_key2
         in the local secrets file) ReputationGatherer falls back to once
         the primary account's own daily budget is exhausted -- see
         reputation.py's module docstring. Two independent free-tier
         accounts each get their own 5,000/month allowance, so this defaults
-        to the same conservative 150/day approximation as the primary.
-        Meaningless (never consulted) if no second account is configured;
-        this is the counter for it, not a toggle.""")),
+        to the same 161/day approximation as the primary (see its
+        docstring for the exact math). Meaningless (never consulted) if no
+        second account is configured; this is the counter for it, not a
+        toggle.""")),
 )
 
 conf.registerGlobalValue(
@@ -486,6 +490,69 @@ conf.registerGlobalValue(
         are deliberately never a registry value: an admin's @config dump
         must never be able to leak these -- only
         this path string is.""")),
+)
+
+conf.registerGroup(Shild, "geoip")
+conf.registerGlobalValue(
+    Shild.geoip, "enabled",
+    registry.Boolean(True, _(
+        """Whether to resolve a host's country from a local, offline MMDB
+        file (plugins/Shild/geoip.py, DB-IP City Lite, CC BY 4.0) instead
+        of relying solely on ip-api.com's countryCode -- added 2026-08-15.
+        Does NOT replace ip-api.com itself: proxy/hosting/ASN/ISP have no
+        free local equivalent, so that call still happens every time. This
+        only changes where "country" comes from -- local first (no
+        network, no budget, works even when ip-api is down/rate-limited),
+        falling back to ip-api's own countryCode if the local database is
+        missing (e.g. scripts/update_geoip_db.py hasn't been run yet) or
+        has no entry for that IP. Silently skipped (not an error) if
+        "geoip.dbPath" doesn't exist -- same fail-open convention as every
+        other optional evidence source in this codebase.""")),
+)
+conf.registerGlobalValue(
+    Shild.geoip, "dbPath",
+    registry.String("geoip/dbip-city-lite.mmdb", _(
+        """Path to the local MMDB file used for offline country lookups --
+        see scripts/update_geoip_db.py to download/refresh it. Resolved
+        relative to the bot's own working directory (runtime/), same
+        convention as budgetPath/secretsPath below -- do NOT prefix with
+        "runtime/" (see their docstrings for the double-"runtime/" bug
+        this exact mistake caused before).""")),
+)
+
+conf.registerGroup(Shild, "blocklist")
+conf.registerGlobalValue(
+    Shild.blocklist, "enabled",
+    registry.Boolean(True, _(
+        """Whether to check a host's resolved IP against locally-downloaded
+        FireHOL community IP blocklists (plugins/Shild/blocklist.py) --
+        added 2026-08-15. A REAL hard evidence signal (unlike the geoip.*
+        group above, which is descriptive only) -- open-proxy and botnet
+        C&C membership are treated the same as a DNSBL hit
+        (hard_corroborates_bad() in shildml/evidence.py). Free, no key, no
+        rate limit, entirely offline once downloaded. Silently skipped
+        (not an error) if "blocklist.dir" has no list files yet -- see
+        scripts/update_blocklists.py.""")),
+)
+conf.registerGlobalValue(
+    Shild.blocklist, "dir",
+    registry.String("blocklists", _(
+        """Directory containing the downloaded blocklist files (one
+        "<name>.txt" per entry in "blocklist.lists") -- see
+        scripts/update_blocklists.py. Resolved relative to the bot's own
+        working directory (runtime/), same convention as geoip.dbPath
+        above -- do NOT prefix with "runtime/".""")),
+)
+conf.registerGlobalValue(
+    Shild.blocklist, "lists",
+    registry.SpaceSeparatedListOfStrings(
+        ["socks_proxy_30d", "sslproxies_30d", "cybercrime", "feodo_badips"], _(
+        """Which curated FireHOL lists to actually check (by name -- must
+        match a "<name>.txt" file in "blocklist.dir", written by
+        scripts/update_blocklists.py's own LISTS tuple). Deliberately a
+        small, specific set of low-cardinality sources, not one of
+        FireHOL's giant multi-million-IP composite aggregates -- see that
+        script's module docstring for why.""")),
 )
 
 conf.registerGlobalValue(

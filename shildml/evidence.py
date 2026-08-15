@@ -51,6 +51,18 @@ see fusion.py's `_apply_escalation` docstring for exactly how each is
 gated and why they're kept separate from the original, more conservative
 escalation path.
 
+**FireHOL blocklist hits (2026-08-15).** `blocklist_hits` -- names of
+locally-downloaded, curated FireHOL community IP blocklists (open SOCKS/
+SSL proxies, known botnet C&C trackers -- see plugins/Shild/blocklist.py
+and scripts/update_blocklists.py) that contain the host's IP. Treated the
+same as `dnsbl_hits`: a hard, independent signal (counted in
+`hard_corroborates_bad()` and `extreme_corroborates_bad()`'s signal count),
+never geo/infrastructure-classification like `geo_proxy`. Deliberately a
+small, curated set of specific low-cardinality sources (a few thousand
+IPs total), not FireHOL's giant multi-million-IP composite aggregates --
+this box has only ~3.4GB RAM, and those single-purpose sources have a
+much lower false-positive profile than a blind aggregate anyway.
+
 =====================================================================
 CRITICAL — evidence must NEVER become a classifier feature.
 =====================================================================
@@ -212,6 +224,7 @@ class HostEvidence:
     dronebl_type: Optional[str] = None
     is_bogon: bool = False
     is_tor_exit: bool = False
+    blocklist_hits: list[str] = field(default_factory=list)
 
     geo_proxy: bool = False
     geo_hosting: bool = False
@@ -248,6 +261,8 @@ class HostEvidence:
         if self.dronebl_type:
             return True
         if self.is_bogon:
+            return True
+        if self.blocklist_hits:
             return True
         if self.abuseipdb_score is not None and self.abuseipdb_score >= th.abuseipdb_bad:
             return True
@@ -293,6 +308,8 @@ class HostEvidence:
         if self.dronebl_type:
             hard_signal_count += 1
         if self.is_bogon:
+            hard_signal_count += 1
+        if self.blocklist_hits:
             hard_signal_count += 1
         if self.open_proxy_ports:
             hard_signal_count += 1
@@ -381,6 +398,8 @@ class HostEvidence:
             parts.append(f"DroneBL: {self.dronebl_type}")
         if self.dnsbl_hits:
             parts.append(f"DNSBL listed on: {', '.join(self.dnsbl_hits)}")
+        if self.blocklist_hits:
+            parts.append(f"blocklisted on: {', '.join(self.blocklist_hits)}")
         if self.is_bogon:
             parts.append("BOGON source address (spoofed or misconfigured)")
         if self.is_tor_exit:
@@ -422,6 +441,7 @@ class HostEvidence:
             "dronebl_type": self.dronebl_type,
             "is_bogon": self.is_bogon,
             "is_tor_exit": self.is_tor_exit,
+            "blocklist_hits": list(self.blocklist_hits),
             "geo_proxy": self.geo_proxy,
             "geo_hosting": self.geo_hosting,
             "asn": self.asn,
@@ -453,6 +473,7 @@ class HostEvidence:
             dronebl_type=d.get("dronebl_type"),
             is_bogon=bool(d.get("is_bogon", False)),
             is_tor_exit=bool(d.get("is_tor_exit", False)),
+            blocklist_hits=list(d.get("blocklist_hits") or []),
             geo_proxy=bool(d.get("geo_proxy", False)),
             geo_hosting=bool(d.get("geo_hosting", False)),
             asn=d.get("asn"),

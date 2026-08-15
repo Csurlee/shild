@@ -69,6 +69,11 @@ def _gatherer(tmp_path, **cfg_kwargs) -> ReputationGatherer:
         str(tmp_path / "budget.json"),
         limits={"ipapi": ProviderLimits(rate_per_min=1000)},
     )
+    # Off by default here so every pre-existing test in this file stays
+    # hermetic/unaffected by the 2026-08-15 local-geoip/blocklist additions;
+    # the dedicated tests below opt back in explicitly.
+    cfg_kwargs.setdefault("geoip_enabled", False)
+    cfg_kwargs.setdefault("blocklist_enabled", False)
     return ReputationGatherer(ReputationConfig(**cfg_kwargs), budget)
 
 
@@ -142,6 +147,207 @@ def test_dronebl_hit_populates_evidence(tmp_path, monkeypatch):
     assert ev.verdict() == "corroborates"
     assert "dronebl" in ev.checks_run
     assert ev.isp == "Some ISP"
+
+
+def test_geoip_local_country_used_when_available(tmp_path, monkeypatch):
+    """2026-08-15: local MMDB lookup takes priority over ip-api's own
+    countryCode when both are available -- see reputation.py's _geo/
+    _apply_geo for why (no network/budget dependency for country)."""
+    async def resolve_ip(loop, host, timeout):
+        return "203.0.113.9"
+
+    async def clean(loop, ip, timeout):
+        return False, False
+
+    async def ipapi_says_us(session, ip, timeout):
+        return {"status": "success", "proxy": False, "hosting": False,
+                "as": "AS1234", "isp": "Some ISP", "countryCode": "US"}, False
+
+    monkeypatch.setattr(reputation, "_resolve_ip", resolve_ip)
+    monkeypatch.setattr(reputation, "_check_dronebl", clean)
+    monkeypatch.setattr(reputation, "_check_spamcop", clean)
+    monkeypatch.setattr(reputation, "_check_bogon", clean)
+    monkeypatch.setattr(reputation, "_check_torexit", clean)
+    monkeypatch.setattr(reputation, "_check_ircbl", clean)
+    monkeypatch.setattr(reputation, "_check_ipapi", ipapi_says_us)
+    monkeypatch.setattr(reputation.geoip, "lookup_country", lambda ip, path: "DE")
+
+    g = _gatherer(tmp_path, geoip_enabled=True, geoip_db_path="unused-in-this-test")
+
+    async def run():
+        return await g.gather(session=object(), host="203.0.113.9", account=None, allow_tier2=False)
+
+    ev = asyncio.run(run())
+    assert ev.country == "DE"  # local wins, not ip-api's "US"
+    assert "geoip_local" in ev.checks_run
+    assert ev.isp == "Some ISP"  # ip-api's own fields are untouched
+
+
+def test_geoip_falls_back_to_ipapi_when_local_unavailable(tmp_path, monkeypatch):
+    """A fresh install (or a lookup miss) should never lose country data --
+    ip-api's countryCode is still the fallback."""
+    async def resolve_ip(loop, host, timeout):
+        return "203.0.113.9"
+
+    async def clean(loop, ip, timeout):
+        return False, False
+
+    async def ipapi_says_fr(session, ip, timeout):
+        return {"status": "success", "proxy": False, "hosting": False,
+                "as": "AS1234", "isp": "Some ISP", "countryCode": "FR"}, False
+
+    monkeypatch.setattr(reputation, "_resolve_ip", resolve_ip)
+    monkeypatch.setattr(reputation, "_check_dronebl", clean)
+    monkeypatch.setattr(reputation, "_check_spamcop", clean)
+    monkeypatch.setattr(reputation, "_check_bogon", clean)
+    monkeypatch.setattr(reputation, "_check_torexit", clean)
+    monkeypatch.setattr(reputation, "_check_ircbl", clean)
+    monkeypatch.setattr(reputation, "_check_ipapi", ipapi_says_fr)
+    monkeypatch.setattr(reputation.geoip, "lookup_country", lambda ip, path: None)
+
+    g = _gatherer(tmp_path, geoip_enabled=True, geoip_db_path="unused-in-this-test")
+
+    async def run():
+        return await g.gather(session=object(), host="203.0.113.9", account=None, allow_tier2=False)
+
+    ev = asyncio.run(run())
+    assert ev.country == "FR"
+    assert "geoip_local_unavailable" in ev.checks_failed
+
+
+def test_geoip_disabled_never_calls_local_lookup(tmp_path, monkeypatch):
+    async def resolve_ip(loop, host, timeout):
+        return "203.0.113.9"
+
+    async def clean(loop, ip, timeout):
+        return False, False
+
+    async def ipapi_says_jp(session, ip, timeout):
+        return {"status": "success", "proxy": False, "hosting": False,
+                "as": "AS1234", "isp": "Some ISP", "countryCode": "JP"}, False
+
+    def boom(ip, path):
+        raise AssertionError("must not call local geoip lookup when disabled")
+
+    monkeypatch.setattr(reputation, "_resolve_ip", resolve_ip)
+    monkeypatch.setattr(reputation, "_check_dronebl", clean)
+    monkeypatch.setattr(reputation, "_check_spamcop", clean)
+    monkeypatch.setattr(reputation, "_check_bogon", clean)
+    monkeypatch.setattr(reputation, "_check_torexit", clean)
+    monkeypatch.setattr(reputation, "_check_ircbl", clean)
+    monkeypatch.setattr(reputation, "_check_ipapi", ipapi_says_jp)
+    monkeypatch.setattr(reputation.geoip, "lookup_country", boom)
+
+    g = _gatherer(tmp_path, geoip_enabled=False)
+
+    async def run():
+        return await g.gather(session=object(), host="203.0.113.9", account=None, allow_tier2=False)
+
+    ev = asyncio.run(run())
+    assert ev.country == "JP"
+    assert "geoip_local" not in ev.checks_run
+    assert "geoip_local_unavailable" not in ev.checks_failed
+
+
+def test_blocklist_hit_populates_evidence(tmp_path, monkeypatch):
+    """2026-08-15: local FireHOL blocklist membership -- a real hard
+    evidence signal, unlike geoip's descriptive-only country."""
+    async def resolve_ip(loop, host, timeout):
+        return "203.0.113.9"
+
+    async def clean(loop, ip, timeout):
+        return False, False
+
+    async def ipapi_clean(session, ip, timeout):
+        return {"status": "success", "proxy": False, "hosting": False,
+                "as": "AS1234", "isp": "Some ISP", "countryCode": "US"}, False
+
+    monkeypatch.setattr(reputation, "_resolve_ip", resolve_ip)
+    monkeypatch.setattr(reputation, "_check_dronebl", clean)
+    monkeypatch.setattr(reputation, "_check_spamcop", clean)
+    monkeypatch.setattr(reputation, "_check_bogon", clean)
+    monkeypatch.setattr(reputation, "_check_torexit", clean)
+    monkeypatch.setattr(reputation, "_check_ircbl", clean)
+    monkeypatch.setattr(reputation, "_check_ipapi", ipapi_clean)
+    monkeypatch.setattr(reputation.blocklist, "any_list_present", lambda lists: True)
+    monkeypatch.setattr(reputation.blocklist, "lookup", lambda ip, lists: ["cybercrime"])
+
+    g = _gatherer(tmp_path, blocklist_enabled=True, blocklist_dir="unused-in-this-test",
+                  blocklist_names=("cybercrime",))
+
+    async def run():
+        return await g.gather(session=object(), host="203.0.113.9", account=None, allow_tier2=False)
+
+    ev = asyncio.run(run())
+    assert ev.blocklist_hits == ["cybercrime"]
+    assert ev.hard_corroborates_bad()
+    assert "blocklist" in ev.checks_run
+
+
+def test_blocklist_no_files_downloaded_yet_fails_open(tmp_path, monkeypatch):
+    async def resolve_ip(loop, host, timeout):
+        return "203.0.113.9"
+
+    async def clean(loop, ip, timeout):
+        return False, False
+
+    async def ipapi_clean(session, ip, timeout):
+        return {"status": "success", "proxy": False, "hosting": False,
+                "as": "AS1234", "isp": "Some ISP", "countryCode": "US"}, False
+
+    monkeypatch.setattr(reputation, "_resolve_ip", resolve_ip)
+    monkeypatch.setattr(reputation, "_check_dronebl", clean)
+    monkeypatch.setattr(reputation, "_check_spamcop", clean)
+    monkeypatch.setattr(reputation, "_check_bogon", clean)
+    monkeypatch.setattr(reputation, "_check_torexit", clean)
+    monkeypatch.setattr(reputation, "_check_ircbl", clean)
+    monkeypatch.setattr(reputation, "_check_ipapi", ipapi_clean)
+
+    g = _gatherer(tmp_path, blocklist_enabled=True,
+                  blocklist_dir=str(tmp_path / "nonexistent-blocklists-dir"))
+
+    async def run():
+        return await g.gather(session=object(), host="203.0.113.9", account=None, allow_tier2=False)
+
+    ev = asyncio.run(run())
+    assert ev.blocklist_hits == []
+    assert "blocklist_unavailable" in ev.checks_failed
+    assert ev.verdict() != "corroborates"  # must not falsely corroborate on missing data
+
+
+def test_blocklist_disabled_never_checks(tmp_path, monkeypatch):
+    async def resolve_ip(loop, host, timeout):
+        return "203.0.113.9"
+
+    async def clean(loop, ip, timeout):
+        return False, False
+
+    async def ipapi_clean(session, ip, timeout):
+        return {"status": "success", "proxy": False, "hosting": False,
+                "as": "AS1234", "isp": "Some ISP", "countryCode": "US"}, False
+
+    def boom(*a, **kw):
+        raise AssertionError("must not check blocklists when disabled")
+
+    monkeypatch.setattr(reputation, "_resolve_ip", resolve_ip)
+    monkeypatch.setattr(reputation, "_check_dronebl", clean)
+    monkeypatch.setattr(reputation, "_check_spamcop", clean)
+    monkeypatch.setattr(reputation, "_check_bogon", clean)
+    monkeypatch.setattr(reputation, "_check_torexit", clean)
+    monkeypatch.setattr(reputation, "_check_ircbl", clean)
+    monkeypatch.setattr(reputation, "_check_ipapi", ipapi_clean)
+    monkeypatch.setattr(reputation.blocklist, "any_list_present", boom)
+    monkeypatch.setattr(reputation.blocklist, "lookup", boom)
+
+    g = _gatherer(tmp_path, blocklist_enabled=False)
+
+    async def run():
+        return await g.gather(session=object(), host="203.0.113.9", account=None, allow_tier2=False)
+
+    ev = asyncio.run(run())
+    assert ev.blocklist_hits == []
+    assert "blocklist" not in ev.checks_run
+    assert "blocklist_unavailable" not in ev.checks_failed
 
 
 def test_ircbl_hit_populates_dnsbl_hits(tmp_path, monkeypatch):

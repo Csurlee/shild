@@ -209,6 +209,11 @@ class Shild(callbacks.Plugin):
                 scamalytics_key=secrets["scamalytics_key"],
                 scamalytics_username2=secrets["scamalytics_username2"],
                 scamalytics_key2=secrets["scamalytics_key2"],
+                geoip_enabled=self.registryValue("geoip.enabled"),
+                geoip_db_path=self.registryValue("geoip.dbPath"),
+                blocklist_enabled=self.registryValue("blocklist.enabled"),
+                blocklist_dir=self.registryValue("blocklist.dir"),
+                blocklist_names=tuple(self.registryValue("blocklist.lists")),
             ),
             self._budget,
         )

@@ -209,11 +209,82 @@ Lists every host on the ignore list.
 | `plugins.Shild.ipqs.enabled` | Boolean | `False` | Whether to call IPQualityScore. Ships off — the configured account has 0 usable free-tier credits. |
 | `plugins.Shild.ipqs.lifetimeLimit` | Positive integer | `1000` | IPQualityScore's free-tier allowance (lifetime, not daily). |
 | `plugins.Shild.scamalytics.enabled` | Boolean | `True` | Whether to call Scamalytics as a second Tier 2 check. Needs both a username and key; silently skipped otherwise. |
-| `plugins.Shild.scamalytics.dailyLimit` | Positive integer | `150` | Conservative daily approximation of Scamalytics' 5,000-credit/month free tier. |
-| `plugins.Shild.scamalytics.dailyLimit2` | Positive integer | `150` | Same, for an optional second Scamalytics account used only once the primary's daily budget is exhausted. |
+| `plugins.Shild.scamalytics.dailyLimit` | Positive integer | `161` | Daily approximation of Scamalytics' 5,000-credit/month free tier — 161/day is the tightest rate that still guarantees the monthly total never exceeds 5,000 even in a 31-day month. Raised 2026-08-15 from an earlier, more conservative 150/day after real usage hit that cap before end of day. |
+| `plugins.Shild.scamalytics.dailyLimit2` | Positive integer | `161` | Same, for an optional second Scamalytics account used only once the primary's daily budget is exhausted. |
 | `plugins.Shild.proxyscan.enabled` | Boolean | `True` | Whether to actively probe a joining host for open proxy ports (Tier 3). Connects to a third party's machine — qualitatively different from every other check. |
 | `plugins.Shild.proxyscan.connectTimeout` | Positive float | `2.0` | Per-port connect timeout (seconds). |
 | `plugins.Shild.proxyscan.overallTimeout` | Positive float | `6.0` | Hard deadline for the whole port scan regardless of port count. |
+| `plugins.Shild.geoip.enabled` | Boolean | `True` | Whether to resolve a host's country from a local, offline MMDB file instead of relying solely on ip-api.com. See "Local GeoIP database" below. |
+| `plugins.Shild.geoip.dbPath` | String | `geoip/dbip-city-lite.mmdb` | Path to the local MMDB file, resolved relative to `runtime/`. |
+| `plugins.Shild.blocklist.enabled` | Boolean | `True` | Whether to check a host's IP against local FireHOL blocklists (a real hard evidence signal). See "Local IP blocklists" below. |
+| `plugins.Shild.blocklist.dir` | String | `blocklists` | Directory containing the downloaded list files, resolved relative to `runtime/`. |
+| `plugins.Shild.blocklist.lists` | Space-separated strings | `socks_proxy_30d sslproxies_30d cybercrime feodo_badips` | Which curated FireHOL lists to check, by name. |
+
+### Local GeoIP database
+
+Added 2026-08-15. `plugins/Shild/geoip.py` resolves a joining host's **country** from a local,
+downloaded MMDB file (DB-IP City Lite, CC BY 4.0 — free, no API key, no rate limit) instead of
+depending on ip-api.com's network round trip for it. This does **not** remove the ip-api.com call
+itself — proxy/hosting/ASN/ISP detection has no free local equivalent, so that request still
+happens every time a host needs a Tier 1 check. Only country's *source* changes: local first (no
+network, no budget, still works if ip-api.com is slow/down/rate-limited for the day), falling back
+to ip-api's own `countryCode` if the local database is missing or has no entry for that IP.
+
+The database file isn't shipped (~130MB uncompressed) — download/refresh it with:
+
+```bash
+python scripts/update_geoip_db.py                 # download to runtime/geoip/dbip-city-lite.mmdb
+python scripts/update_geoip_db.py --check          # report age, exit 1 if missing/stale (>~5 weeks)
+```
+
+DB-IP's own City Lite database updates monthly; there's no harm in refreshing more often, so a
+weekly cron entry is reasonable (not installed automatically — add the line yourself, same as
+every other scheduled job in this project):
+
+```
+0 5 * * 0 cd /path/to/shild-py && .venv/bin/python scripts/update_geoip_db.py >> runtime/geoip_update.log 2>&1
+```
+
+If the file is missing entirely, `geoip.enabled` fails open (not an error) and every lookup falls
+straight back to ip-api.com's `countryCode`, exactly as before this feature existed.
+
+### Local IP blocklists
+
+Added 2026-08-15. Unlike the GeoIP database above, this **is** a real, new hard evidence signal —
+membership on a locally-downloaded [FireHOL](https://github.com/firehol/blocklist-ipsets) community
+IP blocklist is treated the same as a DNSBL hit (`hard_corroborates_bad()` in
+`shildml/evidence.py`), not merely descriptive. Free, no API key, no rate limit, entirely offline.
+
+Deliberately a small, curated set of specific, actively-maintained sources — **not** FireHOL's
+giant multi-million-IP composite aggregates (e.g. `firehol_proxies` alone is ~3.1M IPs, too much
+for this project's RAM-constrained deployment target and a much higher false-positive mix than the
+individually-named trackers below):
+
+| List | Source | What it tracks |
+|---|---|---|
+| `socks_proxy_30d` | socks-proxy.net | Open SOCKS proxies |
+| `sslproxies_30d` | sslproxies.org | Open SSL/HTTPS proxies |
+| `cybercrime` | cybercrime-tracker.net | Botnet command & control servers |
+| `feodo_badips` | abuse.ch Feodo Tracker | Feodo banking-trojan C&C IPs |
+
+Download/refresh:
+
+```bash
+python scripts/update_blocklists.py                # download to runtime/blocklists/
+python scripts/update_blocklists.py --check         # report status, exit 1 if missing/stale
+```
+
+These lists update far more often upstream than the GeoIP database (some every few minutes), and a
+refreshed file is picked up automatically on the very **next lookup** — no plugin reload or bot
+restart needed (`blocklist.py` checks the file's mtime on each lookup, unlike the mmdb reader).
+Still no harm running it hourly via cron (not installed automatically):
+
+```
+0 * * * * cd /path/to/shild-py && .venv/bin/python scripts/update_blocklists.py >> runtime/blocklists_update.log 2>&1
+```
+
+If no list files have been downloaded yet, `blocklist.enabled` fails open (not an error) — every
+lookup just finds nothing, same as before this feature existed.
 
 ### `worker.*` / `report.*`
 
@@ -237,7 +308,7 @@ Lists every host on the ignore list.
 | Live (re-read per event) | Needs `@reload Shild` | Needs a full restart |
 |---|---|---|
 | `thresholds.*` (incl. `classifierBanSecondaryFloor`) | `evidence.abuseipdbThreshold` / `ipqsThreshold` / `scamalyticsThreshold` / `requireHardEvidenceForBan` / `scamalyticsExtreme` / `abuseipdbExtreme` / `ipqsExtreme` / `enableSecondaryBanEscalation` | Never for config values — but the `shildml/fusion.py` + `shildml/evidence.py` code behind the two new `evidence.*Extreme`/`enableSecondaryBanEscalation`-gated escalation sub-rules (2026-08-14) needs a full restart to load at all, same as any other `shildml/` change |
-| `protection.*` | `dnsbl.*`, `ipapi.*`, `abuseipdb.*`, `ipqs.*`, `scamalytics.*`, `proxyscan.*` | |
+| `protection.*` | `dnsbl.*`, `ipapi.*`, `abuseipdb.*`, `ipqs.*`, `scamalytics.*`, `proxyscan.*`, `geoip.*`, `blocklist.*` | |
 | `ollama.*` | `classifier.*`, `worker.*` | |
 | `evidence.enabled` | all `*Path` values, `report.checkIntervalSecs` | |
 | `enabled`, `messageAnalysis`, `relayChannel`, `ignoreList`, `report.dir`, `report.announce` | | |

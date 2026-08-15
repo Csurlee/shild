@@ -28,7 +28,7 @@ opped) it can't do for you.
 
 ## Version
 
-1.6 -- see [`CHANGELOG.md`](CHANGELOG.md).
+1.7 -- see [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License
 

@@ -5,7 +5,9 @@ main loop.
 
 Tiered by cost, per the Phase 1.5 plan:
   Tier 0 (free, local)   -- cloak trust (evidence.classify_cloak), no I/O.
-  Tier 1 (free, unkeyed) -- DNSBL zones + ip-api.com. Only when the host
+  Tier 1 (free, unkeyed) -- DNSBL zones + ip-api.com + local FireHOL
+                            blocklist membership (blocklist.py -- offline,
+                            no network call at all). Only when the host
                             resolved to an IP AND has no cloak trust.
   Tier 2 (keyed, budgeted) -- AbuseIPDB / IPQS / Scamalytics. Only when
                             Tier 1 didn't already corroborate badness
@@ -86,7 +88,7 @@ import aiohttp
 
 from shildml.evidence import TRUST_NONE, HostEvidence, classify_cloak
 
-from . import proxyscan
+from . import blocklist, geoip, proxyscan
 from .budget import BudgetManager
 
 DRONEBL_ZONE = "dnsbl.dronebl.org"
@@ -163,6 +165,13 @@ class ReputationConfig:
     scamalytics_key: Optional[str] = None
     scamalytics_username2: Optional[str] = None  # optional fallback account
     scamalytics_key2: Optional[str] = None
+    geoip_enabled: bool = True
+    geoip_db_path: str = "geoip/dbip-city-lite.mmdb"
+    blocklist_enabled: bool = True
+    blocklist_dir: str = "blocklists"
+    blocklist_names: tuple[str, ...] = (
+        "socks_proxy_30d", "sslproxies_30d", "cybercrime", "feodo_badips",
+    )
 
 
 class TTLCache:
@@ -435,6 +444,22 @@ class ReputationGatherer:
         # channel).
         ip = ev.resolved_ip
         await asyncio.gather(self._dnsbl(loop, ip, ev), self._geo(session, ip, ev))
+        # Local FireHOL blocklist membership -- synchronous, no I/O wait
+        # (in-memory set lookup + a stat() call), so it doesn't need to be
+        # part of the async gather above; see blocklist.py's own docstring.
+        self._blocklist(ip, ev)
+
+    def _blocklist(self, ip: str, ev: HostEvidence) -> None:
+        if not self.config.blocklist_enabled or not ip:
+            return
+        blocklist_dir = Path(self.config.blocklist_dir)
+        lists = {name: str(blocklist_dir / f"{name}.txt") for name in self.config.blocklist_names}
+        if not blocklist.any_list_present(lists):
+            ev.checks_failed.append("blocklist_unavailable")
+            return
+        hits = blocklist.lookup(ip, lists)
+        ev.blocklist_hits.extend(hits)
+        ev.checks_run.append("blocklist")
 
     async def _dnsbl(self, loop, ip: str, ev: HostEvidence) -> None:
         dnsbl_key = ("dnsbl", ip)
@@ -473,6 +498,22 @@ class ReputationGatherer:
             ev.dnsbl_hits.append(IRCBL_ZONE)
 
     async def _geo(self, session: aiohttp.ClientSession, ip: str, ev: HostEvidence) -> None:
+        # Country comes from a local, offline MMDB first (see geoip.py) --
+        # no network call, no budget, works even when ip-api.com is slow,
+        # down, or budget-exhausted for the day. ip-api's own countryCode
+        # is only ever used as a fallback (_apply_geo below), e.g. on a
+        # fresh install that hasn't run scripts/update_geoip_db.py yet.
+        # This does NOT remove the ip-api call itself -- proxy/hosting/
+        # ASN/ISP have no free local equivalent, see this module's and
+        # geoip.py's docstrings for why.
+        if self.config.geoip_enabled:
+            local_country = geoip.lookup_country(ip, self.config.geoip_db_path)
+            if local_country:
+                ev.country = local_country
+                ev.checks_run.append("geoip_local")
+            else:
+                ev.checks_failed.append("geoip_local_unavailable")
+
         geo_key = ("geo", ip)
         cached_geo, geo_hit = self._cache.get(geo_key)
         if geo_hit:
@@ -495,7 +536,8 @@ class ReputationGatherer:
         ev.geo_hosting = bool(data.get("hosting"))
         ev.asn = data.get("as") or None
         ev.isp = data.get("isp") or None
-        ev.country = data.get("countryCode") or None
+        if not ev.country:  # local geoip lookup already populated this, if it succeeded
+            ev.country = data.get("countryCode") or None
 
     async def _tier2(self, session: aiohttp.ClientSession, ev: HostEvidence) -> None:
         # AbuseIPDB, IPQS, and Scamalytics are three independent providers

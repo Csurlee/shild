@@ -436,6 +436,39 @@ def test_escalation_respects_configured_threshold():
     assert d.action == "ban"
 
 
+# ---- blocklist_hits / FireHOL (2026-08-15) ----
+
+def test_blocklist_hit_corroborates():
+    ev = HostEvidence(resolved_ip="1.2.3.4", blocklist_hits=["socks_proxy_30d"])
+    assert ev.verdict() == "corroborates"
+
+
+def test_blocklist_hit_is_hard_corroboration():
+    ev = HostEvidence(resolved_ip="1.2.3.4", blocklist_hits=["cybercrime"])
+    assert ev.hard_corroborates_bad()
+
+
+def test_blocklist_hit_alone_is_not_extreme_corroboration():
+    """One hard signal alone (blocklist hit, no score) is real corroboration
+    but not enough on its own to skip the classifier's own ranking — same
+    treatment as a lone DroneBL hit."""
+    ev = HostEvidence(resolved_ip="1.2.3.4", blocklist_hits=["cybercrime"])
+    assert not ev.extreme_corroborates_bad()
+
+
+def test_blocklist_hit_plus_another_hard_signal_is_extreme_corroboration():
+    ev = HostEvidence(resolved_ip="1.2.3.4", blocklist_hits=["cybercrime"],
+                       scamalytics_blacklisted=True)
+    assert ev.extreme_corroborates_bad()
+
+
+def test_blocklist_hits_round_trip_through_to_dict_from_dict():
+    ev = HostEvidence(resolved_ip="1.2.3.4", blocklist_hits=["socks_proxy_30d", "cybercrime"])
+    rebuilt = HostEvidence.from_dict(ev.to_dict())
+    assert rebuilt.blocklist_hits == ["socks_proxy_30d", "cybercrime"]
+    assert rebuilt.hard_corroborates_bad()
+
+
 # ---- extreme_corroborates_bad (2026-08-14) ----
 
 def test_extreme_scamalytics_score_is_extreme_corroboration():

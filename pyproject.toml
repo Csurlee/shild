@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shildml"
-version = "1.6"
+version = "1.7"
 description = "SHILD's AI-decision fusion and ML classifier — pure Python, no IRC dependency"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
@@ -19,6 +19,7 @@ train = [
 bot = [
     "limnoria",
     "aiohttp",
+    "maxminddb",
 ]
 
 [tool.setuptools.packages.find]

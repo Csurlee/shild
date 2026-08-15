@@ -59,6 +59,8 @@ def _minimal_answers(**overrides) -> list[str]:
         "y",           # abuseipdb.enabled
         "y",           # scamalytics.enabled
         "y",           # proxyscan.enabled
+        "y",           # geoip.enabled
+        "y",           # blocklist.enabled
         "n",           # enable SpamGuard?
         "n",           # enable WebPanel?
         "n",           # enable GitHubWatch?

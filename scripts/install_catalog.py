@@ -140,6 +140,19 @@ CATALOG: dict[str, list] = {
         Skip("ipapi.timeout", "internal tuning"),
         Skip("ipapi.cacheTtl", "internal tuning"),
         Skip("ipapi.rateLimitPerMinute", "internal tuning, tied to ip-api.com's free-tier limit"),
+        Ask("geoip.enabled", tier="plugin", kind="bool", default=True,
+            question="Use a local, offline GeoIP database for country lookups? "
+                     "Free, no API key or rate limit (run scripts/update_geoip_db.py "
+                     "to download it -- falls back to the online ip-api.com check if "
+                     "you skip that)."),
+        Skip("geoip.dbPath", "derived path; scripts/update_geoip_db.py's default matches it"),
+        Ask("blocklist.enabled", tier="plugin", kind="bool", default=True,
+            question="Check joining hosts against local FireHOL open-proxy/botnet "
+                     "blocklists? Free, no API key, no rate limit (run "
+                     "scripts/update_blocklists.py to download them)."),
+        Skip("blocklist.dir", "derived path; scripts/update_blocklists.py's default matches it"),
+        Skip("blocklist.lists", "the curated default set is the intended install; "
+                                 "change via @config if you want a different subset"),
         Skip("thresholds.classifierAct", "internal ML tuning, not a first-install decision"),
         Skip("thresholds.ollamaAct", "internal ML tuning"),
         Skip("thresholds.classifierActWithEvidence", "internal ML tuning"),

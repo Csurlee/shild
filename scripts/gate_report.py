@@ -82,6 +82,8 @@ def analyze(path: str) -> dict:
                 evidence_signal_counts["dnsbl_hit"] += 1
             if ev.get("dronebl_type"):
                 evidence_signal_counts["dronebl_hit"] += 1
+            if ev.get("blocklist_hits"):
+                evidence_signal_counts["blocklist_hit"] += 1
             if not ev.get("checks_run") and not ev.get("cloak"):
                 evidence_signal_counts["no_evidence_available"] += 1
 
