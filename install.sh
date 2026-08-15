@@ -165,6 +165,24 @@ if [ -d "$INSTALL_DIR/.git" ]; then
     fi
 elif [ -d "$INSTALL_DIR" ] && [ -f "$INSTALL_DIR/pyproject.toml" ]; then
     say "Found an existing (non-git) checkout at $INSTALL_DIR -- using it as-is."
+elif [ -d "$INSTALL_DIR" ] && [ -n "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]; then
+    # INSTALL_DIR exists and has something in it (e.g. a pre-seeded
+    # runtime/install.json for --non-interactive, per this script's own
+    # documented flow above) but isn't a real checkout yet -- `git clone`
+    # refuses to clone into any non-empty directory regardless of what's
+    # in it, so clone into a temp dir first and merge the repo tree in
+    # without touching what's already there.
+    say "Cloning into a temp dir and merging into existing $INSTALL_DIR..."
+    TMP_CLONE=$(mktemp -d)
+    if [ -n "$BRANCH" ]; then
+        run git clone --branch "$BRANCH" "$REPO_URL" "$TMP_CLONE"
+    else
+        run git clone "$REPO_URL" "$TMP_CLONE"
+    fi
+    if [ "$DRY_RUN" != "1" ]; then
+        cp -a "$TMP_CLONE/." "$INSTALL_DIR/"
+        rm -rf "$TMP_CLONE"
+    fi
 else
     say "Cloning into $INSTALL_DIR..."
     if [ -n "$BRANCH" ]; then
