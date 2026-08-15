@@ -41,7 +41,30 @@ SHILD_PY="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_DIR="$SHILD_PY/runtime"
 PROC_PATTERN="supybot shildpy.conf"
 
-_pids() { pgrep -f "$PROC_PATTERN" || true; }
+# 2026-08-15: `pgrep -f "supybot shildpy.conf"` alone matches ANY shild
+# instance on the box, not just this one -- every install (this repo's
+# own dev instance, and any separate install via the public installer,
+# e.g. ~/shild alongside ~/shild-py) generates a conf file with this
+# exact same name, since bootstrap_runtime.py always calls it
+# shildpy.conf regardless of install directory. Hit live: a second,
+# genuinely independent instance's `botctl.sh start` refused to run,
+# reporting the FIRST instance's PID as if it were a collision. Fixed by
+# filtering pgrep's candidates down to only PIDs whose actual working
+# directory (/proc/<pid>/cwd -- supybot never chdirs away from where it
+# was launched, since paths like logs/data/conf are resolved relative to
+# cwd) matches THIS install's own RUNTIME_DIR. Both sides go through
+# readlink -f so a symlinked path doesn't cause a false mismatch.
+RUNTIME_DIR_REAL="$(readlink -f "$RUNTIME_DIR" 2>/dev/null || echo "$RUNTIME_DIR")"
+
+_pids() {
+    local pid cwd
+    for pid in $(pgrep -f "$PROC_PATTERN" 2>/dev/null || true); do
+        cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)"
+        if [ "$cwd" = "$RUNTIME_DIR_REAL" ]; then
+            echo "$pid"
+        fi
+    done
+}
 
 _status() {
     echo "--- systemd's view ---"
