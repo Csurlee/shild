@@ -1,3 +1,7 @@
+## 1.8
+
+Initial public release.
+
 ## 1.7
 
 - Local offline GeoIP lookups (`geoip.enabled`, `scripts/update_geoip_db.py`): resolves a host's

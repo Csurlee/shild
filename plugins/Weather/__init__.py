@@ -7,7 +7,7 @@ default location on explicit "setweather" only.
 import supybot
 from supybot import world
 
-__version__ = "1.7"
+__version__ = "1.8"
 __author__ = supybot.authors.unknown
 __contributors__ = {}
 __url__ = "https://github.com/Csurlee/shild"

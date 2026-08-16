@@ -61,6 +61,17 @@ unlike a term list, which is implicitly inert until something's added to
 it -- a threshold is always "live" the moment the code exists to check
 it.
 
+A sixth heuristic, "raid" (2026-08-16, see _check_join_heuristics), is
+join-based rather than message-based: raidJoinLimit distinct nicks joining
+within raidWindowSecs. Adapted the same "idea, not code" way from the
+"grouped flood" concept in progval's AttackProtector plugin
+(github.com/progval/Supybot-plugins/tree/master/AttackProtector, 2010-era
+Python 2 code, not vendored). Funnels through the same _handle_match gate
+chain as everything else -- exemption/killSwitch/op all still apply -- and
+enforces against only the ONE joiner who tips the threshold, never the
+whole burst, since a legitimate netsplit-reconnect burst of real regulars
+can look identical to a coordinated raid at the network level.
+
 Every matched message is logged to data/spamguard_actions.jsonl and
 relayed (if configured) REGARDLESS of whether it was acted on, tagged
 with why (killswitch / not-opped / outside-window / exempt / enforced)
@@ -109,7 +120,7 @@ _CATEGORIES = ("word", "ident", "nick", "realname", "pattern", "black")
 # positive, sequentially-assigned int -- see terms.py) while still
 # satisfying every place that reads term.id/term.text (the kick reason,
 # the JSONL log, spamguardstatus).
-_HEURISTIC_IDS = {"flood": -1, "hilight": -2, "caps": -3, "mojibake": -4}
+_HEURISTIC_IDS = {"flood": -1, "hilight": -2, "caps": -3, "mojibake": -4, "raid": -5}
 
 
 def _heuristic_term(category: str, text: str) -> termstore.Term:
@@ -142,6 +153,11 @@ class SpamGuard(callbacks.Plugin):
         # floodEnabled is on somewhere, so an all-heuristics-off
         # deployment (the code default) never allocates anything here.
         self._recent_messages: dict[tuple[str, str, str], list[float]] = {}
+        # (network, channel) -> [(join timestamp, nick), ...], for the
+        # raid heuristic (2026-08-16). Pruned the same way as
+        # _recent_messages -- see _prune_recent_joins -- and only
+        # populated at all while raidEnabled is on somewhere.
+        self._recent_joins: dict[tuple[str, str], list[tuple[float, str]]] = {}
         self._stats = {"messages": 0, "matches": 0, "enforced": 0}
         self._pending_unbans: dict[str, None] = {}
 
@@ -248,9 +264,11 @@ class SpamGuard(callbacks.Plugin):
         except Exception:
             log.exception("SpamGuard: failed to relay match notice")
 
-    def _log(self, *, network, channel, nick, ident, host, term, field: str, outcome: str) -> None:
+    def _log(self, *, network, channel, nick, ident, host, term, field: str, outcome: str,
+             via: str = "native") -> None:
         record = {
-            "schema_version": 1,
+            "schema_version": 2,  # 2026-08-16: added "via" (native op-based
+            # MODE+KICK vs. X-routed BAN+KICK -- see _x_fallback/_enforce)
             "source": "limnoria-spamguard",
             "ts": time.time(),
             "network": network,
@@ -260,6 +278,7 @@ class SpamGuard(callbacks.Plugin):
             "term": term.text,
             "term_id": term.id,
             "outcome": outcome,
+            "via": via,
         }
         try:
             write_jsonl_line(self.registryValue("logPath"), record)
@@ -278,6 +297,13 @@ class SpamGuard(callbacks.Plugin):
                  if not times or now - times[-1] > window]
         for key in stale:
             self._recent_messages.pop(key, None)
+
+    def _prune_recent_joins(self, now: float) -> None:
+        window = self.registryValue("raidWindowSecs")
+        stale = [key for key, events in self._recent_joins.items()
+                 if not events or now - events[-1][0] > window]
+        for key in stale:
+            self._recent_joins.pop(key, None)
 
     def _is_exempt(self, irc, channel: str, msg) -> bool:
         """Halfop+ in-channel, holding this channel's own ircdb 'op'
@@ -354,6 +380,41 @@ class SpamGuard(callbacks.Plugin):
             if realname_term is not None:
                 self._handle_match(irc, msg, channel, nick, ident, host,
                                     realname_term, field="realname", require_join_window=False)
+                return  # already matched -- no need to also check raid
+
+        self._check_join_heuristics(irc, msg, channel, nick, ident, host)
+
+    def _check_join_heuristics(self, irc, msg, channel, nick, ident, host) -> None:
+        """Threshold-based JOIN heuristics, checked only when no black/
+        nick/ident/realname term already matched this join (same
+        first-match-wins convention as the term checks in doJoin above).
+        Currently just "raid" (2026-08-16) -- see this module's own
+        docstring and heuristics.py's for the full reasoning behind
+        adapting the idea from progval's AttackProtector rather than
+        vendoring it, and why only the tipping-point joiner is acted on.
+        """
+        network = irc.network
+        now = time.time()
+
+        if self.registryValue("raidEnabled", channel, network):
+            key = (network, channel)
+            window = self.registryValue("raidWindowSecs")
+            events = heuristics.prune_join_events(
+                self._recent_joins.get(key, []) + [(now, nick)], now, window)
+            self._recent_joins[key] = events
+            distinct = {n for _, n in events}
+            limit = self.registryValue("raidJoinLimit")
+            if len(distinct) >= limit:
+                # Reset so the next join doesn't immediately re-trigger
+                # before a fresh window has genuinely built back up --
+                # same convention as the flood heuristic.
+                self._recent_joins.pop(key, None)
+                term = _heuristic_term(
+                    "raid", f"{len(distinct)} distinct joins within {window:.0f}s")
+                self._handle_match(irc, msg, channel, nick, ident, host, term,
+                                    field="raid", require_join_window=False)
+                return
+            self._prune_recent_joins(now)
 
     def doPrivmsg(self, irc, msg):
         channel = msg.channel
@@ -492,15 +553,55 @@ class SpamGuard(callbacks.Plugin):
                               f"-- killSwitch is on")
             return
 
+        xcb = None
         if not enforcement.is_opped(irc, channel):
-            self._log(network=network, channel=channel, nick=nick, ident=ident,
-                       host=host, term=term, field=field, outcome="not-opped")
-            self._relay(irc, f"[spamguard] would kban {nick} ({ident}@{host}) in "
-                              f"{network}/{channel} for {field} '{term.text}' [id:{term.id}] "
-                              f"-- not opped")
-            return
+            xcb = self._x_fallback(irc, channel)
+            if xcb is None:
+                self._log(network=network, channel=channel, nick=nick, ident=ident,
+                           host=host, term=term, field=field, outcome="not-opped")
+                # 2026-08-16: distinguish "no X fallback was even
+                # configured for this channel" from "opted in, but not
+                # usable" in the relay text only -- the "not-opped"
+                # outcome tag stays unchanged so nothing that already
+                # consumes the JSONL log needs a new value.
+                # enforcement.preferXCommands lives in UndernetX's OWN
+                # registry, not SpamGuard's -- read it via the live
+                # callback's own public accessor, never a bare
+                # self.registryValue (that would look up
+                # plugins.SpamGuard.enforcement.preferXCommands, which
+                # doesn't exist).
+                suffix = ""
+                x_cb_raw = irc.getCallback("UndernetX")
+                if x_cb_raw is not None:
+                    try:
+                        if x_cb_raw.prefers_x_commands(irc, channel):
+                            suffix = " (X fallback unavailable)"
+                    except Exception:
+                        pass
+                self._relay(irc, f"[spamguard] would kban {nick} ({ident}@{host}) in "
+                                  f"{network}/{channel} for {field} '{term.text}' [id:{term.id}] "
+                                  f"-- not opped{suffix}")
+                return
 
-        self._enforce(irc, network, channel, nick, ident, host, term, field)
+        self._enforce(irc, network, channel, nick, ident, host, term, field, xcb=xcb)
+
+    def _x_fallback(self, irc, channel):
+        """The live UndernetX plugin instance iff X-routed enforcement
+        would actually work in `channel` RIGHT NOW, else None
+        (2026-08-16) -- mirrors plugins/Shild/plugin.py's own
+        `_x_fallback` exactly, deliberately inlined here rather than
+        shared (same "near-copy, not an import" convention this
+        plugin's own enforcement.py already documents for the reasons
+        cross-plugin imports are fragile in this codebase).
+        """
+        cb = irc.getCallback("UndernetX")
+        if cb is None:
+            return None
+        try:
+            return cb if cb.x_enforcement_available(irc, channel) else None
+        except Exception:
+            log.exception("SpamGuard: UndernetX availability check failed")
+            return None
 
     def _sweep_black_term(self, term: termstore.Term) -> int:
         """2026-08-14: "black add" doesn't just block future joins/
@@ -548,7 +649,8 @@ class SpamGuard(callbacks.Plugin):
 
     # ---- enforcement ----
 
-    def _enforce(self, irc, network, channel, nick, ident, host, term, field: str) -> None:
+    def _enforce(self, irc, network, channel, nick, ident, host, term, field: str,
+                 *, xcb=None) -> None:
         duration = self.registryValue("protection.banDurationSecs")
         mask = enforcement.ban_mask(field, nick, ident, host)
         default_reason = self.registryValue("protection.kickReason")
@@ -573,8 +675,16 @@ class SpamGuard(callbacks.Plugin):
         hostmask = f"{nick}!{ident}@{host}"
         kick_reason = f'SpamGuard: "{term.text}" - {hostmask} - reason: {reason_text} - [id: {term.id}]'
 
+        via = "x" if xcb is not None else "native"
         try:
-            enforcement.enforce_ban(irc, channel, nick, mask, kick_reason)
+            if xcb is not None:
+                if not xcb.enforce_ban_via_x(irc, channel, nick, mask, kick_reason,
+                                              duration_secs=duration):
+                    log.warning("SpamGuard: X enforcement declined for %s in %s/%s",
+                                mask, network, channel)
+                    return
+            else:
+                enforcement.enforce_ban(irc, channel, nick, mask, kick_reason)
         except Exception:
             log.exception("SpamGuard: failed to enforce kban")
             return
@@ -585,21 +695,32 @@ class SpamGuard(callbacks.Plugin):
         def _do_unban():
             self._pending_unbans.pop(event_name, None)
             live_irc = world.getIrc(network)
-            if live_irc is not None:
-                try:
+            if live_irc is None:
+                return
+            try:
+                if via == "x":
+                    x_cb = live_irc.getCallback("UndernetX")
+                    if x_cb is None:
+                        log.warning("SpamGuard: UndernetX no longer loaded; cannot "
+                                    "lift X ban %s in %s/%s", mask, network, channel)
+                        return
+                    x_cb.unban_via_x(live_irc, channel, mask)
+                else:
                     enforcement.unban(live_irc, channel, mask)
-                except Exception:
-                    log.exception("SpamGuard: failed to auto-unban %s in %s/%s",
-                                   mask, network, channel)
+            except Exception:
+                log.exception("SpamGuard: failed to auto-unban %s in %s/%s",
+                               mask, network, channel)
 
         self._pending_unbans[event_name] = None
         schedule.addEvent(_do_unban, unban_at, name=event_name)
 
         self._stats["enforced"] += 1
         self._log(network=network, channel=channel, nick=nick, ident=ident,
-                   host=host, term=term, field=field, outcome="enforced")
+                   host=host, term=term, field=field, outcome="enforced", via=via)
+        via_suffix = " (via X)" if via == "x" else ""
         self._relay(irc, f"[spamguard] kbanned {nick} ({ident}@{host}) in "
-                          f"{network}/{channel} for {field} '{term.text}' [id:{term.id}]")
+                          f"{network}/{channel} for {field} '{term.text}' [id:{term.id}]"
+                          f"{via_suffix}")
 
     # ---- commands (all owner-only, same reasoning as Shild's: real
     # people's nicks/hosts and real moderation surface) ----
@@ -632,7 +753,7 @@ class SpamGuard(callbacks.Plugin):
             irc.reply(
                 f"SpamGuard heuristics in {msg.channel}: flood={on('floodEnabled')} "
                 f"hilight={on('hilightEnabled')} caps={on('capsEnabled')} "
-                f"mojibake={on('mojibakeEnabled')}"
+                f"mojibake={on('mojibakeEnabled')} raid={on('raidEnabled')}"
             )
     spamguardstatus = wrap(spamguardstatus, ["owner"])
 

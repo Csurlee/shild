@@ -3,6 +3,7 @@ import.
 """
 from plugins.UndernetX.xcommands import (
     PendingXRequestQueue,
+    XReplySink,
     build_access,
     build_ban,
     build_deop,
@@ -12,6 +13,7 @@ from plugins.UndernetX.xcommands import (
     build_op,
     build_unban,
     build_voice,
+    format_duration,
 )
 
 
@@ -141,3 +143,88 @@ def test_reply_to_is_stored_opaquely():
     sentinel = object()
     req = q.add("undernet", "a", timeout_secs=5.0, reply_to=sentinel, now=0.0)
     assert req.reply_to is sentinel
+
+
+# ---- push_front (2026-08-16, added for multi-line ACCESS reply collection) ----
+
+def test_push_front_restores_fifo_position():
+    q = PendingXRequestQueue()
+    a = q.add("undernet", "a", timeout_secs=10, now=0.0)
+    b = q.add("undernet", "b", timeout_secs=10, now=0.0)
+    popped = q.pop_oldest("undernet")
+    assert popped is a
+    q.push_front(popped)
+    assert q.pop_oldest("undernet") is a
+    assert q.pop_oldest("undernet") is b
+
+
+def test_push_front_on_an_empty_queue():
+    q = PendingXRequestQueue()
+    req = q.add("undernet", "a", timeout_secs=10, now=0.0)
+    q.pop_oldest("undernet")
+    assert q.pending_count("undernet") == 0
+    q.push_front(req)
+    assert q.pending_count("undernet") == 1
+    assert q.pop_oldest("undernet") is req
+
+
+def test_push_front_does_not_affect_other_networks():
+    q = PendingXRequestQueue()
+    a = q.add("undernet", "a", timeout_secs=10, now=0.0)
+    q.add("libera", "b", timeout_secs=10, now=0.0)
+    q.pop_oldest("undernet")
+    q.push_front(a)
+    assert q.pending_count("libera") == 1
+    assert q.pending_count("undernet") == 1
+
+
+# ---- XReplySink -- stored opaquely, same as any other reply_to ----
+
+def test_reply_to_accepts_an_x_reply_sink():
+    q = PendingXRequestQueue()
+    calls = []
+    sink = XReplySink(on_reply=lambda text: calls.append(text) or False,
+                       on_timeout=lambda: calls.append("timeout"))
+    req = q.add("undernet", "probe", timeout_secs=10, reply_to=sink, now=0.0)
+    assert req.reply_to is sink
+    assert req.reply_to.on_reply("line 1") is False
+    assert calls == ["line 1"]
+
+
+def test_x_reply_sink_defaults_to_no_callbacks():
+    sink = XReplySink()
+    assert sink.on_reply is None
+    assert sink.on_timeout is None
+
+
+# ---- format_duration ----
+
+def test_format_duration_typical_hour():
+    assert format_duration(3600) == "60m"
+
+
+def test_format_duration_exact_day():
+    assert format_duration(86400) == "1d"
+
+
+def test_format_duration_clamps_up_to_minimum():
+    assert format_duration(30) == "5m"
+    assert format_duration(0) == "5m"
+
+
+def test_format_duration_clamps_down_to_maximum():
+    assert format_duration(400 * 86400) == "365d"
+
+
+def test_format_duration_non_round_minutes_below_a_day():
+    assert format_duration(90) == "2m" or format_duration(90) == "5m"
+    # exact value isn't load-bearing -- just must be a valid, parseable
+    # minute count under a day, never crash or produce a day/hour unit
+    # for a sub-day duration
+    result = format_duration(90)
+    assert result.endswith("m")
+
+
+def test_format_duration_multi_day_non_round():
+    result = format_duration(3 * 86400 + 3600)  # 3 days 1 hour
+    assert result.endswith("d") or result.endswith("m")

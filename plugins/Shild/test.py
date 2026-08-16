@@ -74,6 +74,36 @@ class ShildTestCase(ChannelPluginTestCase):
         # test body must be restored somewhere" discipline as CLAUDE.md's
         # documented WebPanel test-leak gotcha.
         conf.supybot.plugins.Shild.ignoreList.setValue([])
+        # Same cross-test state-leak discipline as ignoreList above --
+        # decisionCache.enabled/ttlSecs are global values a test can set
+        # directly; reset to their real defaults here so one test's
+        # tweak never leaks into a later one in the same process. The
+        # cache's own CONTENTS never leak between tests regardless (a
+        # fresh DecisionCache is constructed per plugin instance, i.e.
+        # per test, in __init__).
+        conf.supybot.plugins.Shild.decisionCache.enabled.setValue(True)
+        conf.supybot.plugins.Shild.decisionCache.ttlSecs.setValue(1800.0)
+        # Pre-existing latent leak, only now actually tripped: relayChannel
+        # is a global (network-scoped) value a handful of tests set
+        # directly via .get(":test").setValue(...) and never reset --
+        # same class of gotcha as ignoreList/decisionCache above, just not
+        # caught until a new test (added same session) happened to run
+        # alphabetically after one of them with the leak still live.
+        conf.supybot.plugins.Shild.relayChannel.get(":test").setValue("")
+        # Same story, and the REAL root cause of a failure the relayChannel
+        # fix above only partly masked: Shild.enabled for self.channel is
+        # channel-scoped and set True by many tests, never reset. Left
+        # leaked True, an unrelated test's `getMsg(cmd, frm=<some
+        # hostmask>)` synthesizes a JOIN for that sender (Limnoria's own
+        # test harness keeps channel state consistent), which -- with
+        # `enabled` still true from an earlier test -- runs that synthetic
+        # joiner through Shild's FULL evaluation pipeline, producing a
+        # real [shadow] relay line and a real shadow_decisions.jsonl
+        # write neither test expected. Confirmed live: this is exactly
+        # what broke test_shildcheck_requires_owner_capability once a new
+        # test (this session) happened to leave `enabled` True right
+        # before it in alphabetical run order.
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(False)
         # Protection defaults to safe (killSwitch=True) -- each enforcement
         # test below flips it explicitly rather than relying on the default,
         # so the test itself documents which state it needs.
@@ -417,6 +447,14 @@ class ShildTestCase(ChannelPluginTestCase):
         self.assertTrue(Path(self._data_path).exists())
 
     def test_enforcement_suppressed_when_not_opped(self):
+        # This class (ShildTestCase, plugins=("Shild",)) doubles as the
+        # "UndernetX not loaded at all" proof for the 2026-08-16 X-routed
+        # enforcement fallback: irc.getCallback("UndernetX") returns None
+        # here unconditionally, so _x_fallback() always returns None too,
+        # and behavior is exactly what it was before that feature existed
+        # -- no action, no error. See ShildXFallbackTestCase (below, a
+        # separate plugins=("Shild", "UndernetX") class) for the cases
+        # where UndernetX IS loaded.
         conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
         conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
         conf.supybot.plugins.Shild.protection.killSwitch.setValue(False)
@@ -446,6 +484,172 @@ class ShildTestCase(ChannelPluginTestCase):
         kicks = [m for m in self._queued() if m.command == "KICK"]
         self.assertEqual(kicks, [], "warn verdicts must never trigger real enforcement")
         self.assertFalse(Path(self._enforcement_path).exists())
+
+    # ---- decision cache (2026-08-16): repeat joins from the same host ----
+
+    def test_decision_cache_skips_second_shadow_record_for_same_host(self):
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+
+        self.irc.feedMsg(self._make_join("flapper", "~f", "203.0.113.70", self.channel))
+        self.irc.feedMsg(self._make_join("flapper", "~f", "203.0.113.70", self.channel))
+
+        records = Path(self._data_path).read_text().strip().splitlines()
+        self.assertEqual(len(records), 1, "a repeat join from the same host must not re-decide")
+
+    def test_decision_cache_scoped_by_host_not_nick(self):
+        """The real incident this fixes: a reconnecting client, not
+        necessarily even the same nick each time -- caching is keyed by
+        host alone (see decision_cache.py's module docstring)."""
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+
+        self.irc.feedMsg(self._make_join("flapper1", "~f", "203.0.113.71", self.channel))
+        self.irc.feedMsg(self._make_join("flapper2", "~f", "203.0.113.71", self.channel))
+
+        records = Path(self._data_path).read_text().strip().splitlines()
+        self.assertEqual(len(records), 1)
+
+    def test_decision_cache_does_not_relay_a_second_time(self):
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+        conf.supybot.plugins.Shild.relayChannel.get(":test").setValue(self.channel)
+
+        self.irc.feedMsg(self._make_join("flapper", "~f", "203.0.113.72", self.channel))
+        first_relay = self.irc.takeMsg()
+        self.assertIsNotNone(first_relay, "expected the first join's [shadow] relay line")
+
+        self.irc.feedMsg(self._make_join("flapper", "~f", "203.0.113.72", self.channel))
+        second_relay = self.irc.takeMsg()
+        self.assertIsNone(second_relay, "a cache hit must not relay again")
+
+    def test_decision_cache_different_host_still_gets_its_own_decision(self):
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+
+        self.irc.feedMsg(self._make_join("usera", "~a", "203.0.113.73", self.channel))
+        self.irc.feedMsg(self._make_join("userb", "~b", "203.0.113.74", self.channel))
+
+        records = Path(self._data_path).read_text().strip().splitlines()
+        self.assertEqual(len(records), 2, "a genuinely different host must not hit the cache")
+
+    def test_decision_cache_skips_repeat_messages_from_same_host_not_just_joins(self):
+        """The real report this was built from: a host that stays JOINED
+        and just keeps sending messages (never parting/rejoining) was
+        getting a full fresh evaluation on every single message.
+        doJoin/doPrivmsg both funnel into the same _handle_event, so the
+        cache check applies identically to both event types -- proven
+        directly here rather than assumed."""
+        from supybot import ircmsgs
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+        conf.supybot.plugins.Shild.messageAnalysis.get(self.channel).setValue(True)
+
+        def _msg(text):
+            return ircmsgs.privmsg(self.channel, text,
+                                    prefix="chatty!~c@203.0.113.77")
+
+        self.irc.feedMsg(_msg("first message"))
+        for i in range(10):
+            self.irc.feedMsg(_msg(f"message number {i}"))
+
+        records = Path(self._data_path).read_text().strip().splitlines()
+        self.assertEqual(len(records), 1,
+                          "repeat MESSAGES (no join at all) from the same host must "
+                          "not each re-decide -- only the first one should")
+
+    def test_decision_cache_disabled_reevaluates_every_time(self):
+        conf.supybot.plugins.Shild.decisionCache.enabled.setValue(False)
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+
+        self.irc.feedMsg(self._make_join("flapper", "~f", "203.0.113.75", self.channel))
+        self.irc.feedMsg(self._make_join("flapper", "~f", "203.0.113.75", self.channel))
+
+        records = Path(self._data_path).read_text().strip().splitlines()
+        self.assertEqual(len(records), 2, "decisionCache.enabled=False must re-decide every time")
+
+    def test_decision_cache_still_enforces_on_repeat_if_newly_eligible(self):
+        """Being cached is about not RE-DECIDING, never about suppressing
+        real protection once it becomes eligible -- op status or the
+        kill switch can change between the two joins."""
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+        conf.supybot.plugins.Shild.protection.killSwitch.setValue(True)  # armed OFF later
+
+        self.irc.feedMsg(self._make_join("flapper", "~f", "203.0.113.76", self.channel))
+        self.assertEqual([m for m in self._queued() if m.command == "KICK"], [],
+                          "sanity: not yet armed, must not have enforced on the first join")
+
+        conf.supybot.plugins.Shild.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        self.irc.feedMsg(self._make_join("flapper", "~f", "203.0.113.76", self.channel))
+
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        self.assertEqual(len(kicks), 1,
+                          "a cache hit must still enforce once newly eligible")
+        # And still only ONE shadow record overall -- the second join was
+        # a cache hit, not a fresh decision.
+        records = Path(self._data_path).read_text().strip().splitlines()
+        self.assertEqual(len(records), 1)
+
+    # ---- decision cache in-flight tracking (2026-08-16, real second
+    # incident: a burst of near-simultaneous events for the same host,
+    # arriving before the FIRST one's own worker evaluation has resolved
+    # -- see decision_cache.py's module docstring for the confirmed-live
+    # root cause. These tests seed the real DecisionCache's in-flight
+    # state directly (same "seed the real object, don't mock" pattern
+    # already used elsewhere) rather than trying to race a real worker
+    # thread, matching this suite's own stated policy of never
+    # exercising real Tier 1-3 network lookups. ----
+
+    def test_event_dropped_entirely_while_host_is_in_flight(self):
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+        cb = self.irc.getCallback("Shild")
+        cb._decision_cache.mark_in_flight("test", "203.0.113.80")
+
+        self.irc.feedMsg(self._make_join("flapper", "~f", "203.0.113.80", self.channel))
+
+        self.assertFalse(Path(self._data_path).exists(),
+                          "an event for an in-flight host must produce no shadow record at all")
+
+    def test_event_for_a_different_host_is_unaffected_by_another_hosts_in_flight_marker(self):
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+        cb = self.irc.getCallback("Shild")
+        cb._decision_cache.mark_in_flight("test", "203.0.113.81")
+
+        self.irc.feedMsg(self._make_join("someoneelse", "~s", "203.0.113.82", self.channel))
+
+        self.assertTrue(Path(self._data_path).exists(),
+                         "a different, non-in-flight host must still be evaluated normally")
+
+    def test_event_proceeds_normally_once_in_flight_marker_is_cleared(self):
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+        cb = self.irc.getCallback("Shild")
+        cb._decision_cache.mark_in_flight("test", "203.0.113.83")
+        cb._decision_cache.clear_in_flight("test", "203.0.113.83")
+
+        self.irc.feedMsg(self._make_join("flapper", "~f", "203.0.113.83", self.channel))
+
+        self.assertTrue(Path(self._data_path).exists(),
+                         "clearing the in-flight marker must let the next event through")
+
+    def test_synchronous_fast_path_never_leaves_a_host_marked_in_flight(self):
+        """The classifier-confident/evidence-disabled fast path used
+        throughout this test class never calls mark_in_flight itself
+        (only the worker-dispatch site does, in _handle_event) -- confirm
+        a completely ordinary join leaves nothing behind for a later
+        event to trip over."""
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+        cb = self.irc.getCallback("Shild")
+
+        self.irc.feedMsg(self._make_join("flapper", "~f", "203.0.113.84", self.channel))
+
+        self.assertFalse(cb._decision_cache.is_in_flight("test", "203.0.113.84"))
 
     # ---- !shildcheck ----
 
@@ -490,6 +694,34 @@ class ShildTestCase(ChannelPluginTestCase):
         self.assertEqual(
             len(Path(self._data_path).read_text().strip().splitlines()), 1,
             "!shildcheck must not add a second shadow decision record")
+
+    def test_shildcheck_shows_nick_history_for_a_host_with_prior_aliases(self):
+        """2026-08-16: ban-evasion detection -- a host that's connected
+        under multiple nicks shows the OTHER ones (not the one currently
+        being checked) as a separate reply line."""
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        self.irc.feedMsg(self._make_join("evader1", "~e", "203.0.113.60", self.channel))
+        while self.irc.takeMsg() is not None:
+            pass
+        self.irc.feedMsg(self._make_join("evader2", "~e", "203.0.113.60", self.channel))
+        while self.irc.takeMsg() is not None:
+            pass
+
+        m = self.getMsg("shildcheck evader2")
+        self.assertIn("evader2 ~e@203.0.113.60", m.args[1])
+        m2 = self.irc.takeMsg()
+        self.assertIn("also seen as: evader1", m2.args[1])
+
+    def test_shildcheck_no_history_line_when_host_has_no_prior_aliases(self):
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        self.irc.feedMsg(self._make_join("onlyme", "~o", "203.0.113.61", self.channel))
+        while self.irc.takeMsg() is not None:
+            pass
+
+        m = self.getMsg("shildcheck onlyme")
+        self.assertIn("onlyme ~o@203.0.113.61", m.args[1])
+        m2 = self.irc.takeMsg()
+        self.assertNotIn("also seen as", m2.args[1])
 
     def test_shildcheck_resolves_connected_nick_via_irc_state_when_unanalyzed(self):
         # Channel disabled -- doJoin never reaches _handle_event, so
@@ -755,3 +987,155 @@ class ShildTestCase(ChannelPluginTestCase):
         from supybot import ircmsgs
         return ircmsgs.IrcMsg(command="MODE", args=(channel, "+b", mask),
                                prefix=f"{actor}!{actor_ident}@{actor_host}")
+
+
+class ShildXFallbackTestCase(ChannelPluginTestCase):
+    """The 2026-08-16 X-routed enforcement fallback: a real UndernetX
+    instance is loaded (unlike ShildTestCase above, which proves the
+    "UndernetX not loaded" degradation path), and its X-capability cache
+    is seeded directly -- same "seed the real object, don't mock"
+    pattern SpamGuard's own tests already use for its TermStore -- so
+    these tests exercise the ACTUAL x_enforcement_available()/
+    enforce_ban_via_x() gate, not a stand-in for it.
+    """
+    plugins = ("Shild", "UndernetX")
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._model_path = str(Path(self._tmpdir) / "model.npz")
+        self._data_path = str(Path(self._tmpdir) / "shadow.jsonl")
+        self._enforcement_path = str(Path(self._tmpdir) / "enforcement.jsonl")
+        self._ban_ids_path = str(Path(self._tmpdir) / "ban_ids.json")
+        _write_dummy_model(self._model_path, bias_toward="ban")
+
+        conf.supybot.plugins.Shild.classifier.modelPath.setValue(self._model_path)
+        conf.supybot.plugins.Shild.shadowDataPath.setValue(self._data_path)
+        conf.supybot.plugins.Shild.enforcementLogPath.setValue(self._enforcement_path)
+        conf.supybot.plugins.Shild.banIdsPath.setValue(self._ban_ids_path)
+        conf.supybot.plugins.Shild.thresholds.classifierAct.setValue(0.5)
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+        conf.supybot.plugins.Shild.protection.killSwitch.setValue(False)
+        conf.supybot.plugins.Shild.ignoreList.setValue([])
+        conf.supybot.plugins.Shild.decisionCache.enabled.setValue(True)
+        conf.supybot.plugins.Shild.decisionCache.ttlSecs.setValue(1800.0)
+
+        super().setUp()
+
+        self.irc.state.supported["NETWORK"] = "UnderNet"
+        self._x = self.irc.getCallback("UndernetX")
+        self._x.identified = True
+        conf.supybot.plugins.UndernetX.auth.username.setValue("shild")
+        conf.supybot.plugins.UndernetX.auth.password.setValue("")
+        conf.supybot.plugins.UndernetX.enforcement.preferXCommands.get(
+            self.channel).setValue(True)
+        conf.supybot.plugins.UndernetX.enforcement.xFallbackEnabled.setValue(True)
+        conf.supybot.plugins.UndernetX.enforcement.minAccessLevel.setValue(100)
+        conf.supybot.plugins.UndernetX.enforcement.probeTtlSecs.setValue(3600)
+        conf.supybot.plugins.UndernetX.enforcement.probeMinIntervalSecs.setValue(60)
+
+    def _seed_x_usable(self):
+        from plugins.UndernetX.xprobe import ProbeVerdict
+        self._x._capabilities.record(
+            "test", ircutils.toLower(self.channel),
+            ProbeVerdict(state="usable", access_level=500), [],
+        )
+
+    def _queued(self):
+        q = self.irc.queue
+        return list(q.highpriority) + list(q.normal) + list(q.lowpriority)
+
+    def _make_join(self, nick, ident, host):
+        from supybot import ircmsgs
+        return ircmsgs.IrcMsg(command="JOIN", args=(self.channel,),
+                               prefix=f"{nick}!{ident}@{host}")
+
+    def test_not_opped_available_fires_x_ban_and_kick_not_native(self):
+        self._seed_x_usable()
+        self.irc.feedMsg(self._make_join("baduser", "~bad", "203.0.113.20"))
+
+        native = [m for m in self._queued()
+                  if m.command in ("KICK", "MODE") and m.args[0] == self.channel]
+        self.assertEqual(native, [], "must not use the native path when X is available")
+        x_privmsgs = [m for m in self._queued()
+                      if m.command == "PRIVMSG" and m.args[0] == "X@channels.undernet.org"]
+        self.assertEqual(len(x_privmsgs), 2, "expected a BAN then a KICK sent to X")
+        self.assertTrue(x_privmsgs[0].args[1].startswith(f"BAN {self.channel} "))
+        self.assertTrue(x_privmsgs[1].args[1].startswith(f"KICK {self.channel} "))
+        self.assertTrue(Path(self._enforcement_path).exists())
+        record = json.loads(Path(self._enforcement_path).read_text().strip().splitlines()[-1])
+        self.assertEqual(record["via"], "x")
+
+    def test_not_opped_no_cache_entry_enforces_nothing_but_triggers_a_probe(self):
+        # No _seed_x_usable() -- the cache is empty.
+        self.irc.feedMsg(self._make_join("baduser2", "~bad", "203.0.113.21"))
+
+        acted = [m for m in self._queued() if m.command in ("KICK", "MODE")]
+        self.assertEqual(acted, [], "must not use the native path")
+        x_privmsgs = [m for m in self._queued() if m.command == "PRIVMSG"
+                      and m.args[0] == "X@channels.undernet.org"]
+        self.assertEqual(len(x_privmsgs), 1, "expected exactly one lazy ACCESS probe")
+        self.assertTrue(x_privmsgs[0].args[1].startswith("ACCESS "))
+        self.assertFalse(Path(self._enforcement_path).exists())
+
+    def test_not_opped_channel_not_opted_in_does_nothing_not_even_a_probe(self):
+        conf.supybot.plugins.UndernetX.enforcement.preferXCommands.get(
+            self.channel).setValue(False)
+        self.irc.feedMsg(self._make_join("baduser3", "~bad", "203.0.113.22"))
+        self.assertEqual(self._queued(), [])
+        self.assertFalse(Path(self._enforcement_path).exists())
+
+    def test_not_opped_arm_switch_off_does_nothing_even_with_usable_cache(self):
+        self._seed_x_usable()
+        conf.supybot.plugins.UndernetX.enforcement.xFallbackEnabled.setValue(False)
+        self.irc.feedMsg(self._make_join("baduser4", "~bad", "203.0.113.23"))
+        self.assertEqual(self._queued(), [])
+        self.assertFalse(Path(self._enforcement_path).exists())
+
+    def test_not_opped_not_identified_does_nothing(self):
+        self._seed_x_usable()
+        self._x.identified = False
+        self.irc.feedMsg(self._make_join("baduser5", "~bad", "203.0.113.24"))
+        self.assertEqual(self._queued(), [])
+
+    def test_killswitch_still_gates_the_x_path(self):
+        self._seed_x_usable()
+        conf.supybot.plugins.Shild.protection.killSwitch.setValue(True)
+        self.irc.feedMsg(self._make_join("baduser6", "~bad", "203.0.113.25"))
+        x_privmsgs = [m for m in self._queued() if m.command == "PRIVMSG"
+                      and m.args[0] == "X@channels.undernet.org"]
+        self.assertEqual(x_privmsgs, [], "killSwitch must block the X path too")
+
+    def test_opped_always_uses_native_path_never_x_even_with_usable_cache(self):
+        # The single most important guarantee: X is a FALLBACK, never a
+        # substitute for real op.
+        self._seed_x_usable()
+        from supybot import ircmsgs
+        self.irc.feedMsg(ircmsgs.IrcMsg(
+            command="MODE", args=(self.channel, "+o", self.irc.nick),
+            prefix="ChanServ!ChanServ@services.",
+        ))
+        self.irc.feedMsg(self._make_join("baduser7", "~bad", "203.0.113.26"))
+
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        bans = [m for m in self._queued() if m.command == "MODE" and m.args[1] == "+b"]
+        self.assertEqual(len(kicks), 1)
+        self.assertEqual(len(bans), 1)
+        x_privmsgs = [m for m in self._queued() if m.command == "PRIVMSG"
+                      and m.args[0] == "X@channels.undernet.org"]
+        self.assertEqual(x_privmsgs, [], "opped enforcement must never touch X")
+        record = json.loads(Path(self._enforcement_path).read_text().strip().splitlines()[-1])
+        self.assertEqual(record["via"], "native")
+
+    def test_unavailable_x_fallback_does_not_consume_a_ban_id(self):
+        # No _seed_x_usable() -- unavailable, so the join resolves to
+        # "not opped, no X fallback" (a probe fires, but nothing enforces).
+        self.irc.feedMsg(self._make_join("baduser8", "~bad", "203.0.113.27"))
+        self.assertFalse(Path(self._enforcement_path).exists())
+
+        # A SUBSEQUENT, genuinely available enforcement must still get
+        # ban id 1 -- the unavailable miss above must not have consumed one.
+        self._seed_x_usable()
+        self.irc.feedMsg(self._make_join("baduser9", "~bad", "203.0.113.28"))
+        record = json.loads(Path(self._enforcement_path).read_text().strip().splitlines()[-1])
+        self.assertIn("[ID: 1]", record["reason"])

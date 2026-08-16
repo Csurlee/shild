@@ -19,6 +19,19 @@ This module never decides *whether* to act -- that gating (join window,
 exemptions, op status, SpamGuard's own kill switch, separate from
 Shild's) lives in plugin.py. Functions here are pure "given a decision to
 enforce, do the IRC mechanics."
+
+2026-08-16: plugin.py's gate chain gained a SECOND, explicitly gated
+route to a real kick/ban when the bot lacks op -- routing through
+Undernet's X service via plugins/UndernetX (`irc.getCallback("UndernetX")`,
+never a Python import), mirroring the identical addition to Shild's own
+enforcement.py the same day. That path builds plain `ircmsgs.privmsg()`
+calls inside UndernetX's own plugin.py, entirely out of scope for the
+`ircmsgs.(kick|ban|mode)(` grep above, and carries its own layered gating
+(a per-channel opt-in, a global arm switch, and a live-verified capability
+probe -- see plugins/UndernetX/xprobe.py) on top of the same kill switch
+this module's callers already require. This module's own invariant --
+the only place a real `ircmsgs.kick/ban/mode()` call is constructed --
+is unaffected.
 """
 from __future__ import annotations
 

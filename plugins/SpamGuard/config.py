@@ -317,3 +317,48 @@ conf.registerGlobalValue(
         juxtapositions, so even 1-2 can be a real signal in an otherwise
         clean message; not a percentage.""")),
 )
+
+# ---------------------------------------------------------------------
+# Raid heuristic (2026-08-16): distinct-nick join-burst detection, adapted
+# from the "grouped flood" idea in progval's AttackProtector plugin
+# (github.com/progval/Supybot-plugins/tree/master/AttackProtector) --
+# reimplemented independently, not vendored (that plugin is 2010-era
+# Python 2-flavored code). Checked in doJoin, not doPrivmsg -- see
+# _check_join_heuristics in plugin.py. Enforces against only the ONE
+# joiner who tips the count over raidJoinLimit, not the whole burst --
+# same "act on the current event" convention as flood/hilight/caps/
+# mojibake above, and deliberately conservative: a real netsplit-
+# reconnect burst of legitimate returning regulars looks identical at
+# the network level to a coordinated raid (confirmed via a real corpus
+# check during Shild's own join_rate feature design, 2026-08-14 -- see
+# CLAUDE.md), so raidJoinLimit defaults meaningfully higher than a
+# single-nick flood threshold and this still funnels through the SAME
+# exemption/killSwitch/op gate chain as every other heuristic --
+# nothing here bypasses that safety net.
+# ---------------------------------------------------------------------
+
+conf.registerChannelValue(
+    SpamGuard, "raidEnabled",
+    registry.Boolean(False, _(
+        """Whether the raid heuristic (raidJoinLimit distinct nicks
+        joining this channel within raidWindowSecs) is checked. Opt-in,
+        same reasoning as floodEnabled above -- and worth extra caution
+        before enabling: a legitimate netsplit-reconnect burst of real
+        regulars can look similar to a coordinated raid at the network
+        level.""")),
+    opSettable=False,
+)
+conf.registerGlobalValue(
+    SpamGuard, "raidJoinLimit",
+    registry.PositiveInteger(8, _(
+        """Number of DISTINCT nicks joining this channel within
+        raidWindowSecs that counts as a raid. Deliberately higher than
+        floodMessageLimit -- a grouped/coordinated signal should need
+        more corroboration than a single nick's own behavior before
+        anyone gets kicked over it.""")),
+)
+conf.registerGlobalValue(
+    SpamGuard, "raidWindowSecs",
+    registry.PositiveFloat(15.0, _(
+        """Rolling window (seconds) raidJoinLimit is counted over.""")),
+)

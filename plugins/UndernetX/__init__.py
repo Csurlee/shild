@@ -38,7 +38,7 @@ import importlib
 
 # Use this for the version of this plugin.  You may wish to put a CVS keyword
 # in here if you're keeping the plugin in CVS or some similar system.
-__version__ = "1.7"
+__version__ = "1.8"
 
 # XXX Replace this with an appropriate author or supybot.Author instance.
 __author__ = supybot.Author("Ken Spencer", "kspencer", "ken@electrocode.net")
@@ -56,6 +56,7 @@ __contributors__ = {}
 __url__ = "https://github.com/oddluck/limnoria-plugins/"
 
 from . import xcommands
+from . import xprobe
 from . import config
 from . import plugin
 
@@ -64,8 +65,11 @@ from . import plugin
 # modules in this repo -- the original vendored __init__.py only ever
 # reloaded plugin.py itself (config.py wasn't reloaded either; harmless
 # there since it has no mutable state to go stale, unlike xcommands'
-# PendingXRequestQueue class definition).
+# PendingXRequestQueue class definition). xprobe.py (2026-08-16) is the
+# same situation -- its classifier constants and XCapabilityCache class
+# definition need the same treatment.
 importlib.reload(xcommands)
+importlib.reload(xprobe)
 importlib.reload(config)
 importlib.reload(plugin)  # In case we're being reloaded.
 # Add more reloads here if you add third-party modules and want them to be

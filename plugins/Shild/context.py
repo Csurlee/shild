@@ -30,6 +30,21 @@ time doKick runs. This is the same class of bug the Tcl original's
 already quit) -- fixed the same way: capture identity when we last saw
 it ourselves (every join/message already gives us nick+ident+host),
 never look it up after the fact.
+
+Also holds the reverse of the identity cache above: host->nick history
+(2026-08-16), i.e. every nick a given host has connected as, most-recent-
+first -- real ban-evasion detection (same person, new nick after a
+kick/ban), not covered by `identity_for_nick`'s nick->host direction.
+Adapted the *idea* only from progval's `NickTracker` plugin
+(github.com/progval/Supybot-plugins/tree/master/NickTracker) -- that
+plugin is AGPLv3, a meaningfully heavier copyleft than anything else this
+project vendors (BSD-3-Clause/MIT throughout, see THIRD_PARTY_LICENSES.md)
+and AGPL's network-use clause makes it a genuinely different legal
+question for a bot that talks to IRC users, so nothing from it was
+copied -- this is an independent implementation, and unlike NickTracker
+(which re-parses ChannelLogger's log files on demand) it's an in-memory
+side effect of `snapshot()`, the same event stream `_host_joins`/
+`_host_channels` already ride on, with no filesystem dependency at all.
 """
 from __future__ import annotations
 
@@ -71,10 +86,18 @@ class ContextStore:
     """
 
     def __init__(self, join_window_secs: float = 10.0, global_log_max: int = 300,
-                 max_tracked_nicks: int = 5000):
+                 max_tracked_nicks: int = 5000, max_nicks_per_host: int = 20):
         self._chan: Dict[ChanKey, _ChannelState] = defaultdict(_ChannelState)
         self._host_joins: Dict[Tuple[str, str], List[float]] = defaultdict(list)
         self._host_channels: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+        # (network, host) -> OrderedDict[nick.lower(), (display_nick, ts)],
+        # oldest-first, LRU-bounded per host by max_nicks_per_host -- see
+        # module docstring. A host cycling through many nicks (itself a
+        # possible signal, but not this feature's job to judge) just loses
+        # its oldest aliases rather than growing unboundedly.
+        self._host_nicks: Dict[Tuple[str, str], "OrderedDict[str, Tuple[str, float]]"] = \
+            defaultdict(OrderedDict)
+        self.max_nicks_per_host = max_nicks_per_host
         # (ts, network, channel, event_type, nick, host, detail)
         self._global_log: Deque[tuple] = deque(maxlen=global_log_max)
         self.join_window_secs = join_window_secs
@@ -116,6 +139,7 @@ class ContextStore:
         now = ts if ts is not None else time.time()
         with self._lock:
             self._note_identity(network, nick, ident, host)
+            self._note_host_nick(network, host, nick, now)
             cutoff = now - self.join_window_secs
 
             joins = self._host_joins[(network, host)]
@@ -154,6 +178,38 @@ class ContextStore:
         self._nick_identity.move_to_end(key)
         while len(self._nick_identity) > self.max_tracked_nicks:
             self._nick_identity.popitem(last=False)
+
+    def _note_host_nick(self, network: str, host: str, nick: str, ts: float) -> None:
+        # Caller (snapshot) already holds self._lock.
+        if not host:
+            return
+        nicks = self._host_nicks[(network, host)]
+        lower = nick.lower()
+        nicks[lower] = (nick, ts)
+        nicks.move_to_end(lower)
+        while len(nicks) > self.max_nicks_per_host:
+            nicks.popitem(last=False)
+
+    def nick_history_for_host(self, network: str, host: str,
+                               exclude_nick: Optional[str] = None,
+                               limit: int = 10) -> List[str]:
+        """Read-only, most-recent-first list of OTHER nicks this host has
+        connected as on this network -- never mutates (same "a manual
+        check must not inflate tracked state" discipline as
+        observed_context above; recording only ever happens as a side
+        effect of a real snapshot() call, i.e. a real join).
+        `exclude_nick` (case-insensitive) omits the nick currently being
+        checked/joining, so a host's own current identity never shows up
+        in its own history. A host this store has never seen, or one
+        that's only ever used the excluded nick, returns [].
+        """
+        with self._lock:
+            nicks = self._host_nicks.get((network, host))
+            entries = list(nicks.values()) if nicks else []
+        exclude = exclude_nick.lower() if exclude_nick else None
+        display = [n for n, _ts in entries if n.lower() != exclude]
+        display.reverse()  # most-recent-first
+        return display[:limit]
 
     def identity_for_nick(self, network: str, nick: str) -> Optional[Tuple[str, str]]:
         """Best-effort (ident, host) for a nick we've seen join/speak on

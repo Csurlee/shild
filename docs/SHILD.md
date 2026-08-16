@@ -5,9 +5,11 @@ AI + ML classifier analysis for IRC joins and channel messages, with op-gated re
 Every join (and, optionally, every channel message) in an enabled channel is analyzed and logged
 to `data/shadow_decisions.jsonl` — this shadow-mode logging is **unconditional** in every enabled
 channel, regardless of op status or the kill switch. On top of that, a `ban` verdict additionally
-becomes a real kick + ban only when **both** hold: the bot currently holds real op in that channel
-(checked live, never cached) and the global kill switch is off. A `warn` verdict never triggers
-real action.
+becomes a real kick + ban only when **both** hold: the global kill switch is off, and the bot can
+actually act — either it holds real op in that channel right now (checked live, never cached), or
+(2026-08-16, Undernet only) it lacks op but a live-verified X capability there lets it route the
+action through Undernet's X service instead — see `docs/UNDERNETX.md`'s "X-routed enforcement
+fallback". A `warn` verdict never triggers real action either way.
 
 See the main [README](../README.md) for the decision pipeline (classifier → evidence gate →
 optional Ollama → fusion → enforcement) and [`CLAUDE.md`](../CLAUDE.md) for full operational
@@ -23,7 +25,11 @@ For real enforcement (not just shadow logging) to ever fire, **all** of the foll
 
 1. `plugins.Shild.enabled` is `True` for that channel
 2. the fused decision is `ban` (never `warn`)
-3. the bot actually holds op in that channel right now (checked live via IRC state)
+3. the bot actually holds op in that channel right now (checked live via IRC state) **or**
+   (Undernet only) a live-verified X capability fallback is available there — see
+   `docs/UNDERNETX.md`'s "X-routed enforcement fallback"; this is a genuine fallback, never a
+   substitute — a channel where the bot holds real op always uses the native path regardless of
+   what the X cache says
 4. `plugins.Shild.protection.killSwitch` is `False` (it **defaults to `True`** — safe out of the box)
 
 Getting the bot opped at all is separate infrastructure (NickServ/ChanServ on Libera, X on
@@ -100,6 +106,22 @@ actually checked — fixed by always appending `[shadow-manual] evidence: ...` w
 gathered (skipped only for the fast paths that never ran a real lookup at all: an ignored host, or
 a channel-Tier-0-conclusive trusted cloak/account with nothing further to check).
 
+**Shows prior aliases for the same host (2026-08-16)** — real ban-evasion detection (same person,
+new nick after a kick/ban). `context.py`'s `ContextStore` now tracks, as a side effect of every
+real join `snapshot()` already processes, every nick a given host has connected as; `shildcheck`
+shows any others (never the nick currently being checked) as a separate
+`[shadow-manual] <host> also seen as: ...` line, silent if there's no history. In-memory only, no
+filesystem dependency (unlike the idea's origin — see below) — LRU-bounded per host so a very
+long-lived/chatty host can't grow this unboundedly.
+
+The underlying idea is adapted from progval's `NickTracker` plugin
+(`github.com/progval/Supybot-plugins/tree/master/NickTracker`), which re-parses `ChannelLogger`'s
+log files on demand — reimplemented independently rather than vendored, specifically because that
+plugin is **AGPLv3**, a meaningfully heavier copyleft than anything else this project vendors
+(BSD-3-Clause/MIT throughout — see `THIRD_PARTY_LICENSES.md`), and AGPL's network-use clause is a
+genuinely different legal question for a bot that talks to IRC users over the network. Nothing
+from that plugin's code was copied.
+
 ### `shildignore <nick or host/IP>`
 
 ```
@@ -152,9 +174,47 @@ Lists every host on the ignore list.
 | `plugins.Shild.budgetPath` | global | String | `budget.json` | Path to persisted daily/lifetime lookup-budget counters. |
 | `plugins.Shild.banIdsPath` | global | String | `shild_ban_ids.json` | Path to the persisted counter assigning each real ban its permanent `[ID: N]`. |
 | `plugins.Shild.ignoreList` | global | Space-separated list | `[]` | Hosts Shild never evaluates. Managed via `shildignore`/`shildunignore`, not meant to be hand-edited. |
+| `plugins.Shild.decisionCache.enabled` | global | Boolean | `True` | Whether a host's most recent decision is reused for a repeat join/message. See "Decision cache" below. |
+| `plugins.Shild.decisionCache.ttlSecs` | global | Positive float | `7200.0` (2h, raised from 30 min 2026-08-16) | How long a cached decision is reused before a repeat gets a genuinely fresh evaluation. |
 
 > All `*Path` values are resolved relative to the bot's own working directory (`runtime/`) — never
 > prefix them with `runtime/`.
+
+### Decision cache
+
+Added 2026-08-16 after a real live incident: a host reconnecting to a busy channel every 15-90
+seconds (a flapping/reconnecting client, not a fresh attempt each time) was re-running the full
+classifier+evidence pipeline — real AbuseIPDB/Scamalytics network calls, real budget consumption,
+a real proxy-port scan — and re-posting an identical `[shadow] BAN ...` line every single time.
+
+`decision_cache.py`'s `DecisionCache` remembers the most recent fused decision per **host**
+(deliberately not per (nick, host) — every hard corroborating signal, AbuseIPDB/Scamalytics score,
+an open proxy port, the geo/hosting flag, is a property of the IP, not the nick, so a nick change
+from the same host correctly reuses the same well-founded decision rather than forcing a fresh,
+rate-limited lookup for no new information about the host itself). A repeat join/message from the
+same host within `decisionCache.ttlSecs` skips the shadow-log write and the `[shadow]` relay — a
+cache hit is deliberately silent, since neither would carry anything new — but **still runs real
+enforcement if it's newly eligible** (the bot could have been opped, or the kill switch flipped
+off, since the original decision was cached): being cached is about not re-deciding, never about
+suppressing real protection once it's armed. A cache hit does not refresh the entry's own age, so
+a connection that flaps continuously still gets a genuinely fresh look once `ttlSecs` elapses,
+rather than being able to keep itself cached forever just by reconnecting often.
+
+**In-flight tracking, added the same day.** The cache above only protects a new event arriving
+*after* a prior evaluation for the same host has fully completed — it does nothing for a burst of
+near-simultaneous events, none of which have anything cached yet. Confirmed live: a host flooding
+messages every ~2s produced 5 separate full evidence-gathering passes and 5 separate `[shadow]`
+relay lines within seconds (evidence-gathering itself takes ~2s, and `worker.maxConcurrency=1`
+serializes redundant lookups one after another rather than deduplicating them). `plugin.py` now
+marks a host in-flight the moment it dispatches a worker evaluation and clears it once that
+evaluation resolves; a second event for the same host arriving while it's in-flight is dropped
+outright — no worker dispatch, no shadow-log write, no relay — since the in-flight evaluation's
+own resolution already covers that host. In-flight markers also expire on their own after 60s
+regardless of whether they're ever explicitly cleared, bounding the damage if a worker job is ever
+silently dropped (queue full, worker not running) rather than leaving a host unmoderated until the
+next restart.
+
+Plugin-side only (no `shildml/` change) — `@reload Shild` picks it up.
 
 ### `ollama.*`
 
@@ -199,8 +259,9 @@ Lists every host on the ignore list.
 
 | Value | Type | Default | Description |
 |---|---|---|---|
-| `plugins.Shild.dnsbl.timeout` | Positive float | `5.0` | DNS lookup timeout (seconds) for DNSBL/DroneBL/bogon/Tor-exit/IRCBL checks. |
+| `plugins.Shild.dnsbl.timeout` | Positive float | `2.0` | DNS lookup timeout (seconds) for DNSBL/DroneBL/bogon/Tor-exit checks (and IRCBL, when queried — see `ircblEnabled` below). Lowered from `5.0` on 2026-08-16 after live timing showed a slow zone can stall the whole Tier 1 stage for the full timeout. |
 | `plugins.Shild.dnsbl.cacheTtl` | Positive integer | `21600` (6h) | Cache TTL per IP for DNSBL results; also reused as the Tier 2 cache TTL. |
+| `plugins.Shild.dnsbl.ircblEnabled` | Boolean | `False` | Whether `rbl.ircbl.org` is queried on the **live** join/message evidence path. Off by default (2026-08-16): live concurrent timing showed it's consistently the slowest of the 5 DNSBL zones and drags the other 4 down when fired together (`asyncio.gather`), and Undernet's own X service already g-lines off this same list, so a live ban here is often duplicate enforcement. Always still queried on a manual `!shildcheck`/`!shcheck`, regardless of this setting — an operator investigating a host gets every available signal with no live-enforcement risk. |
 | `plugins.Shild.ipapi.timeout` | Positive float | `8.0` | HTTP timeout for ip-api.com geo/proxy lookups. |
 | `plugins.Shild.ipapi.cacheTtl` | Positive integer | `86400` (24h) | Cache TTL per IP for ip-api.com results. |
 | `plugins.Shild.ipapi.rateLimitPerMinute` | Positive integer | `45` | ip-api.com's free-tier rate limit. |
@@ -308,10 +369,10 @@ lookup just finds nothing, same as before this feature existed.
 | Live (re-read per event) | Needs `@reload Shild` | Needs a full restart |
 |---|---|---|
 | `thresholds.*` (incl. `classifierBanSecondaryFloor`) | `evidence.abuseipdbThreshold` / `ipqsThreshold` / `scamalyticsThreshold` / `requireHardEvidenceForBan` / `scamalyticsExtreme` / `abuseipdbExtreme` / `ipqsExtreme` / `enableSecondaryBanEscalation` | Never for config values — but the `shildml/fusion.py` + `shildml/evidence.py` code behind the two new `evidence.*Extreme`/`enableSecondaryBanEscalation`-gated escalation sub-rules (2026-08-14) needs a full restart to load at all, same as any other `shildml/` change |
-| `protection.*` | `dnsbl.*`, `ipapi.*`, `abuseipdb.*`, `ipqs.*`, `scamalytics.*`, `proxyscan.*`, `geoip.*`, `blocklist.*` | |
+| `protection.*` | `dnsbl.timeout`, `dnsbl.cacheTtl`, `ipapi.*`, `abuseipdb.*`, `ipqs.*`, `scamalytics.*`, `proxyscan.*`, `geoip.*`, `blocklist.*` | |
 | `ollama.*` | `classifier.*`, `worker.*` | |
-| `evidence.enabled` | all `*Path` values, `report.checkIntervalSecs` | |
-| `enabled`, `messageAnalysis`, `relayChannel`, `ignoreList`, `report.dir`, `report.announce` | | |
+| `evidence.enabled`, `dnsbl.ircblEnabled` | all `*Path` values, `report.checkIntervalSecs` | |
+| `enabled`, `messageAnalysis`, `relayChannel`, `ignoreList`, `report.dir`, `report.announce`, `decisionCache.enabled` | `decisionCache.ttlSecs` | |
 
 A code change to `shildml/` itself (the pure ML package) always needs a full bot restart — `@reload
 Shild` does not re-import it, since it's a separate top-level package. See `CLAUDE.md` for the
@@ -322,7 +383,7 @@ history behind that rule.
 | File | Purpose |
 |---|---|
 | `data/shadow_decisions.jsonl` | Every decision, unconditional (`fused_raw` + `fused` + `gate` + full `evidence`). |
-| `data/enforcement_actions.jsonl` | Real kick+ban actions Shild itself took. |
+| `data/enforcement_actions.jsonl` | Real kick+ban actions Shild itself took. Each record's `via` field (2026-08-16) is `"native"` (real op, MODE+KICK) or `"x"` (routed through UndernetX — see `docs/UNDERNETX.md`). |
 | `data/observed_moderation.jsonl` | Kicks/bans observed from **other** ops/bots — free ground truth. |
 | `secrets.json` | `abuseipdb_key`, `ipqs_key`, `scamalytics_username`/`_key` (+ optional `_username2`/`_key2`). |
 | `budget.json` | Persisted daily/lifetime lookup-quota counters. |

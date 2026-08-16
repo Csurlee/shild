@@ -35,6 +35,37 @@ class UndernetXTestCase(ChannelPluginTestCase):
         # run order.
         conf.supybot.plugins.UndernetX.auth.username.setValue("")
         conf.supybot.plugins.UndernetX.auth.password.setValue("")
+        # 2026-08-16: enforcement.preferXCommands (channel-scoped) was
+        # ALREADY a real, pre-existing leak here -- two existing tests
+        # below set it via .setValue() and never reset it, only "safe"
+        # by alphabetical test-ordering luck. Reset it and the four new
+        # X-enforcement-fallback registry values explicitly, same
+        # discipline as auth.username/.password just above.
+        conf.supybot.plugins.UndernetX.enforcement.preferXCommands.get(
+            self.channel).setValue(False)
+        # The network-scoped form (2026-08-16, see the network=irc.network
+        # fix) is a SEPARATE registry value from the bare one above -- a
+        # test setting it directly (e.g. to prove the fix works) would
+        # otherwise leak into every later test the same way the bare form
+        # already did before it had this reset. Plain .setValue(False)
+        # is NOT enough here and would actually be actively wrong: per
+        # registry.py's getSpecific(), a net+chan value that was EVER
+        # explicitly set (._wasSet=True) -- even set to False -- takes
+        # ABSOLUTE PRECEDENCE over the bare per-channel value, regardless
+        # of which is actually True. .setValue() always sets ._wasSet,
+        # so leaving that flag set here would make every test relying on
+        # ONLY the bare form (i.e. almost all of them, via _arm() below)
+        # silently read False instead -- caught live via a real test
+        # failure the same day this reset was first added. Must also
+        # clear ._wasSet directly to genuinely restore "never touched".
+        net_specific = conf.supybot.plugins.UndernetX.enforcement.preferXCommands.get(
+            ":test").get(self.channel)
+        net_specific.setValue(False)
+        net_specific._wasSet = False
+        conf.supybot.plugins.UndernetX.enforcement.xFallbackEnabled.setValue(False)
+        conf.supybot.plugins.UndernetX.enforcement.minAccessLevel.setValue(100)
+        conf.supybot.plugins.UndernetX.enforcement.probeTtlSecs.setValue(3600)
+        conf.supybot.plugins.UndernetX.enforcement.probeMinIntervalSecs.setValue(60)
 
         u = ircdb.users.newUser()
         u.name = "test-admin"
@@ -324,6 +355,23 @@ class UndernetXTestCase(ChannelPluginTestCase):
         self.irc.state.supported["NETWORK"] = "Libera.Chat"
         self.assertFalse(self._plugin.prefers_x_commands(self.irc, self.channel))
 
+    def test_prefers_x_commands_reads_a_network_scoped_only_value(self):
+        # Regression test (2026-08-16): a value set via ONLY the
+        # network-scoped form -- e.g. Limnoria's own "config channel
+        # <network> <channel> ..." command -- must be read correctly.
+        # Before the network=irc.network fix, registryValue()'s own
+        # getSpecific() silently ignored this entirely and only ever
+        # consulted the bare per-channel value, so a channel armed this
+        # way (and ONLY this way) would have wrongly read as opted out.
+        conf.supybot.plugins.UndernetX.enforcement.preferXCommands.get(
+            ":test").get(self.channel).setValue(True)
+        # The bare (non-network-scoped) value is untouched/still False --
+        # this proves the network-scoped value is actually what's being
+        # read, not a coincidental bare-value match.
+        self.assertFalse(
+            conf.supybot.plugins.UndernetX.enforcement.preferXCommands.get(self.channel)())
+        self.assertTrue(self._plugin.prefers_x_commands(self.irc, self.channel))
+
     # ---- undernetxstatus ----
 
     def test_undernetxstatus_off_undernet(self):
@@ -356,3 +404,286 @@ class UndernetXTestCase(ChannelPluginTestCase):
         self.assertIsNotNone(reply)
         self.assertIn("operation succeeded", reply.args[1])
         self.assertIsNone(self.irc.takeMsg())  # nothing more queued
+
+    # ---- X-capability probe / enforcement fallback (2026-08-16) ----
+
+    def _arm(self, *, prefer=True, fallback=True, identified=True, username="shild"):
+        conf.supybot.plugins.UndernetX.enforcement.preferXCommands.get(
+            self.channel).setValue(prefer)
+        conf.supybot.plugins.UndernetX.enforcement.xFallbackEnabled.setValue(fallback)
+        conf.supybot.plugins.UndernetX.auth.username.setValue(username)
+        self._plugin.identified = identified
+
+    def _feed_x_notice(self, text):
+        from supybot import ircmsgs
+        xhostmask = conf.supybot.plugins.UndernetX.auth.xserviceHostmask()
+        self.irc.feedMsg(ircmsgs.notice(self.nick, text, prefix=xhostmask))
+
+    def test_xprobe_sends_the_right_access_query_with_no_premature_ack(self):
+        self._arm()
+        sent = self.getMsg(f"xprobe {self.channel}")
+        self.assertEqual(sent.command, "PRIVMSG")
+        self.assertEqual(sent.args[1], f"ACCESS {self.channel} ={self.nick}")
+        reply = self.irc.takeMsg()
+        self.assertIn("probing X capability", reply.args[1])
+
+    def test_xprobe_reports_the_resolved_verdict_once_the_reply_lands(self):
+        # Real bug found live 2026-08-16: "xprobe #channel" sent the
+        # immediate ack and then NEVER reported the actual result -- the
+        # probe's own resolution path only ever logged internally
+        # (correct for the SILENT background triggers, wrong for a
+        # command a human is actively watching). Fixed via
+        # _maybe_probe_channel's new on_verdict callback.
+        self._arm()
+        self.getMsg(f"xprobe {self.channel}")  # the ACCESS PRIVMSG
+        self.irc.takeMsg()  # the "probing..." ack
+
+        self._feed_x_notice(f"shild (shild) has access 500 in {self.channel}.")
+
+        report = self.irc.takeMsg()
+        self.assertIsNotNone(report, "xprobe must report a result once the reply lands")
+        self.assertIn("usable", report.args[1])
+        self.assertIn("500", report.args[1])
+
+    def test_xprobe_reports_unusable_after_a_denial_reply(self):
+        self._arm()
+        self.getMsg(f"xprobe {self.channel}")
+        self.irc.takeMsg()
+
+        self._feed_x_notice("No Match!")
+
+        report = self.irc.takeMsg()
+        self.assertIsNotNone(report)
+        self.assertIn("unusable", report.args[1])
+
+    def test_xprobe_requires_admin_capability(self):
+        self._arm()
+        self._assert_denied_admin_capability(f"xprobe {self.channel}")
+
+    def test_xprobe_errors_off_undernet(self):
+        self._arm()
+        self.irc.state.supported["NETWORK"] = "Libera.Chat"
+        m = self.getMsg(f"xprobe {self.channel}")
+        self.assertIn("only works on UnderNet", m.args[1])
+
+    def test_xprobe_errors_when_not_identified(self):
+        self._arm(identified=False)
+        m = self.getMsg(f"xprobe {self.channel}")
+        self.assertIn("Not identified", m.args[1])
+
+    def test_multiline_access_reply_stays_pending_across_first_lines(self):
+        # The core regression test for the new multi-line mechanic:
+        # header + a data row + a terminator, as three SEPARATE NOTICEs.
+        # The request must stay correlated (pending_count == 1) across
+        # the first two, and only resolve on the terminator.
+        self._arm()
+        self.assertTrue(self._plugin._maybe_probe_channel(self.irc, self.channel, force=True))
+        self.assertEqual(self._plugin._pending.pending_count("test"), 1)
+
+        self._feed_x_notice(f"-- {self.channel} access list --")
+        self.assertEqual(self._plugin._pending.pending_count("test"), 1)
+
+        self._feed_x_notice(f"shild (shild) has access 500 in {self.channel}.")
+        # A definitive line (username+level match) finishes the probe
+        # immediately -- it doesn't need to wait for a terminator too.
+        self.assertEqual(self._plugin._pending.pending_count("test"), 0)
+
+        from plugins.UndernetX import xprobe
+        entry = self._plugin._capabilities.get("test", ircutils.toLower(self.channel))
+        self.assertEqual(entry.state, xprobe.USABLE)
+        self.assertEqual(entry.access_level, 500)
+
+    def test_multiline_access_reply_resolves_on_terminator_with_no_definitive_row(self):
+        self._arm()
+        self._plugin._maybe_probe_channel(self.irc, self.channel, force=True)
+        self._feed_x_notice(f"-- {self.channel} access list --")
+        self._feed_x_notice("someoneelse (someoneelse) has access 500 in here.")
+        self.assertEqual(self._plugin._pending.pending_count("test"), 1)
+        self._feed_x_notice("End of access list.")
+        self.assertEqual(self._plugin._pending.pending_count("test"), 0)
+
+        from plugins.UndernetX import xprobe
+        entry = self._plugin._capabilities.get("test", ircutils.toLower(self.channel))
+        self.assertEqual(entry.state, xprobe.UNUSABLE)
+
+    def test_probe_denial_reply_resolves_unusable_immediately(self):
+        self._arm()
+        self._plugin._maybe_probe_channel(self.irc, self.channel, force=True)
+        self._feed_x_notice("No Match!")
+        self.assertEqual(self._plugin._pending.pending_count("test"), 0)
+
+        from plugins.UndernetX import xprobe
+        entry = self._plugin._capabilities.get("test", ircutils.toLower(self.channel))
+        self.assertEqual(entry.state, xprobe.UNUSABLE)
+
+    def test_impostor_notice_mid_probe_is_ignored(self):
+        from supybot import ircmsgs
+        self._arm()
+        self._plugin._maybe_probe_channel(self.irc, self.channel, force=True)
+        impostor = ircmsgs.notice(self.nick, "shild (shild) has access 500 in here.",
+                                   prefix="X!nobody@evil.example")
+        self.irc.feedMsg(impostor)  # must not raise, must not satisfy the probe
+        self.assertEqual(self._plugin._pending.pending_count("test"), 1)
+
+    # ---- x_enforcement_available -- fail-closed on every missing precondition ----
+
+    def test_x_enforcement_available_false_off_undernet(self):
+        self._arm()
+        self._seed_usable()
+        self.irc.state.supported["NETWORK"] = "Libera.Chat"
+        self.assertFalse(self._plugin.x_enforcement_available(self.irc, self.channel))
+
+    def test_x_enforcement_available_false_when_not_identified(self):
+        self._arm(identified=False)
+        self._seed_usable()
+        self.assertFalse(self._plugin.x_enforcement_available(self.irc, self.channel))
+
+    def test_x_enforcement_available_false_when_arm_switch_off(self):
+        self._arm(fallback=False)
+        self._seed_usable()
+        self.assertFalse(self._plugin.x_enforcement_available(self.irc, self.channel))
+
+    def test_x_enforcement_available_false_when_channel_not_opted_in(self):
+        self._arm(prefer=False)
+        self._seed_usable()
+        self.assertFalse(self._plugin.x_enforcement_available(self.irc, self.channel))
+
+    def test_x_enforcement_available_false_with_no_cache_entry(self):
+        self._arm()
+        self.assertFalse(self._plugin.x_enforcement_available(self.irc, self.channel))
+
+    def test_x_enforcement_available_true_with_seeded_usable_cache(self):
+        self._arm()
+        self._seed_usable()
+        self.assertTrue(self._plugin.x_enforcement_available(self.irc, self.channel))
+
+    def test_x_enforcement_available_true_with_network_scoped_only_prefer(self):
+        # Same regression as test_prefers_x_commands_reads_a_network_
+        # scoped_only_value, but through the actual enforcement gate
+        # (x_enforcement_available), which is what Shild/SpamGuard's
+        # enforcement.py really calls.
+        self._arm(prefer=False)  # bare form explicitly False
+        conf.supybot.plugins.UndernetX.enforcement.preferXCommands.get(
+            ":test").get(self.channel).setValue(True)
+        self._seed_usable()
+        self.assertTrue(self._plugin.x_enforcement_available(self.irc, self.channel))
+
+    def _seed_usable(self):
+        from plugins.UndernetX.xprobe import ProbeVerdict
+        self._plugin._capabilities.record(
+            "test", ircutils.toLower(self.channel),
+            ProbeVerdict(state="usable", access_level=500), [],
+        )
+
+    # ---- enforce_ban_via_x / unban_via_x ----
+
+    def test_enforce_ban_via_x_queues_ban_then_kick(self):
+        self._arm()
+        self._seed_usable()
+        result = self._plugin.enforce_ban_via_x(
+            self.irc, self.channel, "spammer", "*!*@1.2.3.4", "spamming", duration_secs=3600)
+        self.assertTrue(result)
+        ban = self.irc.takeMsg()
+        kick = self.irc.takeMsg()
+        self.assertEqual(ban.args[1], f"BAN {self.channel} *!*@1.2.3.4 60m 0 spamming")
+        self.assertEqual(kick.args[1], f"KICK {self.channel} spammer spamming")
+
+    def test_enforce_ban_via_x_with_no_cache_entry_queues_no_ban_or_kick(self):
+        # The gate cannot be bypassed -- a caller holding a stale
+        # reference or skipping x_enforcement_available itself still
+        # gets re-checked inside enforce_ban_via_x, which returns False.
+        # That recheck legitimately queues a lazy availability PROBE as
+        # an honest side effect (same as x_enforcement_available called
+        # directly would) -- what must NEVER happen is an actual BAN/
+        # KICK being sent without a confirmed-usable cache entry.
+        self._arm()
+        result = self._plugin.enforce_ban_via_x(
+            self.irc, self.channel, "spammer", "*!*@1.2.3.4", "spamming")
+        self.assertFalse(result)
+        queued = [self.irc.takeMsg()]
+        while queued[-1] is not None:
+            queued.append(self.irc.takeMsg())
+        queued = [m for m in queued if m is not None]
+        self.assertEqual(
+            [m for m in queued if m.args[1].startswith(("BAN ", "KICK "))], [])
+
+    def test_denial_reply_after_enforcement_demotes_the_cache(self):
+        from plugins.UndernetX import xprobe
+        self._arm()
+        self._seed_usable()
+        self._plugin.enforce_ban_via_x(
+            self.irc, self.channel, "spammer", "*!*@1.2.3.4", "spamming", duration_secs=3600)
+        self.irc.takeMsg()  # BAN
+        self.irc.takeMsg()  # KICK
+        self._feed_x_notice("You lack enough access.")  # answers the BAN's own correlation
+        entry = self._plugin._capabilities.get("test", ircutils.toLower(self.channel))
+        self.assertEqual(entry.state, xprobe.UNUSABLE)
+
+    def test_unban_via_x_works_even_after_cache_demotion(self):
+        self._arm()
+        self._seed_usable()
+        self._plugin._capabilities.invalidate("test", ircutils.toLower(self.channel))
+        result = self._plugin.unban_via_x(self.irc, self.channel, "*!*@1.2.3.4")
+        self.assertTrue(result)
+        sent = self.irc.takeMsg()
+        self.assertEqual(sent.args[1], f"UNBAN {self.channel} *!*@1.2.3.4")
+
+    # ---- doJoin-triggered probing ----
+
+    def _feed_join(self, nick):
+        from supybot import ircmsgs
+        # feedMsg (not calling doJoin directly) matters here: IrcMsg's
+        # own `.channel` attribute is only ever set by irclib.py's real
+        # dispatch path (irclib.py:1642, msg.channel = channel) -- a
+        # bare IrcMsg's __getattr__ returns None for anything not
+        # explicitly set, so a direct doJoin(irc, msg) call would see
+        # msg.channel is None and silently no-op every gate that reads
+        # it. Every other plugin's own JOIN-simulating test helper in
+        # this repo (Shild's _make_join, SpamGuard's _join) already goes
+        # through feedMsg for exactly this reason.
+        self.irc.feedMsg(ircmsgs.IrcMsg(
+            command="JOIN", args=(self.channel,),
+            prefix=ircutils.joinHostmask(nick, "shild", "bot.example"),
+        ))
+
+    def test_own_join_to_opted_in_channel_schedules_a_probe(self):
+        self._arm()
+        before = len(self._plugin._scheduled_probe_events)
+        self._feed_join(self.nick)
+        self.assertGreater(len(self._plugin._scheduled_probe_events), before)
+
+    def test_own_join_to_non_opted_in_channel_schedules_nothing(self):
+        self._arm(prefer=False)
+        before = len(self._plugin._scheduled_probe_events)
+        self._feed_join(self.nick)
+        self.assertEqual(len(self._plugin._scheduled_probe_events), before)
+
+    def test_other_nicks_join_is_ignored(self):
+        self._arm()
+        before = len(self._plugin._scheduled_probe_events)
+        self._feed_join("someoneelse")
+        self.assertEqual(len(self._plugin._scheduled_probe_events), before)
+
+    # ---- login success clears the capability cache ----
+
+    def test_fresh_login_success_clears_the_capability_cache(self):
+        self._arm()
+        self._seed_usable()
+        self.assertTrue(self._plugin._capabilities.is_usable(
+            "test", ircutils.toLower(self.channel), ttl=3600))
+        self._plugin.identified = False  # simulate "not yet identified this session"
+        self._feed_x_notice("AUTHENTICATION SUCCESSFUL as shild")
+        # A fresh identification clears every cached verdict on this
+        # network -- old verdicts from a prior/no session are meaningless.
+        self.assertIsNone(self._plugin._capabilities.get("test", ircutils.toLower(self.channel)))
+
+    def test_relogin_while_already_identified_does_not_clear_the_cache(self):
+        # was_identified True -> True is NOT a fresh identification, so
+        # an already-logged-in bot's cached verdicts survive an
+        # "already authenticated" reply (e.g. a stray duplicate login
+        # attempt) rather than being wiped for no reason.
+        self._arm()
+        self._seed_usable()
+        self._plugin.identified = True
+        self._feed_x_notice("Sorry, You are already authenticated as shild")
+        self.assertIsNotNone(self._plugin._capabilities.get("test", ircutils.toLower(self.channel)))

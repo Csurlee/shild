@@ -13,6 +13,19 @@ This module never decides *whether* to act -- that gating (op status,
 the global kill switch, which fused actions warrant enforcement) lives in
 plugin.py's `_maybe_enforce()`. Functions here are pure "given a decision
 to enforce, do the IRC mechanics."
+
+2026-08-16: `_maybe_enforce()` gained a SECOND, explicitly gated route to
+a real kick/ban when the bot lacks op -- routing through Undernet's X
+service via plugins/UndernetX (`irc.getCallback("UndernetX")`, never a
+Python import). That path builds plain `ircmsgs.privmsg()` calls inside
+UndernetX's own `plugin.py`, entirely out of scope for the
+`ircmsgs.(kick|ban|mode)(` grep above, and is subject to its own layered
+gating (a per-channel opt-in, a global arm switch, and a live-verified
+capability probe -- see plugins/UndernetX/xprobe.py) on top of the same
+kill switch this module's callers already require. This module's own
+invariant -- the only place a real `ircmsgs.kick/ban/mode()` call is
+constructed -- is unaffected; the X path is a different mechanism
+entirely, not a second way to build the same kind of message.
 """
 from __future__ import annotations
 

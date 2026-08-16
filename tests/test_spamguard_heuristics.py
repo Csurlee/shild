@@ -1,6 +1,7 @@
 from plugins.SpamGuard.heuristics import (
     caps_percentage,
     highlighted_nick_count,
+    prune_join_events,
     prune_window,
 )
 
@@ -24,6 +25,31 @@ def test_prune_window_empty_input_is_empty_output():
 def test_prune_window_boundary_is_inclusive():
     # exactly window_secs old -- "now - t <= window_secs" keeps it
     assert prune_window([5.0], now=10.0, window_secs=5.0) == [5.0]
+
+
+# ---- prune_join_events ----
+
+def test_prune_join_events_keeps_entries_within_window():
+    events = [(1.0, "a"), (5.0, "b"), (9.0, "c")]
+    result = prune_join_events(events, now=10.0, window_secs=5.0)
+    assert result == [(5.0, "b"), (9.0, "c")]
+
+
+def test_prune_join_events_drops_everything_outside_window():
+    events = [(1.0, "a"), (2.0, "b")]
+    assert prune_join_events(events, now=100.0, window_secs=5.0) == []
+
+
+def test_prune_join_events_empty_input_is_empty_output():
+    assert prune_join_events([], now=10.0, window_secs=5.0) == []
+
+
+def test_prune_join_events_preserves_nick_pairing():
+    # Same nick joining twice must not collapse -- pruning only drops by
+    # time, distinct-nick counting is the caller's job (plugin.py).
+    events = [(9.0, "flooder"), (9.5, "flooder")]
+    result = prune_join_events(events, now=10.0, window_secs=5.0)
+    assert result == [(9.0, "flooder"), (9.5, "flooder")]
 
 
 # ---- highlighted_nick_count ----

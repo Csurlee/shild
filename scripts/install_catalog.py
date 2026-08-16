@@ -125,6 +125,8 @@ CATALOG: dict[str, list] = {
         Skip("proxyscan.connectTimeout", "internal tuning"),
         Skip("proxyscan.overallTimeout", "internal tuning"),
         Skip("ignoreList", "managed live via the shildignore command, not at install time"),
+        Skip("decisionCache.enabled", "correct default (True), not a first-install decision"),
+        Skip("decisionCache.ttlSecs", "internal tuning"),
         Skip("report.dir", "derived: runtime/daily_analysis"),
         Skip("report.announce", "internal tuning"),
         Skip("report.checkIntervalSecs", "internal tuning"),
@@ -137,6 +139,13 @@ CATALOG: dict[str, list] = {
         Skip("worker.maxConcurrency", "internal tuning"),
         Skip("dnsbl.timeout", "internal tuning"),
         Skip("dnsbl.cacheTtl", "internal tuning"),
+        Ask("dnsbl.ircblEnabled", tier="advanced", kind="bool", default=False,
+            question="Include rbl.ircbl.org in LIVE join/message evidence checks? "
+                     "(Off by default: on this project's own deployment it was the "
+                     "slowest of the 5 DNSBL zones and dragged the others down when "
+                     "queried concurrently, and Undernet's own X service already "
+                     "g-lines off this same list -- still always queried on a manual "
+                     "!shildcheck regardless of this setting.)"),
         Skip("ipapi.timeout", "internal tuning"),
         Skip("ipapi.cacheTtl", "internal tuning"),
         Skip("ipapi.rateLimitPerMinute", "internal tuning, tied to ip-api.com's free-tier limit"),
@@ -185,6 +194,9 @@ CATALOG: dict[str, list] = {
             question="Enable the excess-caps heuristic globally as a default for new channels?"),
         Ask("mojibakeEnabled", tier="advanced", kind="bool", default=False,
             question="Enable the mojibake/garbled-encoding heuristic globally as a default for new channels?"),
+        Ask("raidEnabled", tier="advanced", kind="bool", default=False,
+            question="Enable the raid (coordinated-join) heuristic globally as a default for new "
+                     "channels? Caution: a real netsplit-reconnect burst can resemble a raid."),
         Skip("floodMessageLimit", "internal tuning"),
         Skip("floodWindowSecs", "internal tuning"),
         Skip("hilightNickLimit", "internal tuning"),
@@ -192,6 +204,8 @@ CATALOG: dict[str, list] = {
         Skip("capsPercent", "internal tuning"),
         Skip("capsMinLength", "internal tuning"),
         Skip("mojibakeScore", "internal tuning"),
+        Skip("raidJoinLimit", "internal tuning"),
+        Skip("raidWindowSecs", "internal tuning"),
         Skip("words", "legacy migration-only field, superseded by the `spamguard word add` command"),
         Skip("phrases", "legacy migration-only field"),
         Skip("patterns", "legacy migration-only field"),
@@ -281,7 +295,19 @@ CATALOG: dict[str, list] = {
         Skip("commands.replyTimeoutSecs", "internal tuning"),
         Skip("commands.defaultBanDuration", "internal tuning"),
         Skip("commands.defaultBanAccess", "internal tuning, verify against a live X before changing"),
-        Skip("enforcement.preferXCommands", "not yet consumed by any enforcement path, nothing to configure"),
+        Skip("enforcement.preferXCommands",
+             "per-channel opt-in for the X-routed enforcement fallback; set live per "
+             "channel only after completing the live verification procedure in "
+             "docs/UNDERNETX.md, not at install time"),
+        Skip("enforcement.xFallbackEnabled",
+             "master arm switch for X-routed enforcement -- ships off; the reply-text "
+             "classifier it depends on (xprobe.py) isn't verified against a live X "
+             "reply for any given deployment's account, see docs/UNDERNETX.md's "
+             "rollout procedure before ever enabling"),
+        Skip("enforcement.minAccessLevel",
+             "internal tuning; verify against a live X ACCESS reply before changing"),
+        Skip("enforcement.probeTtlSecs", "internal tuning"),
+        Skip("enforcement.probeMinIntervalSecs", "internal tuning"),
     ],
 }
 

@@ -20,11 +20,15 @@ and takes no real enforcement action until **all** of the following hold:
    if `exemptRegistered` — is any recognized registered user at all)
 4. `plugins.SpamGuard.protection.killSwitch` is `False` (**defaults `True`** — safe out of the box,
    independent of Shild's own kill switch)
-5. the bot actually holds op in that channel right now (checked live)
+5. the bot actually holds op in that channel right now (checked live) **or** (Undernet only,
+   2026-08-16) it lacks op but a live-verified X capability fallback is available — see
+   `docs/UNDERNETX.md`'s "X-routed enforcement fallback"; the native path is always used instead
+   when the bot does hold op, regardless of the X cache
 
 Every match is logged and relayed regardless of whether it acted, tagged with the exact reason it
 didn't (`killswitch` / `not-opped` / `outside-window` / `exempt`) or that it did (`enforced`) — so
-the term list can be tuned against real traffic before ever arming the kill switch.
+the term list can be tuned against real traffic before ever arming the kill switch. Each `enforced`
+record's `via` field (2026-08-16) is `"native"` or `"x"`.
 
 ## Terms: id-keyed, not registry lists
 
@@ -67,7 +71,9 @@ doesn't only block **future** joins/messages — the moment you add it, SpamGuar
 sweeps **every network the bot is currently connected to** for anyone already sitting in an
 enabled channel who matches, and kick+bans them right then (subject to the exact same exemption/
 kill-switch/op gates as any live match — an already-present halfop+ or registered user is still
-exempt, and nothing happens anywhere the kill switch is on or the bot isn't opped).
+exempt, and nothing happens anywhere the kill switch is on, or the bot isn't opped and has no
+live-verified X capability fallback available either — see `docs/UNDERNETX.md`'s "X-routed
+enforcement fallback", 2026-08-16).
 
 ```
 <owner> spamguard black add badbot
@@ -89,15 +95,26 @@ already `True` — adding a `black` entry does not override or bypass that per-c
 as every other mechanism in this plugin. "Every channel the bot is or joins" means every channel
 SpamGuard actually watches, not literally every channel the bot's IRC connection happens to be in.
 
-## Message heuristics (flood, hilight, caps, mojibake)
+## Message heuristics (flood, hilight, caps, mojibake, raid)
 
-Four more, non-term, threshold-based detectors (2026-08-14) — adapted from ideas in Libera Chat's
-own `ozone` network-abuse bot (`github.com/Libera-Chat/ozone`), reimplemented independently rather
-than copied (except the mojibake regex table, vendored verbatim under its MIT license — see
+Four non-term, threshold-based message detectors (2026-08-14) — adapted from ideas in Libera
+Chat's own `ozone` network-abuse bot (`github.com/Libera-Chat/ozone`), reimplemented independently
+rather than copied (except the mojibake regex table, vendored verbatim under its MIT license — see
 `mojibake.py`'s module docstring). Each funnels through the **same** gate chain as content/ident/
 nick/realname matches (exemption → kill switch → op), checked only when no content term already
 matched a message, and none require the join window — these are general per-message conduct
 signals, not specifically the "just joined and pasted a template" pattern content matching targets.
+
+A fifth, **raid** (2026-08-16), is join-based rather than message-based — adapted the same
+"idea, not code" way from the "grouped flood" concept in progval's `AttackProtector` plugin
+(`github.com/progval/Supybot-plugins/tree/master/AttackProtector`, 2010-era code, not vendored).
+It fires on `raidJoinLimit` **distinct** nicks joining the same channel within `raidWindowSecs`,
+but — unlike AttackProtector's own group-flood punishment, which can act on the whole burst — only
+ever enforces against the ONE joiner whose join tipped the count over the limit, never retroactively
+against the earlier ones. This is deliberately conservative: a genuine netsplit-reconnect burst of
+real regulars rejoining together looks identical to a coordinated raid at the network level, so
+`raidJoinLimit` defaults meaningfully higher than a single-nick flood threshold, and — like every
+other heuristic here — it still funnels through the same exemption/kill-switch/op gate chain.
 
 Unlike a term list (implicitly inert until a word/phrase/pattern is added), a threshold is always
 *live* the moment code exists to check it — so each heuristic is its own **per-channel opt-in,
@@ -110,12 +127,13 @@ relay lines with the kill switch still on, same staged-rollout discipline as the
 | **hilight** | `plugins.SpamGuard.hilightEnabled` | a single message names `hilightNickLimit` (default 4) or more distinct real channel members by nick (each ≥ `hilightMinNickLen` chars, default 3) — classic raid-bot behavior |
 | **caps** | `plugins.SpamGuard.capsEnabled` | `capsPercent` (default 70%) or more of a message's *letters* are uppercase, once it's at least `capsMinLength` (default 10) characters |
 | **mojibake** | `plugins.SpamGuard.mojibakeEnabled` | `mojibake.mojibake_score()` (garbled-character-encoding detection) is at/above `mojibakeScore` (default 2) |
+| **raid** | `plugins.SpamGuard.raidEnabled` | `raidJoinLimit` (default 8) *distinct* nicks join the channel within `raidWindowSecs` (default 15.0s) — acts only on the tipping-point joiner |
 
 Each match is logged/relayed/enforced exactly like a term match, using a fixed negative pseudo-id
-(`flood=-1`, `hilight=-2`, `caps=-3`, `mojibake=-4`) in place of a real TermStore id, since these
-aren't user-managed text entries — `spamguardsearch`/`spamguardremove` never apply to them; tune
-via `@config`/`config channel` instead. `spamguardstatus`, run **in a channel**, shows that
-channel's on/off state for all four on a second reply line.
+(`flood=-1`, `hilight=-2`, `caps=-3`, `mojibake=-4`, `raid=-5`) in place of a real TermStore id,
+since these aren't user-managed text entries — `spamguardsearch`/`spamguardremove` never apply to
+them; tune via `@config`/`config channel` instead. `spamguardstatus`, run **in a channel**, shows
+that channel's on/off state for all five on a second reply line.
 
 ## Commands
 
@@ -184,7 +202,7 @@ takes no arguments
 Reports match/enforcement counters (since the last restart), kill-switch state, pending
 auto-unbans, and per-category term counts — including a count of any stored patterns that failed
 to compile. Run in a channel, a second reply line also shows that channel's flood/hilight/caps/
-mojibake enable state.
+mojibake/raid enable state.
 
 ## Configuration
 
@@ -212,6 +230,9 @@ mojibake enable state.
 | `plugins.SpamGuard.capsMinLength` | global | Positive integer | `10` | Messages shorter than this (characters) are never checked for excessive caps. |
 | `plugins.SpamGuard.mojibakeEnabled` | channel | Boolean | `False` | Whether the mojibake heuristic is checked in this channel. Not op-settable. |
 | `plugins.SpamGuard.mojibakeScore` | global | Positive integer | `2` | `mojibake.mojibake_score()` value at/above which a message triggers — a raw count, not a percentage. |
+| `plugins.SpamGuard.raidEnabled` | channel | Boolean | `False` | Whether the raid (coordinated-join) heuristic is checked in this channel. Not op-settable. |
+| `plugins.SpamGuard.raidJoinLimit` | global | Positive integer | `8` | Distinct nicks joining within `raidWindowSecs` that counts as a raid. Higher than `floodMessageLimit` on purpose — a grouped signal needs more corroboration. |
+| `plugins.SpamGuard.raidWindowSecs` | global | Positive float | `15.0` | Rolling window (seconds) `raidJoinLimit` is counted over. |
 
 > `termsPath` and `logPath` are resolved relative to the bot's own working directory (`runtime/`)
 > — never prefix them with `runtime/`.

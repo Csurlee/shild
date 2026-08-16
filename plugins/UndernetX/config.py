@@ -137,21 +137,91 @@ conf.registerChannelValue(
     UndernetX.enforcement,
     "preferXCommands",
     registry.Boolean(False, _(
-        """Whether THIS channel's moderation should prefer routing
-        through X (e.g. "/msg X ban #chan host" instead of a raw
-        MODE +b) when the bot holds sufficient X access, rather than
-        Limnoria's own IRC-native MODE/KICK. Not op-settable -- same
-        reasoning as every other enforcement-adjacent switch in this
-        deployment (Shild.enabled, SpamGuard.enabled): a channel op
-        should not unilaterally change how the bot moderates.
+        """Whether THIS channel opts in to the X-routed enforcement
+        FALLBACK: when Shild/SpamGuard want to kick+ban here but the bot
+        doesn't hold real IRC op, should it try routing the action
+        through X (e.g. "/msg X ban #chan host") instead of doing
+        nothing. Not op-settable -- same reasoning as every other
+        enforcement-adjacent switch in this deployment (Shild.enabled,
+        SpamGuard.enabled): a channel op should not unilaterally change
+        how the bot moderates.
 
-        As of 2026-08-14 this value is inspectable and settable but has
-        NO consumer yet -- Shild's and SpamGuard's own enforcement.py
-        modules don't read it. It exists now (readable via
-        UndernetX.prefers_x_commands(irc, channel)) so a follow-up that
-        wires it into their real kick/ban paths doesn't need to
-        redesign this seam, only call it.""")),
+        As of 2026-08-16 this has a real consumer: Shild's and
+        SpamGuard's enforcement paths call
+        UndernetX.x_enforcement_available(irc, channel), which requires
+        this AND enforcement.xFallbackEnabled AND a live-verified,
+        cached probe result confirming X actually manages this channel
+        and the bot has enough access there -- opting in here alone does
+        NOT arm anything by itself; see enforcement.xFallbackEnabled's
+        own docstring and docs/UNDERNETX.md's "X-routed enforcement
+        fallback" section for the required rollout/verification steps
+        before setting this True anywhere live. When it IS true, the bot
+        also periodically probes this channel's X access in the
+        background (on join, on a fresh X login, and lazily as needed)
+        so a verdict is ready before it's ever needed -- an opted-out
+        channel generates zero X traffic for this feature.""")),
     opSettable=False,
+)
+conf.registerGlobalValue(
+    UndernetX.enforcement,
+    "xFallbackEnabled",
+    registry.Boolean(False, _(
+        """Master arm switch for the entire X-routed enforcement
+        fallback feature (2026-08-16). Defaults False -- the feature
+        ships fully wired but completely inert until this is flipped,
+        deliberately separate from the per-channel
+        enforcement.preferXCommands opt-in: the risk this switch guards
+        against is CODE-shaped (the X ACCESS-reply classifier in
+        xprobe.py is NOT verified against a live "channel not
+        registered with X" or a live successful access-level reply --
+        only scraped from general X documentation, plus one confirmed
+        string, "No Match!"), not per-channel, so one global flip
+        should be enough to back the whole thing out under a live
+        incident rather than needing to walk every opted-in channel one
+        by one -- same shape as protection.killSwitch elsewhere in this
+        deployment. Do NOT enable before completing the live
+        verification procedure in docs/UNDERNETX.md's "X-routed
+        enforcement fallback" section. Even when True, a channel with
+        no real X presence still resolves to "unusable" and behaves
+        exactly like today (log-only, no action) -- this switch only
+        permits the FEATURE to run, it never bypasses the per-channel
+        availability check itself.""")),
+)
+conf.registerGlobalValue(
+    UndernetX.enforcement,
+    "minAccessLevel",
+    registry.NonNegativeInteger(100, _(
+        """Minimum X access level the capability probe must see for the
+        bot's own username in a channel before that channel counts as
+        usable for X-routed enforcement. 100 is X's documented
+        op-granting access level, which comfortably implies ban/kick
+        authority -- but this is UNVERIFIED against a live ACCESS reply
+        for this deployment's actual account, same caveat as
+        commands.defaultBanAccess. Confirm the real number your account
+        shows (via "xaccess <#channel> =<botnick>" or the "xprobe"
+        command) before relying on the default.""")),
+)
+conf.registerGlobalValue(
+    UndernetX.enforcement,
+    "probeTtlSecs",
+    registry.PositiveInteger(3600, _(
+        """How long (seconds) a capability-probe verdict is trusted
+        before being treated as stale (and therefore unusable again,
+        triggering a fresh probe on the next lazy check). Default 1h --
+        long enough that a channel doesn't get re-probed constantly,
+        short enough that a revoked X access level self-corrects within
+        an hour even if nothing explicitly invalidates the cache
+        sooner.""")),
+)
+conf.registerGlobalValue(
+    UndernetX.enforcement,
+    "probeMinIntervalSecs",
+    registry.PositiveInteger(60, _(
+        """Floor (seconds) between capability probes for the SAME
+        channel, regardless of how many times it's asked about in that
+        window -- prevents a burst of joins/enforcement misses on an
+        unknown/stale channel from firing more than one ACCESS query at
+        X per interval.""")),
 )
 
 # vim:set shiftwidth=4 tabstop=4 expandtab textwidth=79:

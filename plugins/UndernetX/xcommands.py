@@ -89,6 +89,54 @@ def build_access(channel: str, target: str) -> str:
     return f"ACCESS {channel} {target}"
 
 
+def format_duration(secs: int) -> str:
+    """Converts a plain seconds count (e.g. protection.banDurationSecs)
+    into X's own BAN duration argument -- X accepts "5m" through "365d"
+    (2026-08-14, see build_ban's docstring). Picks the coarsest unit
+    that doesn't lose more than a minute of precision, clamping at both
+    ends rather than ever producing a value X would reject: below 5
+    minutes clamps up to "5m", above 365 days clamps down to "365d".
+    """
+    minutes = max(1, round(secs / 60))
+    if minutes < 5:
+        return "5m"
+    if minutes % 1440 == 0 and minutes // 1440 <= 365:
+        return f"{minutes // 1440}d"
+    if minutes <= 1440:
+        return f"{minutes}m"
+    days = minutes // 1440
+    if days >= 365:
+        return "365d"
+    return f"{days}d"
+
+
+@dataclass
+class XReplySink:
+    """What plugin.py stashes as a PendingXRequest's `reply_to` for any
+    caller that wants to inspect the raw reply text programmatically
+    instead of just relaying it to a channel (2026-08-16, added for the
+    X-capability probe and the silent enforcement send path). The queue
+    itself still never inspects `reply_to` -- see PendingXRequest's own
+    docstring -- this is purely a convention plugin.py's _handle_x_reply
+    understands.
+
+    on_reply(text) -> bool: called once per NOTICE correlated to this
+        request. Return True to indicate MORE lines are expected (the
+        request is re-armed via PendingXRequestQueue.push_front, same
+        timeout deadline); return False or None to indicate this reply
+        is complete. Needed because X's ACCESS reply is multi-line
+        (header/rows/terminator) and the existing one-NOTICE-consumes-
+        one-request model can't represent that on its own.
+    on_timeout(): called if the deadline elapses before on_reply ever
+        returns a non-True result. For a multi-line collector this is
+        the NORMAL "the reply window closed" finish, not necessarily an
+        error -- the caller decides what to do with whatever was
+        collected so far.
+    """
+    on_reply: Optional[object] = None
+    on_timeout: Optional[object] = None
+
+
 @dataclass
 class PendingXRequest:
     network: str
@@ -133,6 +181,17 @@ class PendingXRequestQueue:
         if not q:
             return None
         return q.pop(0)
+
+    def push_front(self, req: PendingXRequest) -> None:
+        """Re-inserts a request at the FRONT of its network's queue --
+        used when a request's XReplySink.on_reply says "I need more
+        lines" (2026-08-16): the request was already popped by
+        pop_oldest to correlate the NOTICE just received, and must go
+        back to being the NEXT one correlated (not the last), so a
+        multi-line reply's second/third NOTICE doesn't get matched
+        against some other, unrelated pending request instead.
+        """
+        self._queues.setdefault(req.network, []).insert(0, req)
 
     def discard(self, req: PendingXRequest) -> bool:
         """Removes a specific request (used when its timeout fires

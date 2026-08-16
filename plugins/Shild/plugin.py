@@ -53,6 +53,7 @@ from .budget import BudgetManager, ProviderLimits
 from .classifier import ClassifierWrapper
 from .collector import Collector, build_enforcement_record, build_moderation_record, build_record
 from .context import ContextSnapshot, ContextStore
+from .decision_cache import DecisionCache
 from .reputation import ReputationConfig, ReputationGatherer, load_secrets
 from .worker import Worker
 
@@ -159,6 +160,8 @@ class Shild(callbacks.Plugin):
 
         self._classifier = ClassifierWrapper(self.registryValue("classifier.modelPath"))
         self._context = ContextStore()
+        self._decision_cache = DecisionCache(
+            ttl_secs=self.registryValue("decisionCache.ttlSecs"))
         self._worker = Worker(
             max_queue=self.registryValue("worker.maxQueue"),
             max_concurrency=self.registryValue("worker.maxConcurrency"),
@@ -565,6 +568,33 @@ class Shild(callbacks.Plugin):
                          ctx, classifier_result, None, fused, fused, None, None)
             return
 
+        if self.registryValue("decisionCache.enabled"):
+            cached = self._decision_cache.get(network, host)
+            if cached is not None:
+                # Same host, already decided recently -- see
+                # decision_cache.py's module docstring for the real
+                # incident this fixes (a flapping client re-triggering
+                # the full evidence pipeline every 15-90s) and why this
+                # is keyed by host, not (nick, host). Skips the shadow-log
+                # write and relay (neither carries anything new) but
+                # still runs real enforcement if newly eligible -- op
+                # status or the kill switch could have changed since the
+                # cached decision was made.
+                cached_fused, cached_evidence = cached
+                self._maybe_enforce(irc, network, channel, nick, ident, host,
+                                     cached_fused, cached_evidence)
+                return
+            if self._decision_cache.is_in_flight(network, host):
+                # A burst of near-simultaneous events for this same
+                # host, arriving before the FIRST one's own evaluation
+                # has resolved (real incident, 2026-08-16 -- see
+                # decision_cache.py's module docstring). Nothing to
+                # enforce with yet, and the in-flight evaluation's own
+                # _finish() already covers this host once it resolves --
+                # drop this event outright rather than dispatching a
+                # redundant worker task.
+                return
+
         thresholds = self._thresholds()
         classifier_confident = (
             classifier_result is not None
@@ -636,10 +666,12 @@ class Shild(callbacks.Plugin):
             timeout=self.registryValue("ollama.timeout"),
         )
 
+        include_ircbl = self.registryValue("dnsbl.ircblEnabled")
+
         def coro_factory():
             return self._evaluate(
                 classifier_confident, ollama_enabled, event_type, nick, ident, host, channel,
-                account, text, ctx, config, evidence_enabled,
+                account, text, ctx, config, evidence_enabled, include_ircbl,
             )
 
         def on_result(outcome):
@@ -665,10 +697,13 @@ class Shild(callbacks.Plugin):
             self._finish(irc, network, channel, event_type, nick, ident, host, account,
                          ctx, classifier_result, ollama_result, fused, fused_raw, latency_ms, ev)
 
+        if self.registryValue("decisionCache.enabled"):
+            self._decision_cache.mark_in_flight(network, host)
         self._worker.submit(coro_factory, on_result)
 
     async def _evaluate(self, classifier_confident, ollama_enabled, event_type, nick, ident,
-                         host, channel, account, text, ctx, ollama_config, evidence_enabled):
+                         host, channel, account, text, ctx, ollama_config, evidence_enabled,
+                         include_ircbl=True):
         """Runs on the worker thread. Gathers host evidence first (Tier
         0-3, see reputation.py/proxyscan.py) -- always, regardless of
         ollama_enabled, since evidence still enriches the record and feeds
@@ -678,6 +713,12 @@ class Shild(callbacks.Plugin):
         Ollama prompt WITH the evidence summary embedded and calls Ollama.
         Returns (ollama_result, latency_ms, evidence) so the caller's
         on_result can fuse+record.
+
+        include_ircbl (2026-08-16): False on the live join/message path by
+        default (dnsbl.ircblEnabled), True always for !shildcheck -- see
+        that config value's docstring and reputation.gather()'s own
+        comment for why IRCBL is live-disabled but still manually
+        queryable.
         """
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
@@ -692,7 +733,7 @@ class Shild(callbacks.Plugin):
             # enabled/resolved/trust-tier gate lives there now too.
             ev = await self._reputation.gather(
                 self._session, host, account, allow_tier2=True,
-                proxyscan_cfg=self._proxyscan_cfg,
+                proxyscan_cfg=self._proxyscan_cfg, include_ircbl=include_ircbl,
             )
 
         if classifier_confident or not ollama_enabled:
@@ -719,6 +760,15 @@ class Shild(callbacks.Plugin):
     def _finish(self, irc, network, channel, event_type, nick, ident, host, account,
                 ctx, classifier_result, ollama_result, fused, fused_raw, ollama_latency_ms,
                 evidence) -> None:
+        # Unconditional (not gated on decisionCache.enabled) so a stuck
+        # in-flight marker can never survive a live toggle of that
+        # setting mid-evaluation -- discard() is a harmless no-op if
+        # this host was never marked in the first place (every
+        # synchronous _finish() call site, which never marks in-flight
+        # at all, hits exactly that no-op path).
+        self._decision_cache.clear_in_flight(network, host)
+        if self.registryValue("decisionCache.enabled"):
+            self._decision_cache.set(network, host, fused, evidence)
         self._stats["decisions"] += 1
         if fused.degraded:
             self._stats["degraded"] += 1
@@ -745,20 +795,47 @@ class Shild(callbacks.Plugin):
 
         self._maybe_enforce(irc, network, channel, nick, ident, host, fused, evidence)
 
+    def _x_fallback(self, irc, channel):
+        """The live UndernetX plugin instance iff X-routed enforcement
+        would actually work in `channel` RIGHT NOW, else None
+        (2026-08-16). Looked up fresh via irc.getCallback on every call,
+        never cached -- same discipline as WebPanel's own
+        shild_callback()/ChannelStats lookups (a cached reference would
+        keep reading a dead instance after a `@reload UndernetX`).
+        Degrades to None with zero errors if UndernetX isn't loaded at
+        all, so a deployment without it behaves exactly as before this
+        feature existed.
+        """
+        cb = irc.getCallback("UndernetX")
+        if cb is None:
+            return None
+        try:
+            return cb if cb.x_enforcement_available(irc, channel) else None
+        except Exception:
+            log.exception("Shild: UndernetX availability check failed")
+            return None
+
     def _maybe_enforce(self, irc, network, channel, nick, ident, host, fused, evidence) -> None:
         """Phase 2: turns a `ban` verdict into a real kick+ban, but only
-        where BOTH hold: the bot actually has op in this channel right
-        now (checked live, never cached) and the global kill switch is
-        off. `warn` takes no action here, same as always. This runs
-        AFTER the unconditional shadow-log write/relay above -- shadow
-        logging never depends on any of this.
+        where BOTH hold: the global kill switch is off, AND the bot can
+        actually act -- either it holds real op in this channel right
+        now (checked live, never cached), or (2026-08-16) it lacks op
+        but UndernetX confirms a live-verified X capability there (see
+        `_x_fallback` above and plugins/UndernetX/xprobe.py). `warn`
+        takes no action here, same as always. This runs AFTER the
+        unconditional shadow-log write/relay above -- shadow logging
+        never depends on any of this.
         """
         if fused.action != "ban" or fused.degraded:
             return
         if self.registryValue("protection.killSwitch"):
             return
+
+        xcb = None
         if not enforcement.is_opped(irc, channel):
-            return
+            xcb = self._x_fallback(irc, channel)
+            if xcb is None:
+                return  # exactly today's behavior: not opped, no X fallback available
 
         duration = self.registryValue("protection.banDurationSecs")
         # Short, adaptive kick message (2026-08-11 request) -- built from
@@ -768,14 +845,24 @@ class Shild(callbacks.Plugin):
         # IRC-display-only, same convention as _irc_compact_reason()
         # above). ban_id is assigned only once enforcement is actually
         # about to happen, not earlier -- a decision that never reaches
-        # here (killswitch/not-opped) never consumes an id.
+        # here (killswitch/not-opped-and-no-X-fallback) never consumes
+        # an id.
         ban_id = self._ban_ids.next_id()
         cause = _short_ban_cause(evidence)
         score = _short_ban_score(evidence, fused.confidence)
         kick_reason = f"SHILD: {host} {cause} (score: {score}) [ID: {ban_id}]"
 
+        mask = enforcement.ban_mask(host)
+        via = "x" if xcb is not None else "native"
         try:
-            mask = enforcement.enforce_ban(irc, channel, nick, host, kick_reason)
+            if xcb is not None:
+                if not xcb.enforce_ban_via_x(irc, channel, nick, mask, kick_reason,
+                                              duration_secs=duration):
+                    log.warning("Shild: X enforcement declined for %s in %s/%s",
+                                mask, network, channel)
+                    return
+            else:
+                mask = enforcement.enforce_ban(irc, channel, nick, host, kick_reason)
         except Exception:
             log.exception("Shild: failed to enforce ban")
             return
@@ -786,11 +873,20 @@ class Shild(callbacks.Plugin):
         def _do_unban():
             self._pending_unbans.pop(event_name, None)
             live_irc = world.getIrc(network)
-            if live_irc is not None:
-                try:
+            if live_irc is None:
+                return
+            try:
+                if via == "x":
+                    x_cb = live_irc.getCallback("UndernetX")
+                    if x_cb is None:
+                        log.warning("Shild: UndernetX no longer loaded; cannot lift "
+                                    "X ban %s in %s/%s", mask, network, channel)
+                        return
+                    x_cb.unban_via_x(live_irc, channel, mask)
+                else:
                     enforcement.unban(live_irc, channel, mask)
-                except Exception:
-                    log.exception("Shild: failed to auto-unban %s in %s/%s", mask, network, channel)
+            except Exception:
+                log.exception("Shild: failed to auto-unban %s in %s/%s", mask, network, channel)
 
         self._pending_unbans[event_name] = None
         schedule.addEvent(_do_unban, unban_at, name=event_name)
@@ -799,7 +895,7 @@ class Shild(callbacks.Plugin):
             id=ban_id,
             network=network, channel=channel, nick=nick, ident=ident, host=host,
             ban_mask=mask, reason=kick_reason, duration_secs=duration, unban_at=unban_at,
-            fused=fused,
+            fused=fused, via=via,
         )
         try:
             self._enforcement_log.write(record)
@@ -983,6 +1079,11 @@ class Shild(callbacks.Plugin):
         happened) and never enforces, regardless of the result or the
         kill switch. Owner-only (2026-08-09): it also spends real
         third-party API budget (AbuseIPDB/IPQS) per lookup.
+
+        Also shows any OTHER nicks this host has connected as (2026-08-16,
+        see context.py's nick_history_for_host) -- real ban-evasion
+        detection, e.g. "also seen as: evader1, evader2" -- when there's
+        any history to show; silent otherwise.
         """
         resolved = self._resolve_check_target(irc, target)
         if resolved is None:
@@ -996,6 +1097,10 @@ class Shild(callbacks.Plugin):
 
         irc.reply(f"[shadow-manual] checking {target} ({nick} {ident}@{host} on "
                   f"{network}) ...")
+
+        history = self._context.nick_history_for_host(network, host, exclude_nick=nick)
+        if history:
+            irc.reply(f"[shadow-manual] {host} also seen as: {', '.join(history)}")
 
         if self._is_ignored(host):
             # Reflects reality: a live event for this host would never
@@ -1082,9 +1187,14 @@ class Shild(callbacks.Plugin):
         )
 
         def coro_factory():
+            # Always True, regardless of dnsbl.ircblEnabled -- a manual
+            # check carries no live-enforcement risk or latency pressure,
+            # and an operator investigating a host benefits from every
+            # available signal (2026-08-16, see that config value's
+            # docstring).
             return self._evaluate(
                 classifier_confident, ollama_enabled, "join", nick, ident, host,
-                channel or "", None, "", ctx, config, evidence_enabled,
+                channel or "", None, "", ctx, config, evidence_enabled, True,
             )
 
         def on_result(outcome):

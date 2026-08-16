@@ -57,6 +57,78 @@ def test_identity_survives_being_kicked_from_state_perspective():
     assert ctx.identity_for_nick("libera", "spammer") == ("~spam", "203.0.113.9")
 
 
+# ---- nick_history_for_host (2026-08-16): ban-evasion / alias tracking ----
+
+def test_nick_history_returns_prior_nicks_most_recent_first():
+    ctx = ContextStore()
+    ctx.snapshot("undernet", "#windrop", "evader1", "~e", "203.0.113.9")
+    ctx.snapshot("undernet", "#windrop", "evader2", "~e", "203.0.113.9")
+    ctx.snapshot("undernet", "#windrop", "evader3", "~e", "203.0.113.9")
+    history = ctx.nick_history_for_host("undernet", "203.0.113.9")
+    assert history == ["evader3", "evader2", "evader1"]
+
+
+def test_nick_history_excludes_the_current_nick_case_insensitively():
+    ctx = ContextStore()
+    ctx.snapshot("undernet", "#windrop", "Evader", "~e", "203.0.113.9")
+    ctx.snapshot("undernet", "#windrop", "evader2", "~e", "203.0.113.9")
+    history = ctx.nick_history_for_host("undernet", "203.0.113.9", exclude_nick="EVADER2")
+    assert history == ["Evader"]
+
+
+def test_nick_history_dedupes_same_nick_case_insensitively():
+    ctx = ContextStore()
+    ctx.snapshot("undernet", "#windrop", "Bob", "~b", "203.0.113.9")
+    ctx.snapshot("undernet", "#windrop", "bob", "~b", "203.0.113.9")
+    history = ctx.nick_history_for_host("undernet", "203.0.113.9", exclude_nick="nobody")
+    assert history == ["bob"]  # one entry, most-recent spelling kept
+
+
+def test_nick_history_unknown_host_returns_empty_and_creates_no_state():
+    ctx = ContextStore()
+    assert ctx.nick_history_for_host("undernet", "198.51.100.1") == []
+
+
+def test_nick_history_scoped_per_network():
+    ctx = ContextStore()
+    ctx.snapshot("libera", "#windrop", "alice", "~a", "203.0.113.9")
+    assert ctx.nick_history_for_host("undernet", "203.0.113.9") == []
+
+
+def test_nick_history_respects_limit():
+    ctx = ContextStore()
+    for i in range(5):
+        ctx.snapshot("undernet", "#windrop", f"n{i}", "~n", "203.0.113.9")
+    assert len(ctx.nick_history_for_host("undernet", "203.0.113.9", limit=2)) == 2
+
+
+def test_nick_history_is_lru_bounded_per_host():
+    ctx = ContextStore(max_nicks_per_host=3)
+    for i in range(5):
+        ctx.snapshot("undernet", "#windrop", f"n{i}", "~n", "203.0.113.9")
+    history = ctx.nick_history_for_host("undernet", "203.0.113.9")
+    assert "n0" not in history
+    assert "n1" not in history
+    assert set(history) == {"n2", "n3", "n4"}
+
+
+def test_nick_history_a_manual_check_does_not_mutate_state():
+    """Same discipline as observed_context: a read must never itself
+    become a recorded event -- calling this repeatedly must not add
+    entries or otherwise change future results."""
+    ctx = ContextStore()
+    ctx.snapshot("undernet", "#windrop", "real", "~r", "203.0.113.9")
+    for _ in range(10):
+        ctx.nick_history_for_host("undernet", "203.0.113.9")
+    assert ctx.nick_history_for_host("undernet", "203.0.113.9") == ["real"]
+
+
+def test_nick_history_blank_host_never_tracked():
+    ctx = ContextStore()
+    ctx.snapshot("undernet", "#windrop", "cloaked", "~c", "")
+    assert ctx.nick_history_for_host("undernet", "") == []
+
+
 # ---- WebPanel accessors: reads off a second thread, plus the lock that
 # makes that safe (see context.py's module/ContextStore docstrings) ----
 

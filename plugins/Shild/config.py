@@ -176,6 +176,34 @@ conf.registerGlobalValue(
         shildml.schema.load_training_rows.""")),
 )
 
+conf.registerGroup(Shild, "decisionCache")
+conf.registerGlobalValue(
+    Shild.decisionCache, "enabled",
+    registry.Boolean(True, _(
+        """Whether a host's most recent fused decision is reused for a
+        repeat join/message within decisionCache.ttlSecs, instead of
+        re-running the full classifier+evidence pipeline and re-posting
+        an identical [shadow] line -- added 2026-08-16 after a real
+        flapping/reconnecting client re-triggered real AbuseIPDB/
+        Scamalytics/proxyscan lookups every 15-90 seconds for the exact
+        same host. Keyed by host, not (nick, host) -- see
+        decision_cache.py's module docstring for why. Real enforcement
+        still fires on a cache hit if newly eligible (op/killSwitch could
+        have changed); only the shadow-log write and relay are skipped,
+        since neither carries new information on a repeat.""")),
+)
+conf.registerGlobalValue(
+    Shild.decisionCache, "ttlSecs",
+    registry.PositiveFloat(7200.0, _(
+        """How long a cached decision is reused before a repeat join/
+        message from the same host gets a genuinely fresh evaluation
+        again (2 hours by default -- raised from 30 minutes on
+        2026-08-16 by user decision) -- long enough to absorb a
+        flapping connection's reconnect burst, short enough that a host
+        returning much later is still judged against current evidence,
+        not a stale read.""")),
+)
+
 conf.registerGlobalValue(
     Shild, "enforcementLogPath",
     registry.String("data/enforcement_actions.jsonl", _(
@@ -366,15 +394,48 @@ conf.registerGlobalValue(
 conf.registerGroup(Shild, "dnsbl")
 conf.registerGlobalValue(
     Shild.dnsbl, "timeout",
-    registry.PositiveFloat(5.0, _(
-        """DNS lookup timeout in seconds for DNSBL/DroneBL/bogon/Tor-exit
-        checks.""")),
+    registry.PositiveFloat(2.0, _(
+        """DNS lookup timeout in seconds for DNSBL/DroneBL/bogon/Tor-exit/
+        IRCBL checks -- all 5 zones are queried concurrently
+        (asyncio.gather in reputation.py's _dnsbl), so ONE slow zone stalls
+        the whole Tier 1 stage for this long regardless of how fast the
+        others answer. Lowered from 5.0 on 2026-08-16 after live RFC5782
+        timing on rbl.ircbl.org showed real, repeated multi-second
+        round trips (observed 0.6-4.9s across 3 consecutive queries) --
+        the exact same DroneBL-latency pattern already root-caused via a
+        corpus scan (see CLAUDE.md's "DroneBL timeout" section), just
+        never actually landed in this file despite being documented as
+        applied. A missed check on a slow round-trip just removes one of
+        several corroborating signals (fail-open, same as every other
+        optional/timeout-prone check here) rather than blocking the whole
+        decision.""")),
 )
 conf.registerGlobalValue(
     Shild.dnsbl, "cacheTtl",
     registry.PositiveInteger(21600, _(
         """How long (seconds) to cache a DNSBL/DroneBL/bogon/Tor-exit
         result per IP. Default 6h.""")),
+)
+conf.registerGlobalValue(
+    Shild.dnsbl, "ircblEnabled",
+    registry.Boolean(False, _(
+        """Whether rbl.ircbl.org is included in the automatic, LIVE
+        evidence gather (join/message evaluation). Default False as of
+        2026-08-16, by deliberate user decision, for two independent
+        reasons: (1) live concurrent timing showed rbl.ircbl.org is
+        consistently the slowest of the 5 DNSBL zones (2-5.5s even
+        queried alone) and the one that drags the other 4 down with it
+        when fired together via asyncio.gather -- see CLAUDE.md's DNSBL
+        section for the measured batching effect; (2) Undernet -- this
+        deployment's own busiest network -- already uses IRCBL as X's own
+        g-line source, so a live ban off the same signal is often pure
+        duplication of enforcement Undernet's own services already do.
+        Does NOT remove IRCBL entirely: it's still queried on a manual
+        !shildcheck/!shcheck lookup regardless of this setting (see
+        reputation.py's gather()'s include_ircbl param) -- an operator
+        explicitly investigating a host benefits from every signal, and a
+        manual check carries no live-enforcement risk or latency
+        pressure.""")),
 )
 
 conf.registerGroup(Shild, "ipapi")

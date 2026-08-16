@@ -384,6 +384,7 @@ class ReputationGatherer:
         account: Optional[str],
         allow_tier2: bool,
         proxyscan_cfg: Optional[proxyscan.ProxyScanConfig] = None,
+        include_ircbl: bool = True,
     ) -> HostEvidence:
         t0 = time.monotonic()
         cloak, trust_tier, is_tor_gateway = classify_cloak(host)
@@ -416,7 +417,7 @@ class ReputationGatherer:
         if proxyscan_cfg is not None and proxyscan_cfg.enabled:
             proxyscan_task = asyncio.ensure_future(proxyscan.scan(ev.resolved_ip, proxyscan_cfg))
 
-        await self._tier1(loop, session, ev)
+        await self._tier1(loop, session, ev, include_ircbl)
         # 2026-08-10: was `not ev.corroborates_bad()` -- but geo_proxy alone
         # already makes that True (see evidence.py's hard/soft split), so
         # Tier 1 finding ONLY geo_proxy was skipping Tier 2 entirely, the
@@ -434,8 +435,9 @@ class ReputationGatherer:
         ev.lookup_ms = (time.monotonic() - t0) * 1000
         return ev
 
-    async def _tier1(self, loop, session: aiohttp.ClientSession, ev: HostEvidence) -> None:
-        # DNSBL (5 zones) and ip-api are fully independent of each other --
+    async def _tier1(self, loop, session: aiohttp.ClientSession, ev: HostEvidence,
+                      include_ircbl: bool = True) -> None:
+        # DNSBL (4-5 zones) and ip-api are fully independent of each other --
         # only sequential because of how this used to be written. Kicking
         # both off before awaiting either turns "sum of both" into "max of
         # both", which is most of the multi-second real-world join-to-ban
@@ -443,7 +445,7 @@ class ReputationGatherer:
         # a ~6s Shild kick vs. ~3s from a single-check bot on the same
         # channel).
         ip = ev.resolved_ip
-        await asyncio.gather(self._dnsbl(loop, ip, ev), self._geo(session, ip, ev))
+        await asyncio.gather(self._dnsbl(loop, ip, ev, include_ircbl), self._geo(session, ip, ev))
         # Local FireHOL blocklist membership -- synchronous, no I/O wait
         # (in-memory set lookup + a stat() call), so it doesn't need to be
         # part of the async gather above; see blocklist.py's own docstring.
@@ -461,32 +463,39 @@ class ReputationGatherer:
         ev.blocklist_hits.extend(hits)
         ev.checks_run.append("blocklist")
 
-    async def _dnsbl(self, loop, ip: str, ev: HostEvidence) -> None:
+    async def _dnsbl(self, loop, ip: str, ev: HostEvidence, include_ircbl: bool = True) -> None:
+        # IRCBL is split into its own cache entry/query, separate from the
+        # other 4 zones (2026-08-16) -- it's optionally skipped entirely on
+        # the live path (see config.py's dnsbl.ircblEnabled docstring for
+        # why: it's the one zone consistently slow enough to drag the other
+        # 4 down when fired together, and Undernet's own X already g-lines
+        # off the same list) but must still be queryable from a manual
+        # !shildcheck regardless of the live setting. Folding it into the
+        # shared 4-zone cache tuple would mean a live call that skips it
+        # could poison the cache for a later manual call that wants it (or
+        # vice versa) -- a separate cache key avoids that entirely.
         dnsbl_key = ("dnsbl", ip)
         cached, hit = self._cache.get(dnsbl_key)
         if hit:
-            is_bogon, dronebl_type, spamcop_hit, is_tor, ircbl_hit = cached
-            ev.checks_run.extend(["dronebl", "spamcop", "bogon", "torexit", "ircbl"])
+            is_bogon, dronebl_type, spamcop_hit, is_tor = cached
+            ev.checks_run.extend(["dronebl", "spamcop", "bogon", "torexit"])
         else:
             (dronebl_type, dronebl_failed), (spamcop_hit, spamcop_failed), \
-                (is_bogon, bogon_failed), (tor_hit, tor_failed), \
-                (ircbl_hit, ircbl_failed) = await asyncio.gather(
+                (is_bogon, bogon_failed), (tor_hit, tor_failed) = await asyncio.gather(
                 _check_dronebl(loop, ip, self.config.dns_timeout),
                 _check_spamcop(loop, ip, self.config.dns_timeout),
                 _check_bogon(loop, ip, self.config.dns_timeout),
                 _check_torexit(loop, ip, self.config.dns_timeout),
-                _check_ircbl(loop, ip, self.config.dns_timeout),
             )
             is_tor = tor_hit or ev.is_tor_exit
             for name, failed in (
                 ("dronebl", dronebl_failed), ("spamcop", spamcop_failed),
                 ("bogon", bogon_failed), ("torexit", tor_failed),
-                ("ircbl", ircbl_failed),
             ):
                 (ev.checks_failed if failed else ev.checks_run).append(name)
-            if not (dronebl_failed or spamcop_failed or bogon_failed or tor_failed or ircbl_failed):
+            if not (dronebl_failed or spamcop_failed or bogon_failed or tor_failed):
                 self._cache.set(dnsbl_key,
-                                 (is_bogon, dronebl_type, spamcop_hit, is_tor, ircbl_hit),
+                                 (is_bogon, dronebl_type, spamcop_hit, is_tor),
                                  self.config.dnsbl_ttl)
 
         ev.dronebl_type = dronebl_type
@@ -494,6 +503,19 @@ class ReputationGatherer:
         ev.is_tor_exit = is_tor
         if spamcop_hit:
             ev.dnsbl_hits.append(SPAMCOP_ZONE)
+
+        if not include_ircbl:
+            return
+        ircbl_key = ("ircbl", ip)
+        cached_ircbl, ircbl_cache_hit = self._cache.get(ircbl_key)
+        if ircbl_cache_hit:
+            ircbl_hit = cached_ircbl
+            ev.checks_run.append("ircbl")
+        else:
+            ircbl_hit, ircbl_failed = await _check_ircbl(loop, ip, self.config.dns_timeout)
+            (ev.checks_failed if ircbl_failed else ev.checks_run).append("ircbl")
+            if not ircbl_failed:
+                self._cache.set(ircbl_key, ircbl_hit, self.config.dnsbl_ttl)
         if ircbl_hit:
             ev.dnsbl_hits.append(IRCBL_ZONE)
 

@@ -390,6 +390,106 @@ def test_ircbl_hit_populates_dnsbl_hits(tmp_path, monkeypatch):
     assert ev.hard_corroborates_bad()
 
 
+def test_include_ircbl_false_skips_ircbl_query_entirely(tmp_path, monkeypatch):
+    """2026-08-16: dnsbl.ircblEnabled=False on the live path -- IRCBL must
+    not be queried at all (not run, not failed, not in dnsbl_hits) when
+    include_ircbl=False is passed through, and the other 4 zones must be
+    completely unaffected."""
+    async def resolve_ip(loop, host, timeout):
+        return "203.0.113.9"
+
+    called = {"ircbl": False}
+
+    async def ircbl_would_hit(loop, ip, timeout):
+        called["ircbl"] = True
+        return True, False
+
+    async def clean(loop, ip, timeout):
+        return False, False
+
+    async def dronebl_clean(loop, ip, timeout):
+        return None, False
+
+    async def ipapi_clean(session, ip, timeout):
+        return {"status": "success", "proxy": False, "hosting": False}, False
+
+    monkeypatch.setattr(reputation, "_resolve_ip", resolve_ip)
+    monkeypatch.setattr(reputation, "_check_dronebl", dronebl_clean)
+    monkeypatch.setattr(reputation, "_check_spamcop", clean)
+    monkeypatch.setattr(reputation, "_check_bogon", clean)
+    monkeypatch.setattr(reputation, "_check_torexit", clean)
+    monkeypatch.setattr(reputation, "_check_ircbl", ircbl_would_hit)
+    monkeypatch.setattr(reputation, "_check_ipapi", ipapi_clean)
+
+    g = _gatherer(tmp_path)
+
+    async def run():
+        return await g.gather(session=object(), host="203.0.113.9", account=None,
+                               allow_tier2=False, include_ircbl=False)
+
+    ev = asyncio.run(run())
+    assert called["ircbl"] is False
+    assert ev.dnsbl_hits == []
+    assert "ircbl" not in ev.checks_run
+    assert "ircbl" not in ev.checks_failed
+    # the other 4 zones still ran normally
+    assert "dronebl" in ev.checks_run
+    assert "spamcop" in ev.checks_run
+    assert "bogon" in ev.checks_run
+    assert "torexit" in ev.checks_run
+
+
+def test_include_ircbl_false_then_true_both_get_fresh_correct_answers(tmp_path, monkeypatch):
+    """The main dnsbl cache tuple no longer carries ircbl_hit (split into
+    its own cache key, 2026-08-16) -- a live call with include_ircbl=False
+    followed by a manual !shildcheck-style call with include_ircbl=True for
+    the SAME ip must not reuse a stale/absent ircbl answer from the first
+    call's cache entry; it must actually query ircbl on the second call."""
+    async def resolve_ip(loop, host, timeout):
+        return "203.0.113.9"
+
+    ircbl_calls = {"n": 0}
+
+    async def ircbl_hit(loop, ip, timeout):
+        ircbl_calls["n"] += 1
+        return True, False
+
+    async def clean(loop, ip, timeout):
+        return False, False
+
+    async def dronebl_clean(loop, ip, timeout):
+        return None, False
+
+    async def ipapi_clean(session, ip, timeout):
+        return {"status": "success", "proxy": False, "hosting": False}, False
+
+    monkeypatch.setattr(reputation, "_resolve_ip", resolve_ip)
+    monkeypatch.setattr(reputation, "_check_dronebl", dronebl_clean)
+    monkeypatch.setattr(reputation, "_check_spamcop", clean)
+    monkeypatch.setattr(reputation, "_check_bogon", clean)
+    monkeypatch.setattr(reputation, "_check_torexit", clean)
+    monkeypatch.setattr(reputation, "_check_ircbl", ircbl_hit)
+    monkeypatch.setattr(reputation, "_check_ipapi", ipapi_clean)
+
+    g = _gatherer(tmp_path)
+
+    async def run():
+        live = await g.gather(session=object(), host="203.0.113.9", account=None,
+                               allow_tier2=False, include_ircbl=False)
+        manual = await g.gather(session=object(), host="203.0.113.9", account=None,
+                                 allow_tier2=False, include_ircbl=True)
+        return live, manual
+
+    live_ev, manual_ev = asyncio.run(run())
+    assert live_ev.dnsbl_hits == []
+    assert manual_ev.dnsbl_hits == [reputation.IRCBL_ZONE]
+    assert ircbl_calls["n"] == 1  # only the manual call actually queried it
+    # the other 4 zones' cache DID help the second call (no re-query needed
+    # to still get the right, consistent answer)
+    assert manual_ev.is_bogon == live_ev.is_bogon
+    assert manual_ev.dronebl_type == live_ev.dronebl_type
+
+
 def test_tier2_skipped_when_tier1_already_corroborates(tmp_path, monkeypatch):
     async def resolve_ip(loop, host, timeout):
         return "203.0.113.9"

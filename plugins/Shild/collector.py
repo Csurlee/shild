@@ -26,7 +26,9 @@ from shildml import fusion, schema
 from .context import ContextSnapshot
 
 OBSERVED_MODERATION_SCHEMA_VERSION = 1
-ENFORCEMENT_SCHEMA_VERSION = 1
+ENFORCEMENT_SCHEMA_VERSION = 2  # 2026-08-16: added "via" (native op-based
+# MODE+KICK vs. X-routed BAN+KICK -- see build_enforcement_record's `via`
+# param and plugins/Shild/plugin.py's `_x_fallback`/`_maybe_enforce`)
 
 
 def build_record(
@@ -128,7 +130,7 @@ def build_moderation_record(
 def build_enforcement_record(
     *, id: int, network: str, channel: str, nick: str, ident: str, host: str,
     ban_mask: str, reason: str, duration_secs: int, unban_at: float,
-    fused: fusion.FusedDecision,
+    fused: fusion.FusedDecision, via: str = "native",
 ) -> dict:
     """A real enforcement action Shild itself took -- distinct from both
     `shadow_decisions.jsonl` (decisions, whether or not acted on) and
@@ -141,6 +143,12 @@ def build_enforcement_record(
     shown in the real kick message's own "[ID: N]" (2026-08-11) -- looking
     a past ban back up means finding its `id` here, no separate lookup
     command needed.
+
+    `via` (2026-08-16): "native" (a real MODE+b/KICK, requires the bot to
+    hold op) or "x" (routed through Undernet's X service via
+    plugins/UndernetX -- used when the bot lacks op but the channel has a
+    live-verified X capability; see plugin.py's `_x_fallback`). Defaults
+    "native" for callers that predate this distinction.
     """
     return {
         "schema_version": ENFORCEMENT_SCHEMA_VERSION,
@@ -154,6 +162,7 @@ def build_enforcement_record(
         "reason": reason,
         "duration_secs": duration_secs,
         "unban_at": unban_at,
+        "via": via,
         "fused_decision": {
             "action": fused.action, "confidence": fused.confidence,
             "source": fused.source, "reason": fused.reason,

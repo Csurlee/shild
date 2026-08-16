@@ -43,7 +43,8 @@ class SpamGuardTestCase(ChannelPluginTestCase):
         # config-dict restore): a heuristic left "on" by one test would
         # otherwise leak into every later test in the same process. Reset
         # explicitly here; each heuristic test enables only what it needs.
-        for name in ("floodEnabled", "hilightEnabled", "capsEnabled", "mojibakeEnabled"):
+        for name in ("floodEnabled", "hilightEnabled", "capsEnabled", "mojibakeEnabled",
+                     "raidEnabled"):
             getattr(conf.supybot.plugins.SpamGuard, name).get(self.channel).setValue(False)
         # Protection defaults to safe (killSwitch=True) -- each
         # enforcement test below flips it explicitly, same convention as
@@ -213,6 +214,14 @@ class SpamGuardTestCase(ChannelPluginTestCase):
         self.assertEqual(self._log_records()[-1]["outcome"], "killswitch")
 
     def test_matched_but_not_opped_does_not_enforce(self):
+        # This class (SpamGuardTestCase, plugins=("SpamGuard",)) doubles
+        # as the "UndernetX not loaded at all" proof for the 2026-08-16
+        # X-routed enforcement fallback -- irc.getCallback("UndernetX")
+        # returns None here unconditionally, so _x_fallback() always
+        # returns None too, and behavior is exactly what it was before
+        # that feature existed. See SpamGuardXFallbackTestCase (below,
+        # plugins=("SpamGuard", "UndernetX")) for the cases where
+        # UndernetX IS loaded.
         conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
         # Deliberately NOT granting op.
         self._join()
@@ -778,6 +787,81 @@ class SpamGuardTestCase(ChannelPluginTestCase):
         self.assertIn("hilight=off", m2.args[1])
         self.assertIn("caps=off", m2.args[1])
         self.assertIn("mojibake=off", m2.args[1])
+        self.assertIn("raid=off", m2.args[1])
+
+    # ---- raid (2026-08-16): distinct-nick join-burst detection ----
+
+    def test_raid_enforces_after_distinct_join_limit_reached(self):
+        conf.supybot.plugins.SpamGuard.raidEnabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        limit = conf.supybot.plugins.SpamGuard.raidJoinLimit()
+        for i in range(limit - 1):
+            self._join(nick=f"raider{i}", ident="~r", host=f"raider{i}.example.net")
+        self._join(nick="tipper", ident="~r", host=self._DEFAULT_HOST)
+
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        self.assertEqual(len(kicks), 1, "expected exactly one enforcement at the limit")
+        self.assertEqual(kicks[0].args[1], "tipper",
+                          "must act on the tipping-point joiner, not an earlier one")
+        records = self._log_records()
+        self.assertEqual(records[-1]["outcome"], "enforced")
+        self.assertEqual(records[-1]["field"], "raid")
+        self.assertEqual(records[-1]["term_id"], -5)
+
+    def test_raid_below_limit_does_not_enforce(self):
+        conf.supybot.plugins.SpamGuard.raidEnabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        limit = conf.supybot.plugins.SpamGuard.raidJoinLimit()
+        for i in range(limit - 1):
+            self._join(nick=f"raider{i}", ident="~r", host=f"raider{i}.example.net")
+
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        self.assertEqual(kicks, [])
+
+    def test_raid_disabled_by_default_never_enforces(self):
+        """raidEnabled defaults False -- opt-in per channel, same safety
+        posture as every other heuristic here."""
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        for i in range(20):
+            self._join(nick=f"raider{i}", ident="~r", host=f"raider{i}.example.net")
+
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        self.assertEqual(kicks, [])
+
+    def test_raid_same_nick_rejoining_does_not_count_as_distinct(self):
+        """A single nick joining/parting/rejoining repeatedly (a reconnect
+        flap) must never look like a raid on its own -- only DISTINCT
+        nicks count toward raidJoinLimit."""
+        conf.supybot.plugins.SpamGuard.raidEnabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        limit = conf.supybot.plugins.SpamGuard.raidJoinLimit()
+        for _ in range(limit + 5):
+            self._join(nick="flapper", ident="~f", host=self._DEFAULT_HOST)
+
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        self.assertEqual(kicks, [])
+
+    def test_raid_resets_after_triggering_not_immediately_retriggered(self):
+        """Same convention as the flood heuristic: once raidJoinLimit is
+        reached and acted on, tracked state is cleared -- the very next
+        join must not immediately trigger a second enforcement before a
+        fresh window has genuinely built back up."""
+        conf.supybot.plugins.SpamGuard.raidEnabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        limit = conf.supybot.plugins.SpamGuard.raidJoinLimit()
+        for i in range(limit - 1):
+            self._join(nick=f"raider{i}", ident="~r", host=f"raider{i}.example.net")
+        self._join(nick="tipper", ident="~r", host=self._DEFAULT_HOST)
+        self._join(nick="onemore", ident="~r", host=f"onemore.example.net{'__no_testcap__'}")
+
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        self.assertEqual(len(kicks), 1, "the join right after a trigger must not re-trigger")
+        self.assertEqual(kicks[0].args[1], "tipper")
 
     # ---- black (2026-08-14): matches nick OR host, acts on future joins
     # AND immediately sweeps anyone already present ----
@@ -946,3 +1030,136 @@ class SpamGuardTestCase(ChannelPluginTestCase):
     def test_spamguard_add_requires_owner_capability(self):
         self._assert_denied_owner_capability("spamguard word add foo")
         self.assertIsNone(self._plugin._terms.find_by_text("word", "foo"))
+
+
+class SpamGuardXFallbackTestCase(ChannelPluginTestCase):
+    """The 2026-08-16 X-routed enforcement fallback -- mirrors
+    ShildXFallbackTestCase (plugins/Shild/test.py) exactly, same "seed
+    the real UndernetX capability cache, don't mock" approach.
+    """
+    plugins = ("SpamGuard", "UndernetX")
+
+    _DEFAULT_HOST = SpamGuardTestCase._DEFAULT_HOST
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._log_path = str(Path(self._tmpdir) / "spamguard_actions.jsonl")
+        self._terms_path = str(Path(self._tmpdir) / "spamguard_terms.json")
+        conf.supybot.plugins.SpamGuard.logPath.setValue(self._log_path)
+        conf.supybot.plugins.SpamGuard.termsPath.setValue(self._terms_path)
+        conf.supybot.plugins.SpamGuard.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+
+        super().setUp()
+
+        self._plugin = self.irc.getCallback("SpamGuard")
+        self._czura_term = self._plugin._terms.add("word", "Czura")
+        self._plugin._rebuild_matchers()
+
+        self.irc.state.supported["NETWORK"] = "UnderNet"
+        self._x = self.irc.getCallback("UndernetX")
+        self._x.identified = True
+        conf.supybot.plugins.UndernetX.auth.username.setValue("shild")
+        conf.supybot.plugins.UndernetX.auth.password.setValue("")
+        conf.supybot.plugins.UndernetX.enforcement.preferXCommands.get(
+            self.channel).setValue(True)
+        conf.supybot.plugins.UndernetX.enforcement.xFallbackEnabled.setValue(True)
+        conf.supybot.plugins.UndernetX.enforcement.minAccessLevel.setValue(100)
+        conf.supybot.plugins.UndernetX.enforcement.probeTtlSecs.setValue(3600)
+        conf.supybot.plugins.UndernetX.enforcement.probeMinIntervalSecs.setValue(60)
+
+    def _seed_x_usable(self):
+        from plugins.UndernetX.xprobe import ProbeVerdict
+        self._x._capabilities.record(
+            "test", ircutils.toLower(self.channel),
+            ProbeVerdict(state="usable", access_level=500), [],
+        )
+
+    def _spam_msg(self, nick="primaryocelo", ident="~ocelo", host=None):
+        host = host or self._DEFAULT_HOST
+        return ircmsgs.privmsg(
+            self.channel,
+            "Hi Guys! It's Madeleine Czura! Just thought I'd leave my number here.",
+            prefix=f"{nick}!{ident}@{host}",
+        )
+
+    def _join(self, nick="primaryocelo", ident="~ocelo", host=None):
+        host = host or self._DEFAULT_HOST
+        self.irc.feedMsg(ircmsgs.IrcMsg(
+            command="JOIN", args=(self.channel,), prefix=f"{nick}!{ident}@{host}",
+        ))
+
+    def _queued(self):
+        q = self.irc.queue
+        return list(q.highpriority) + list(q.normal) + list(q.lowpriority)
+
+    def _log_records(self):
+        if not Path(self._log_path).exists():
+            return []
+        return [json.loads(line) for line in Path(self._log_path).read_text().strip().splitlines()]
+
+    def test_not_opped_available_fires_x_ban_and_kick(self):
+        self._seed_x_usable()
+        self._join()
+        self.irc.feedMsg(self._spam_msg())
+
+        native = [m for m in self._queued() if m.command in ("KICK", "MODE")]
+        self.assertEqual(native, [])
+        x_privmsgs = [m for m in self._queued() if m.command == "PRIVMSG"
+                      and m.args[0] == "X@channels.undernet.org"]
+        self.assertEqual(len(x_privmsgs), 2)
+        self.assertTrue(x_privmsgs[0].args[1].startswith(f"BAN {self.channel} "))
+        self.assertTrue(x_privmsgs[1].args[1].startswith(f"KICK {self.channel} "))
+        record = self._log_records()[-1]
+        self.assertEqual(record["outcome"], "enforced")
+        self.assertEqual(record["via"], "x")
+
+    def test_not_opped_no_cache_entry_does_not_enforce(self):
+        self._join()
+        self.irc.feedMsg(self._spam_msg())
+        self.assertEqual([m for m in self._queued() if m.command in ("KICK", "MODE")], [])
+        self.assertEqual(self._log_records()[-1]["outcome"], "not-opped")
+
+    def test_not_opped_channel_not_opted_in_does_not_enforce(self):
+        conf.supybot.plugins.UndernetX.enforcement.preferXCommands.get(
+            self.channel).setValue(False)
+        self._join()
+        self.irc.feedMsg(self._spam_msg())
+        self.assertEqual([m for m in self._queued() if m.command == "PRIVMSG"
+                           and m.args[0] == "X@channels.undernet.org"], [])
+        self.assertEqual(self._log_records()[-1]["outcome"], "not-opped")
+
+    def test_not_opped_arm_switch_off_does_not_enforce_even_with_usable_cache(self):
+        self._seed_x_usable()
+        conf.supybot.plugins.UndernetX.enforcement.xFallbackEnabled.setValue(False)
+        self._join()
+        self.irc.feedMsg(self._spam_msg())
+        self.assertEqual([m for m in self._queued() if m.command == "PRIVMSG"
+                           and m.args[0] == "X@channels.undernet.org"], [])
+
+    def test_killswitch_still_gates_the_x_path(self):
+        self._seed_x_usable()
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(True)
+        self._join()
+        self.irc.feedMsg(self._spam_msg())
+        self.assertEqual([m for m in self._queued() if m.command == "PRIVMSG"
+                           and m.args[0] == "X@channels.undernet.org"], [])
+
+    def test_opped_always_uses_native_path_never_x(self):
+        self._seed_x_usable()
+        self.irc.feedMsg(ircmsgs.IrcMsg(
+            command="MODE", args=(self.channel, "+o", self.irc.nick),
+            prefix="ChanServ!ChanServ@services.",
+        ))
+        self._join()
+        self.irc.feedMsg(self._spam_msg())
+
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        bans = [m for m in self._queued() if m.command == "MODE" and m.args[1] == "+b"]
+        self.assertEqual(len(kicks), 1)
+        self.assertEqual(len(bans), 1)
+        x_privmsgs = [m for m in self._queued() if m.command == "PRIVMSG"
+                      and m.args[0] == "X@channels.undernet.org"]
+        self.assertEqual(x_privmsgs, [])
+        record = self._log_records()[-1]
+        self.assertEqual(record["via"], "native")
