@@ -922,3 +922,136 @@ def test_repeat_lookup_hits_cache_not_network(tmp_path, monkeypatch):
 
     asyncio.run(run_twice())
     assert calls["dronebl"] == 1  # second call served from cache
+
+
+# ---- Scamalytics tiered on AbuseIPDB's own result (2026-08-16) ----
+
+def _tiering_setup(monkeypatch, abuseipdb_score, *, scamalytics_calls):
+    async def resolve_ip(loop, host, timeout):
+        return "203.0.113.9"
+
+    async def clean(loop, ip, timeout):
+        return False, False
+
+    async def dronebl_clean(loop, ip, timeout):
+        return None, False
+
+    async def ipapi_clean(session, ip, timeout):
+        return {"status": "success", "proxy": False, "hosting": False}, False
+
+    async def abuseipdb_score_fn(session, ip, key, timeout):
+        return abuseipdb_score, False
+
+    async def scamalytics_recorder(session, ip, username, key, timeout):
+        scamalytics_calls.append(ip)
+        return 0, False, False
+
+    monkeypatch.setattr(reputation, "_resolve_ip", resolve_ip)
+    monkeypatch.setattr(reputation, "_check_dronebl", dronebl_clean)
+    monkeypatch.setattr(reputation, "_check_spamcop", clean)
+    monkeypatch.setattr(reputation, "_check_bogon", clean)
+    monkeypatch.setattr(reputation, "_check_torexit", clean)
+    monkeypatch.setattr(reputation, "_check_ircbl", clean)
+    monkeypatch.setattr(reputation, "_check_ipapi", ipapi_clean)
+    monkeypatch.setattr(reputation, "_check_abuseipdb", abuseipdb_score_fn)
+    monkeypatch.setattr(reputation, "_check_scamalytics", scamalytics_recorder)
+
+
+def test_scamalytics_skipped_when_abuseipdb_score_below_tier_min(tmp_path, monkeypatch):
+    calls = []
+    _tiering_setup(monkeypatch, abuseipdb_score=2, scamalytics_calls=calls)
+    g = _gatherer(tmp_path, abuseipdb_enabled=True, abuseipdb_key="fake-key",
+                  scamalytics_enabled=True, scamalytics_username="u", scamalytics_key="k")
+
+    async def run():
+        return await g.gather(session=object(), host="203.0.113.9", account=None, allow_tier2=True)
+
+    ev = asyncio.run(run())
+    assert calls == []
+    assert "scamalytics" not in ev.checks_run
+    assert "scamalytics" not in ev.checks_failed
+
+
+def test_scamalytics_skipped_when_abuseipdb_score_at_or_above_tier_max(tmp_path, monkeypatch):
+    calls = []
+    _tiering_setup(monkeypatch, abuseipdb_score=60, scamalytics_calls=calls)
+    g = _gatherer(tmp_path, abuseipdb_enabled=True, abuseipdb_key="fake-key",
+                  scamalytics_enabled=True, scamalytics_username="u", scamalytics_key="k")
+
+    async def run():
+        return await g.gather(session=object(), host="203.0.113.9", account=None, allow_tier2=True)
+
+    ev = asyncio.run(run())
+    assert calls == []
+
+
+def test_scamalytics_called_when_abuseipdb_score_in_middle_band(tmp_path, monkeypatch):
+    calls = []
+    _tiering_setup(monkeypatch, abuseipdb_score=20, scamalytics_calls=calls)
+    g = _gatherer(tmp_path, abuseipdb_enabled=True, abuseipdb_key="fake-key",
+                  scamalytics_enabled=True, scamalytics_username="u", scamalytics_key="k")
+
+    async def run():
+        return await g.gather(session=object(), host="203.0.113.9", account=None, allow_tier2=True)
+
+    asyncio.run(run())
+    assert calls == ["203.0.113.9"]
+
+
+def test_scamalytics_called_at_exact_lower_boundary(tmp_path, monkeypatch):
+    # min=5 is inclusive.
+    calls = []
+    _tiering_setup(monkeypatch, abuseipdb_score=5, scamalytics_calls=calls)
+    g = _gatherer(tmp_path, abuseipdb_enabled=True, abuseipdb_key="fake-key",
+                  scamalytics_enabled=True, scamalytics_username="u", scamalytics_key="k")
+
+    async def run():
+        return await g.gather(session=object(), host="203.0.113.9", account=None, allow_tier2=True)
+
+    asyncio.run(run())
+    assert calls == ["203.0.113.9"]
+
+
+def test_scamalytics_skipped_at_exact_upper_boundary(tmp_path, monkeypatch):
+    # max=50 is exclusive.
+    calls = []
+    _tiering_setup(monkeypatch, abuseipdb_score=50, scamalytics_calls=calls)
+    g = _gatherer(tmp_path, abuseipdb_enabled=True, abuseipdb_key="fake-key",
+                  scamalytics_enabled=True, scamalytics_username="u", scamalytics_key="k")
+
+    async def run():
+        return await g.gather(session=object(), host="203.0.113.9", account=None, allow_tier2=True)
+
+    asyncio.run(run())
+    assert calls == []
+
+
+def test_tiering_disabled_always_calls_scamalytics_regardless_of_score(tmp_path, monkeypatch):
+    calls = []
+    _tiering_setup(monkeypatch, abuseipdb_score=2, scamalytics_calls=calls)  # would tier-skip if enabled
+    g = _gatherer(tmp_path, abuseipdb_enabled=True, abuseipdb_key="fake-key",
+                  scamalytics_enabled=True, scamalytics_username="u", scamalytics_key="k",
+                  scamalytics_tiering_enabled=False)
+
+    async def run():
+        return await g.gather(session=object(), host="203.0.113.9", account=None, allow_tier2=True)
+
+    asyncio.run(run())
+    assert calls == ["203.0.113.9"]
+
+
+def test_scamalytics_still_called_when_abuseipdb_never_ran(tmp_path, monkeypatch):
+    # No AbuseIPDB key configured at all -- no score to tier on, so
+    # tiering must fail OPEN (still call Scamalytics) rather than
+    # silently losing coverage.
+    calls = []
+    _tiering_setup(monkeypatch, abuseipdb_score=2, scamalytics_calls=calls)
+    g = _gatherer(tmp_path, scamalytics_enabled=True,
+                  scamalytics_username="u", scamalytics_key="k")
+
+    async def run():
+        return await g.gather(session=object(), host="203.0.113.9", account=None, allow_tier2=True)
+
+    ev = asyncio.run(run())
+    assert calls == ["203.0.113.9"]
+    assert ev.abuseipdb_score is None

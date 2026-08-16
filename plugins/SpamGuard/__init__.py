@@ -7,7 +7,7 @@ module docstring for the motivating example and design.
 import supybot
 from supybot import world
 
-__version__ = "1.8"
+__version__ = "1.9"
 __author__ = supybot.authors.unknown
 __contributors__ = {}
 __url__ = "https://github.com/Csurlee/shild"
@@ -18,12 +18,18 @@ __url__ = "https://github.com/Csurlee/shild"
 # too, or it goes stale on reload).
 from . import matcher
 from . import enforcement
+from . import heuristics
+from . import mojibake
+from . import terms
 from . import config
 from . import plugin
 from importlib import reload
 
 reload(matcher)
 reload(enforcement)
+reload(heuristics)
+reload(mojibake)
+reload(terms)
 reload(config)
 reload(plugin)
 

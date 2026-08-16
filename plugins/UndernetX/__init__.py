@@ -38,7 +38,7 @@ import importlib
 
 # Use this for the version of this plugin.  You may wish to put a CVS keyword
 # in here if you're keeping the plugin in CVS or some similar system.
-__version__ = "1.8"
+__version__ = "1.9"
 
 # XXX Replace this with an appropriate author or supybot.Author instance.
 __author__ = supybot.Author("Ken Spencer", "kspencer", "ken@electrocode.net")

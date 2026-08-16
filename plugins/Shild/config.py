@@ -528,6 +528,46 @@ conf.registerGlobalValue(
         second account is configured; this is the counter for it, not a
         toggle.""")),
 )
+conf.registerGlobalValue(
+    Shild.scamalytics, "tieringEnabled",
+    registry.Boolean(True, _(
+        """Whether the Scamalytics Tier 2 call is TIERED on AbuseIPDB's
+        own result (2026-08-16), rather than always firing alongside
+        AbuseIPDB/IPQS on every event. Real budget pressure motivated
+        this: both Scamalytics accounts combined (322/day) were observed
+        exhausted by mid-afternoon on a real traffic day while AbuseIPDB
+        (1000/day) still had headroom. When True, Scamalytics only runs
+        when AbuseIPDB's score falls in the [tierMinAbuseipdbScore,
+        tierMaxAbuseipdbScore) band -- genuinely ambiguous, where a
+        second opinion is actually useful -- rather than on a score
+        AbuseIPDB alone already called clean or already-corroborating.
+        Set False to go back to always calling both, if this tradeoff
+        (fewer Scamalytics-confirmed escalations on already-flagged
+        hosts, in exchange for the budget lasting the whole day) turns
+        out to be the wrong one. See reputation.py's module docstring
+        for the full reasoning, including why a tiered-out skip is
+        deliberately never recorded in checks_failed.""")),
+)
+conf.registerGlobalValue(
+    Shild.scamalytics, "tierMinAbuseipdbScore",
+    registry.NonNegativeInteger(5, _(
+        """Only meaningful when scamalytics.tieringEnabled is True. An
+        AbuseIPDB score BELOW this is treated as clean enough that a
+        Scamalytics second opinion is skipped.""")),
+)
+conf.registerGlobalValue(
+    Shild.scamalytics, "tierMaxAbuseipdbScore",
+    registry.NonNegativeInteger(50, _(
+        """Only meaningful when scamalytics.tieringEnabled is True. An
+        AbuseIPDB score AT OR ABOVE this already gives AbuseIPDB's own
+        hard-corroborating signal (see evidence.py's
+        hard_corroborates_bad()) on its own, so Scamalytics is skipped
+        rather than spent confirming the same conclusion a second way.
+        Deliberately well below evidence.abuseipdbExtreme's default (90)
+        -- this threshold is about "is a second opinion worth the
+        budget", not about "is this extreme enough to escalate", a
+        materially different question answered elsewhere.""")),
+)
 
 conf.registerGlobalValue(
     Shild, "secretsPath",

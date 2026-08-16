@@ -6,7 +6,7 @@ observes and logs decisions, never acts; no moderation commands yet).
 import supybot
 from supybot import world
 
-__version__ = "1.8"
+__version__ = "1.9"
 __author__ = supybot.authors.unknown
 __contributors__ = {}
 __url__ = "https://github.com/Csurlee/shild"
@@ -25,6 +25,7 @@ from . import reputation
 from . import proxyscan
 from . import enforcement
 from . import collector
+from . import decision_cache
 from . import config
 from . import plugin
 from importlib import reload
@@ -39,6 +40,7 @@ reload(reputation)
 reload(proxyscan)
 reload(enforcement)
 reload(collector)
+reload(decision_cache)
 reload(config)
 reload(plugin)
 

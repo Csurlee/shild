@@ -118,6 +118,9 @@ CATALOG: dict[str, list] = {
             url="https://scamalytics.com/ip/api/enquiry"),
         Skip("scamalytics.dailyLimit", "internal tuning, conservative approximation of the monthly quota"),
         Skip("scamalytics.dailyLimit2", "internal tuning; second-account fallback budget"),
+        Skip("scamalytics.tieringEnabled", "correct default (True), not a first-install decision"),
+        Skip("scamalytics.tierMinAbuseipdbScore", "internal tuning"),
+        Skip("scamalytics.tierMaxAbuseipdbScore", "internal tuning"),
         Ask("proxyscan.enabled", tier="plugin", kind="bool", default=True,
             question="Enable active proxy-port scanning? This actively connects to a "
                      "joining host's IP to check for open proxy ports -- more signal, "

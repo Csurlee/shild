@@ -46,6 +46,37 @@ scamalytics_username2/scamalytics_key2 aren't both present, same
 "optional provider, fails open to skip" convention as every other
 optional check in this module.
 
+**Scamalytics call tiered on AbuseIPDB's own result, added 2026-08-16.**
+Real budget pressure, not a hypothetical: both Scamalytics accounts
+(161/day each, 322/day combined) were observed hitting their daily cap by
+mid-afternoon on a real traffic day, while AbuseIPDB (1000/day) still had
+real headroom -- Scamalytics was being spent on every single Tier 2
+event regardless of what AbuseIPDB already found. `_tier2()` now runs
+AbuseIPDB and IPQS concurrently first (same "max not sum" latency
+reasoning as everything else in this module), then only calls
+Scamalytics if AbuseIPDB's own score lands in the "genuinely ambiguous"
+middle band -- `scamalytics_tier_min_abuseipdb` (default 5) to
+`scamalytics_tier_max_abuseipdb` (default 50, exclusive) -- rather than
+on every event. A score below the low bound is clean enough that a
+second opinion rarely changes anything; a score at/above the high bound
+already gives AbuseIPDB's own hard-corroborating signal on its own
+(see evidence.py's hard_corroborates_bad()), so a second provider isn't
+needed to justify the same conclusion. Deliberately fails OPEN toward
+MORE checking, not less, whenever AbuseIPDB's own score isn't available
+to tier on at all (disabled, no key, budget-exhausted, or a genuine
+network failure) -- there is no data to make a skip decision from, so
+the safe default is to still ask Scamalytics rather than silently
+losing coverage. `scamalytics.tieringEnabled` (default True) is the
+escape hatch back to "always call both" if this tradeoff (fewer
+Scamalytics-corroborated escalations on already-AbuseIPDB-flagged hosts,
+in exchange for the budget lasting through the whole day) turns out to
+be the wrong one. A tiered-out skip is NOT recorded in checks_run or
+checks_failed -- same convention as scamalytics.enabled=False or a
+missing key (not applicable this time, not a failure); checks_failed
+specifically must stay reserved for genuine failures, since
+evidence.py's own "confirmed clean" path depends on checks_failed being
+empty.
+
 Trusted cloaks and unresolvable hosts never reach Tier 1/2 at all: this is
 both the privacy decision (never send a registered user's traffic to a
 third party) and the budget decision (don't spend AbuseIPDB/ip-api quota
@@ -165,6 +196,9 @@ class ReputationConfig:
     scamalytics_key: Optional[str] = None
     scamalytics_username2: Optional[str] = None  # optional fallback account
     scamalytics_key2: Optional[str] = None
+    scamalytics_tiering_enabled: bool = True
+    scamalytics_tier_min_abuseipdb: int = 5
+    scamalytics_tier_max_abuseipdb: int = 50
     geoip_enabled: bool = True
     geoip_db_path: str = "geoip/dbip-city-lite.mmdb"
     blocklist_enabled: bool = True
@@ -562,15 +596,30 @@ class ReputationGatherer:
             ev.country = data.get("countryCode") or None
 
     async def _tier2(self, session: aiohttp.ClientSession, ev: HostEvidence) -> None:
-        # AbuseIPDB, IPQS, and Scamalytics are three independent providers
-        # writing three independent HostEvidence fields -- run concurrently
-        # rather than one-after-another, same "max not sum" latency fix as
-        # _tier1 above (2026-08-13).
+        # AbuseIPDB and IPQS are independent providers writing independent
+        # HostEvidence fields -- run concurrently, same "max not sum"
+        # latency fix as _tier1 above (2026-08-13). Scamalytics
+        # (2026-08-16) is now TIERED on AbuseIPDB's own result -- see this
+        # module's docstring -- so it can no longer join that same gather
+        # unconditionally; it runs after, only when actually worth the
+        # budget.
         await asyncio.gather(
             self._tier2_abuseipdb(session, ev),
             self._tier2_ipqs(session, ev),
-            self._tier2_scamalytics(session, ev),
         )
+        if self._scamalytics_worth_checking(ev):
+            await self._tier2_scamalytics(session, ev)
+
+    def _scamalytics_worth_checking(self, ev: HostEvidence) -> bool:
+        cfg = self.config
+        if not cfg.scamalytics_tiering_enabled:
+            return True
+        if ev.abuseipdb_score is None:
+            # AbuseIPDB didn't run, had no key, was budget-exhausted, or
+            # genuinely failed -- no data to tier on, so fail toward MORE
+            # checking, not less.
+            return True
+        return cfg.scamalytics_tier_min_abuseipdb <= ev.abuseipdb_score < cfg.scamalytics_tier_max_abuseipdb
 
     async def _tier2_abuseipdb(self, session: aiohttp.ClientSession, ev: HostEvidence) -> None:
         cfg = self.config

@@ -212,6 +212,11 @@ class Shild(callbacks.Plugin):
                 scamalytics_key=secrets["scamalytics_key"],
                 scamalytics_username2=secrets["scamalytics_username2"],
                 scamalytics_key2=secrets["scamalytics_key2"],
+                scamalytics_tiering_enabled=self.registryValue("scamalytics.tieringEnabled"),
+                scamalytics_tier_min_abuseipdb=self.registryValue(
+                    "scamalytics.tierMinAbuseipdbScore"),
+                scamalytics_tier_max_abuseipdb=self.registryValue(
+                    "scamalytics.tierMaxAbuseipdbScore"),
                 geoip_enabled=self.registryValue("geoip.enabled"),
                 geoip_db_path=self.registryValue("geoip.dbPath"),
                 blocklist_enabled=self.registryValue("blocklist.enabled"),

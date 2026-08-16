@@ -272,6 +272,9 @@ Plugin-side only (no `shildml/` change) — `@reload Shild` picks it up.
 | `plugins.Shild.scamalytics.enabled` | Boolean | `True` | Whether to call Scamalytics as a second Tier 2 check. Needs both a username and key; silently skipped otherwise. |
 | `plugins.Shild.scamalytics.dailyLimit` | Positive integer | `161` | Daily approximation of Scamalytics' 5,000-credit/month free tier — 161/day is the tightest rate that still guarantees the monthly total never exceeds 5,000 even in a 31-day month. Raised 2026-08-15 from an earlier, more conservative 150/day after real usage hit that cap before end of day. |
 | `plugins.Shild.scamalytics.dailyLimit2` | Positive integer | `161` | Same, for an optional second Scamalytics account used only once the primary's daily budget is exhausted. |
+| `plugins.Shild.scamalytics.tieringEnabled` | Boolean | `True` | Whether the Scamalytics call is tiered on AbuseIPDB's own result (2026-08-16) rather than always firing alongside AbuseIPDB/IPQS. See "Scamalytics tiering" below. |
+| `plugins.Shild.scamalytics.tierMinAbuseipdbScore` | Non-negative integer | `5` | An AbuseIPDB score below this is clean enough that Scamalytics is skipped. |
+| `plugins.Shild.scamalytics.tierMaxAbuseipdbScore` | Non-negative integer | `50` | An AbuseIPDB score at/above this already hard-corroborates on its own, so Scamalytics is skipped. |
 | `plugins.Shild.proxyscan.enabled` | Boolean | `True` | Whether to actively probe a joining host for open proxy ports (Tier 3). Connects to a third party's machine — qualitatively different from every other check. |
 | `plugins.Shild.proxyscan.connectTimeout` | Positive float | `2.0` | Per-port connect timeout (seconds). |
 | `plugins.Shild.proxyscan.overallTimeout` | Positive float | `6.0` | Hard deadline for the whole port scan regardless of port count. |
@@ -280,6 +283,28 @@ Plugin-side only (no `shildml/` change) — `@reload Shild` picks it up.
 | `plugins.Shild.blocklist.enabled` | Boolean | `True` | Whether to check a host's IP against local FireHOL blocklists (a real hard evidence signal). See "Local IP blocklists" below. |
 | `plugins.Shild.blocklist.dir` | String | `blocklists` | Directory containing the downloaded list files, resolved relative to `runtime/`. |
 | `plugins.Shild.blocklist.lists` | Space-separated strings | `socks_proxy_30d sslproxies_30d cybercrime feodo_badips` | Which curated FireHOL lists to check, by name. |
+
+### Scamalytics tiering
+
+Added 2026-08-16, after both Scamalytics accounts (161/day each, 322/day combined) were observed
+hitting their daily cap by mid-afternoon on a real traffic day, while AbuseIPDB (1000/day) still
+had headroom — Scamalytics was being spent on every single Tier 2 event regardless of what
+AbuseIPDB already found. AbuseIPDB and IPQS still run concurrently as before; Scamalytics now only
+runs *after*, and only when AbuseIPDB's own score lands in the "genuinely ambiguous" middle band
+(`tierMinAbuseipdbScore` to `tierMaxAbuseipdbScore`, default `5`–`50`, exclusive upper bound). A
+score below the low bound is clean enough that a second opinion rarely changes anything; a score
+at/above the high bound already gives AbuseIPDB's own hard-corroborating signal on its own, so a
+second provider isn't needed to reach the same conclusion.
+
+**Fails open, not closed**, whenever AbuseIPDB's score isn't available to tier on at all (disabled,
+no key, budget-exhausted, or a genuine failure) — there's no data to make a skip decision from, so
+Scamalytics is still called rather than silently losing coverage. Set `tieringEnabled` to `False`
+to go back to always calling both, if this trade-off (fewer Scamalytics-confirmed escalations on
+hosts AbuseIPDB already flagged on its own, in exchange for the daily budget actually lasting the
+whole day) turns out to be the wrong one. A tiered-out skip is never recorded in `checks_failed` —
+same convention as `scamalytics.enabled=False` or a missing key (not applicable this time, not a
+failure) — since `evidence.py`'s own "confirmed clean" path depends on `checks_failed` staying
+empty for a genuinely clean host.
 
 ### Local GeoIP database
 
