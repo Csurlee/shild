@@ -417,3 +417,53 @@ conf.registerGlobalValue(
     registry.PositiveFloat(15.0, _(
         """Rolling window (seconds) raidJoinLimit is counted over.""")),
 )
+
+# ---------------------------------------------------------------------
+# Group-flood heuristic (2026-08-22): the MESSAGE-side counterpart to the
+# raid block above -- groupFloodMessageLimit DISTINCT nicks each sending a
+# message in the same channel within groupFloodWindowSecs, even when every
+# individual nick stays under floodMessageLimit. Same "grouped flood" idea
+# from progval's AttackProtector plugin
+# (github.com/progval/Supybot-plugins/tree/master/AttackProtector),
+# reimplemented independently, not vendored -- raid covers the join side,
+# this covers the message side. Checked in doPrivmsg via
+# _check_heuristics, right after `flood` (its per-nick sibling) and before
+# hilight. Enforces against only the ONE message that tips the count over
+# the limit, never the whole burst -- same "act on the current event"
+# convention as every other heuristic here -- and still funnels through
+# the identical exemption/killSwitch/op gate chain.
+# ---------------------------------------------------------------------
+
+conf.registerChannelValue(
+    SpamGuard, "groupFloodEnabled",
+    registry.Boolean(False, _(
+        """Whether the group-flood heuristic (groupFloodMessageLimit
+        DISTINCT nicks messaging this channel within
+        groupFloodWindowSecs) is checked. Opt-in, same reasoning as
+        floodEnabled above -- and worth the same extra caution
+        raidEnabled warrants: an ordinary busy moment in an active
+        channel (a popular topic, a shared link everyone reacts to) is
+        the false-positive case to watch for here.""")),
+    opSettable=False,
+)
+conf.registerGlobalValue(
+    SpamGuard, "groupFloodMessageLimit",
+    registry.PositiveInteger(8, _(
+        """Number of DISTINCT nicks messaging this channel within
+        groupFloodWindowSecs that counts as a coordinated group flood.
+        Deliberately higher than floodMessageLimit, same reasoning as
+        raidJoinLimit -- a grouped signal should need more corroboration
+        than a single nick's own behavior before anyone gets kicked over
+        it. Mirrors raidJoinLimit's 8/15.0s pair as a starting point
+        rather than a tuned value: unlike raidJoinLimit (whose default
+        was sanity-checked against real join clusters in the 2026-08-14
+        shadow corpus), there is no corpus measurement backing this
+        number yet -- enable per channel with the kill switch on and
+        watch [spamguard] relay lines before trusting it.""")),
+)
+conf.registerGlobalValue(
+    SpamGuard, "groupFloodWindowSecs",
+    registry.PositiveFloat(15.0, _(
+        """Rolling window (seconds) groupFloodMessageLimit is counted
+        over.""")),
+)

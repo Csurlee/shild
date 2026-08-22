@@ -90,6 +90,12 @@ class ShildTestCase(ChannelPluginTestCase):
         # caught until a new test (added same session) happened to run
         # alphabetically after one of them with the leak still live.
         conf.supybot.plugins.Shild.relayChannel.get(":test").setValue("")
+        # conf.supybot.networks (2026-08-22) -- read by the new
+        # _pin_network_values(), called from every plugin __init__, i.e.
+        # every test's setUp() in this whole file. Reset here so a test
+        # that explicitly sets it (see the _pin_network_values tests
+        # below) can't leak a stale network list into a later test.
+        conf.supybot.networks.setValue([])
         # Same story, and the REAL root cause of a failure the relayChannel
         # fix above only partly masked: Shild.enabled for self.channel is
         # channel-scoped and set True by many tests, never reset. Left
@@ -988,6 +994,44 @@ class ShildTestCase(ChannelPluginTestCase):
         self.assertIn("SpamGuard: not loaded", lines)
         self.assertIn("UndernetX: not loaded", lines)
 
+    # ---- _pin_network_values (2026-08-22) ----
+
+    def test_pin_network_values_reactivates_a_configured_relay_channel(self):
+        """The actual bug this fixes: a network-scoped registry override
+        (relayChannel) that's present in the conf file but never
+        explicitly .setValue()'d during THIS process's run gets silently
+        dropped from the next clean-shutdown write-back -- confirmed live,
+        with zero error trace either way (_relay() just no-ops on an empty
+        channel). _wasSet=False directly simulates "loaded from the conf
+        file's cache but never re-activated" -- exactly the state that was
+        found live and caused real ban/warn decisions to go unannounced
+        with no visible sign anything was wrong.
+        """
+        conf.supybot.networks.setValue([self.irc.network])
+        val = conf.supybot.plugins.Shild.relayChannel.get(":" + self.irc.network)
+        val.setValue("#relay")
+        val._wasSet = False
+
+        self.irc.getCallback("Shild")._pin_network_values()
+
+        self.assertTrue(val._wasSet)
+        self.assertEqual(
+            conf.supybot.plugins.Shild.relayChannel.getSpecific(network=self.irc.network)(),
+            "#relay",
+        )
+
+    def test_pin_network_values_does_not_create_a_spurious_override(self):
+        """A network with no relayChannel configured at all must stay
+        untouched -- writing back an empty string would create a real,
+        persisted override where none was ever intended."""
+        conf.supybot.networks.setValue([self.irc.network, "othernet"])
+        # self.irc.network's relayChannel is whatever setUp left it as
+        # (unset, per this class's own convention); "othernet" is
+        # definitely never configured.
+        self.irc.getCallback("Shild")._pin_network_values()
+        val = conf.supybot.plugins.Shild.relayChannel.get(":othernet")
+        self.assertFalse(val._wasSet)
+
     def _queued(self):
         """All messages currently queued to be sent, without dequeuing
         them (avoids the outgoing-queue's real-time throttling, which
@@ -1053,6 +1097,9 @@ class ShildXFallbackTestCase(ChannelPluginTestCase):
         conf.supybot.plugins.Shild.thresholds.classifierAct.setValue(0.5)
         conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
         conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+        # See ShildTestCase.setUp()'s own comment -- read by
+        # _pin_network_values(), called from every plugin __init__.
+        conf.supybot.networks.setValue([])
         conf.supybot.plugins.Shild.protection.killSwitch.setValue(False)
         conf.supybot.plugins.Shild.ignoreList.setValue([])
         conf.supybot.plugins.Shild.decisionCache.enabled.setValue(True)
@@ -1210,6 +1257,9 @@ class ShildConfigTestCase(ChannelPluginTestCase):
         conf.supybot.plugins.Shild.messageAnalysis.get(self.channel).setValue(True)
         conf.supybot.plugins.Shild.protection.killSwitch.setValue(False)
         conf.supybot.plugins.Shild.ollama.enabled.setValue(True)
+        # See ShildTestCase.setUp()'s own comment -- read by
+        # _pin_network_values(), called from every plugin __init__.
+        conf.supybot.networks.setValue([])
 
         self._sg_terms_path = str(Path(self._tmpdir) / "spamguard_terms.json")
         self._sg_host_bans_path = str(Path(self._tmpdir) / "spamguard_host_bans.json")

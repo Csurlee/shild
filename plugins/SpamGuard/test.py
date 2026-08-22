@@ -36,6 +36,11 @@ class SpamGuardTestCase(ChannelPluginTestCase):
         # terms regardless of what earlier tests added.
         conf.supybot.plugins.SpamGuard.termsPath.setValue(self._terms_path)
         conf.supybot.plugins.SpamGuard.enabled.get(self.channel).setValue(True)
+        # conf.supybot.networks (2026-08-22) -- read by _pin_network_values(),
+        # called from every plugin __init__, i.e. every test's setUp() in
+        # this whole file. Reset here so a test that explicitly sets it
+        # can't leak a stale network list into a later test.
+        conf.supybot.networks.setValue([])
         # Cross-test state-leak gotcha (same class already documented
         # elsewhere for Shild's ignoreList/UndernetX's auth.username --
         # any value set directly via .setValue() in a test body, channel-
@@ -43,8 +48,8 @@ class SpamGuardTestCase(ChannelPluginTestCase):
         # config-dict restore): a heuristic left "on" by one test would
         # otherwise leak into every later test in the same process. Reset
         # explicitly here; each heuristic test enables only what it needs.
-        for name in ("floodEnabled", "hilightEnabled", "capsEnabled", "mojibakeEnabled",
-                     "raidEnabled"):
+        for name in ("floodEnabled", "groupFloodEnabled", "hilightEnabled", "capsEnabled",
+                     "mojibakeEnabled", "raidEnabled"):
             getattr(conf.supybot.plugins.SpamGuard, name).get(self.channel).setValue(False)
         # hostBanAutoRebanEnabled (2026-08-22) is global, not channel-
         # scoped -- same cross-test state-leak risk as everything else
@@ -100,6 +105,17 @@ class SpamGuardTestCase(ChannelPluginTestCase):
         args = (self.channel,) if realname is None else (self.channel, "*", realname)
         self.irc.feedMsg(ircmsgs.IrcMsg(
             command="JOIN", args=args, prefix=f"{nick}!{ident}@{host}",
+        ))
+
+    def _chat(self, nick, text="just chatting", ident="~c", host=None):
+        """A plain PRIVMSG from a DISTINCT identity -- each group_flood
+        test nick needs its own ident/host, unlike the flood tests where
+        every message comes from one nick. text deliberately avoids the
+        seeded "Czura" content term and stays short/lowercase so it can
+        never also trip caps/mojibake."""
+        self.irc.feedMsg(ircmsgs.privmsg(
+            self.channel, text,
+            prefix=f"{nick}!{ident}@{host or f'{nick}.example.net'}",
         ))
 
     def _grant_op(self, channel):
@@ -970,6 +986,7 @@ class SpamGuardTestCase(ChannelPluginTestCase):
         m2 = self.irc.takeMsg()
         self.assertIsNotNone(m2, "expected a second line with per-heuristic state")
         self.assertIn("flood=on", m2.args[1])
+        self.assertIn("groupflood=off", m2.args[1])
         self.assertIn("hilight=off", m2.args[1])
         self.assertIn("caps=off", m2.args[1])
         self.assertIn("mojibake=off", m2.args[1])
@@ -1047,6 +1064,84 @@ class SpamGuardTestCase(ChannelPluginTestCase):
 
         kicks = [m for m in self._queued() if m.command == "KICK"]
         self.assertEqual(len(kicks), 1, "the join right after a trigger must not re-trigger")
+        self.assertEqual(kicks[0].args[1], "tipper")
+
+    # ---- group_flood (2026-08-22): distinct-nick message-burst detection,
+    # the message-side counterpart to raid above ----
+
+    def test_group_flood_enforces_after_distinct_nick_limit_reached(self):
+        conf.supybot.plugins.SpamGuard.groupFloodEnabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        limit = conf.supybot.plugins.SpamGuard.groupFloodMessageLimit()
+        for i in range(limit - 1):
+            self._chat(f"spammer{i}")
+        self._chat("tipper", host=self._DEFAULT_HOST)
+
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        self.assertEqual(len(kicks), 1, "expected exactly one enforcement at the limit")
+        self.assertEqual(kicks[0].args[1], "tipper",
+                          "must act on the tipping-point message, not an earlier one")
+        records = self._log_records()
+        self.assertEqual(records[-1]["outcome"], "enforced")
+        self.assertEqual(records[-1]["field"], "group_flood")
+        self.assertEqual(records[-1]["term_id"], -7)
+
+    def test_group_flood_below_limit_does_not_enforce(self):
+        conf.supybot.plugins.SpamGuard.groupFloodEnabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        limit = conf.supybot.plugins.SpamGuard.groupFloodMessageLimit()
+        for i in range(limit - 1):
+            self._chat(f"spammer{i}")
+
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        self.assertEqual(kicks, [])
+
+    def test_group_flood_disabled_by_default_never_enforces(self):
+        """groupFloodEnabled defaults False -- opt-in per channel, same
+        safety posture as every other heuristic here."""
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        for i in range(20):
+            self._chat(f"spammer{i}")
+
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        self.assertEqual(kicks, [])
+
+    def test_group_flood_one_nick_talking_a_lot_does_not_count_as_distinct(self):
+        """A single chatty nick sending many messages must never look
+        like a coordinated group flood on its own -- only DISTINCT nicks
+        count toward groupFloodMessageLimit. (floodEnabled is off here,
+        reset in setUp, so the per-nick flood heuristic can't fire
+        either.)"""
+        conf.supybot.plugins.SpamGuard.groupFloodEnabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        limit = conf.supybot.plugins.SpamGuard.groupFloodMessageLimit()
+        for _ in range(limit + 5):
+            self._chat("chatty", host=self._DEFAULT_HOST)
+
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        self.assertEqual(kicks, [])
+
+    def test_group_flood_resets_after_triggering_not_immediately_retriggered(self):
+        """Same convention as the flood/raid heuristics: once
+        groupFloodMessageLimit is reached and acted on, tracked state is
+        cleared -- the very next message must not immediately trigger a
+        second enforcement before a fresh window has genuinely built
+        back up."""
+        conf.supybot.plugins.SpamGuard.groupFloodEnabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        limit = conf.supybot.plugins.SpamGuard.groupFloodMessageLimit()
+        for i in range(limit - 1):
+            self._chat(f"spammer{i}")
+        self._chat("tipper", host=self._DEFAULT_HOST)
+        self._chat("onemore", host=f"onemore.example.net{'__no_testcap__'}")
+
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        self.assertEqual(len(kicks), 1, "the message right after a trigger must not re-trigger")
         self.assertEqual(kicks[0].args[1], "tipper")
 
     # ---- black (2026-08-14): matches nick OR host, acts on future joins
@@ -1217,6 +1312,31 @@ class SpamGuardTestCase(ChannelPluginTestCase):
         self._assert_denied_owner_capability("spamguard word add foo")
         self.assertIsNone(self._plugin._terms.find_by_text("word", "foo"))
 
+    # ---- _pin_network_values (2026-08-22) ----
+
+    def test_pin_network_values_reactivates_a_configured_relay_channel(self):
+        """See plugins/Shild/test.py's matching test for the full
+        explanation of the real bug this fixes -- identical mechanism,
+        SpamGuard's own relayChannel value."""
+        conf.supybot.networks.setValue([self.irc.network])
+        val = conf.supybot.plugins.SpamGuard.relayChannel.get(":" + self.irc.network)
+        val.setValue("#relay")
+        val._wasSet = False
+
+        self._plugin._pin_network_values()
+
+        self.assertTrue(val._wasSet)
+        self.assertEqual(
+            conf.supybot.plugins.SpamGuard.relayChannel.getSpecific(network=self.irc.network)(),
+            "#relay",
+        )
+
+    def test_pin_network_values_does_not_create_a_spurious_override(self):
+        conf.supybot.networks.setValue([self.irc.network, "othernet"])
+        self._plugin._pin_network_values()
+        val = conf.supybot.plugins.SpamGuard.relayChannel.get(":othernet")
+        self.assertFalse(val._wasSet)
+
 
 class SpamGuardXFallbackTestCase(ChannelPluginTestCase):
     """The 2026-08-16 X-routed enforcement fallback -- mirrors
@@ -1234,6 +1354,11 @@ class SpamGuardXFallbackTestCase(ChannelPluginTestCase):
         conf.supybot.plugins.SpamGuard.logPath.setValue(self._log_path)
         conf.supybot.plugins.SpamGuard.termsPath.setValue(self._terms_path)
         conf.supybot.plugins.SpamGuard.enabled.get(self.channel).setValue(True)
+        # conf.supybot.networks (2026-08-22) -- read by _pin_network_values(),
+        # called from every plugin __init__, i.e. every test's setUp() in
+        # this whole file. Reset here so a test that explicitly sets it
+        # can't leak a stale network list into a later test.
+        conf.supybot.networks.setValue([])
         conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
 
         super().setUp()

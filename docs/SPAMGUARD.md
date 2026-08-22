@@ -95,7 +95,7 @@ already `True` — adding a `black` entry does not override or bypass that per-c
 as every other mechanism in this plugin. "Every channel the bot is or joins" means every channel
 SpamGuard actually watches, not literally every channel the bot's IRC connection happens to be in.
 
-## Message heuristics (flood, hilight, caps, mojibake, raid)
+## Message heuristics (flood, groupFlood, hilight, caps, mojibake, raid)
 
 Four non-term, threshold-based message detectors (2026-08-14) — adapted from ideas in Libera
 Chat's own `ozone` network-abuse bot (`github.com/Libera-Chat/ozone`), reimplemented independently
@@ -116,6 +116,16 @@ real regulars rejoining together looks identical to a coordinated raid at the ne
 `raidJoinLimit` defaults meaningfully higher than a single-nick flood threshold, and — like every
 other heuristic here — it still funnels through the same exemption/kill-switch/op gate chain.
 
+A sixth, **groupFlood** (2026-08-22), is the message-side counterpart to `raid` and comes from the
+same `AttackProtector` "grouped flood" idea: `groupFloodMessageLimit` **distinct** nicks each
+sending a message in the same channel within `groupFloodWindowSecs`, catching a coordinated
+multi-identity spam wave where every individual nick stays under `floodMessageLimit`. Like `raid`,
+it enforces only against the ONE message that tipped the count over the limit, never the earlier
+ones, and clears its tracked state on trigger so the next message can't immediately re-fire it.
+Its defaults deliberately mirror `raidJoinLimit`/`raidWindowSecs` (8 / 15.0s) as a starting point —
+unlike `raidJoinLimit`, there is no corpus measurement behind that number yet, so enable it per
+channel with the kill switch still on and watch the relay first.
+
 Unlike a term list (implicitly inert until a word/phrase/pattern is added), a threshold is always
 *live* the moment code exists to check it — so each heuristic is its own **per-channel opt-in,
 default off**, the equivalent safety property. Enable them one at a time and watch `[spamguard]`
@@ -124,16 +134,18 @@ relay lines with the kill switch still on, same staged-rollout discipline as the
 | Heuristic | Enable value (channel) | Triggers when |
 |---|---|---|
 | **flood** | `plugins.SpamGuard.floodEnabled` | `floodMessageLimit` (default 5) messages from the same nick within `floodWindowSecs` (default 8.0s) |
+| **groupFlood** | `plugins.SpamGuard.groupFloodEnabled` | `groupFloodMessageLimit` (default 8) *distinct* nicks each message the channel within `groupFloodWindowSecs` (default 15.0s) — acts only on the tipping-point message |
 | **hilight** | `plugins.SpamGuard.hilightEnabled` | a single message names `hilightNickLimit` (default 4) or more distinct real channel members by nick (each ≥ `hilightMinNickLen` chars, default 3) — classic raid-bot behavior |
 | **caps** | `plugins.SpamGuard.capsEnabled` | `capsPercent` (default 70%) or more of a message's *letters* are uppercase, once it's at least `capsMinLength` (default 10) characters |
 | **mojibake** | `plugins.SpamGuard.mojibakeEnabled` | `mojibake.mojibake_score()` (garbled-character-encoding detection) is at/above `mojibakeScore` (default 2) |
 | **raid** | `plugins.SpamGuard.raidEnabled` | `raidJoinLimit` (default 8) *distinct* nicks join the channel within `raidWindowSecs` (default 15.0s) — acts only on the tipping-point joiner |
 
 Each match is logged/relayed/enforced exactly like a term match, using a fixed negative pseudo-id
-(`flood=-1`, `hilight=-2`, `caps=-3`, `mojibake=-4`, `raid=-5`) in place of a real TermStore id,
-since these aren't user-managed text entries — `spamguardsearch`/`spamguardremove` never apply to
-them; tune via `@config`/`config channel` instead. `spamguardstatus`, run **in a channel**, shows
-that channel's on/off state for all five on a second reply line.
+(`flood=-1`, `hilight=-2`, `caps=-3`, `mojibake=-4`, `raid=-5`, `group_flood=-7`) in place of a
+real TermStore id, since these aren't user-managed text entries — `spamguardsearch`/
+`spamguardremove` never apply to them; tune via `@config`/`config channel` instead.
+`spamguardstatus`, run **in a channel**, shows that channel's on/off state for all six on a second
+reply line.
 
 ## Commands
 
@@ -201,8 +213,8 @@ takes no arguments
 
 Reports match/enforcement counters (since the last restart), kill-switch state, pending
 auto-unbans, and per-category term counts — including a count of any stored patterns that failed
-to compile. Run in a channel, a second reply line also shows that channel's flood/hilight/caps/
-mojibake/raid enable state.
+to compile. Run in a channel, a second reply line also shows that channel's flood/groupflood/
+hilight/caps/mojibake/raid enable state.
 
 ## Configuration
 
@@ -226,6 +238,9 @@ mojibake/raid enable state.
 | `plugins.SpamGuard.floodEnabled` | channel | Boolean | `False` | Whether the flood heuristic is checked in this channel. Not op-settable. |
 | `plugins.SpamGuard.floodMessageLimit` | global | Positive integer | `5` | Messages from the same nick within `floodWindowSecs` that counts as flooding. |
 | `plugins.SpamGuard.floodWindowSecs` | global | Positive float | `8.0` | Rolling window (seconds) `floodMessageLimit` is counted over. |
+| `plugins.SpamGuard.groupFloodEnabled` | channel | Boolean | `False` | Whether the group-flood (distinct-nick message burst) heuristic is checked in this channel. Not op-settable. |
+| `plugins.SpamGuard.groupFloodMessageLimit` | global | Positive integer | `8` | Distinct nicks messaging the channel within `groupFloodWindowSecs` that counts as a group flood. Mirrors `raidJoinLimit`; no corpus tuning behind it yet. |
+| `plugins.SpamGuard.groupFloodWindowSecs` | global | Positive float | `15.0` | Rolling window (seconds) `groupFloodMessageLimit` is counted over. |
 | `plugins.SpamGuard.hilightEnabled` | channel | Boolean | `False` | Whether the mass-highlight heuristic is checked in this channel. Not op-settable. |
 | `plugins.SpamGuard.hilightNickLimit` | global | Positive integer | `4` | Distinct real channel members named by nick in one message that counts as a mass-highlight. |
 | `plugins.SpamGuard.hilightMinNickLen` | global | Positive integer | `3` | Nicks shorter than this never count toward `hilightNickLimit`. |
@@ -261,7 +276,7 @@ blocking enforcement.
   sense: nicks are the most freely reusable identity of the three — without NickServ registration
   and enforcement, literally anyone can pick up a banned nick next. Still useful for a known-bad
   literal nick (a bot's fixed default), just don't expect it to survive a determined nick change.
-- `content`, `realname`, `black`, and every heuristic (flood/hilight/caps/mojibake/raid/
+- `content`, `realname`, `black`, and every heuristic (flood/groupFlood/hilight/caps/mojibake/raid/
   `host_history`) fall back to a host-based mask: content/black-by-nick/heuristics have no identity
   component of their own, and realname isn't part of an IRC ban mask at all (masks are strictly
   `nick!ident@host`).

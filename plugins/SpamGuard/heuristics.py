@@ -1,8 +1,9 @@
 """Pure, non-term, threshold-based heuristics: flood, mass nick-highlight,
 and excessive caps (message-based, 2026-08-14), plus raid/coordinated-join
-detection (join-based, 2026-08-16). See mojibake.py for the fourth message
-heuristic (garbled-encoding detection, vendored separately since it's a
-large regex table, not written here).
+detection (join-based, 2026-08-16) and group_flood/coordinated-message
+detection (message-based, 2026-08-22). See mojibake.py for the fourth
+message heuristic (garbled-encoding detection, vendored separately since
+it's a large regex table, not written here).
 
 The first three are adapted from ideas in Libera Chat's own `ozone`
 network-abuse bot (github.com/Libera-Chat/ozone, plugin.py's
@@ -19,7 +20,13 @@ prune_join_events (raid detection) is adapted the same "idea, not code" way
 from the "grouped flood" concept in progval's AttackProtector plugin
 (github.com/progval/Supybot-plugins/tree/master/AttackProtector, 2010-era
 Python 2-flavored code, not vendored) -- see plugin.py's
-_check_join_heuristics docstring for the full reasoning.
+_check_join_heuristics docstring for the full reasoning. As of 2026-08-22
+it's also reused, unchanged, by group_flood (see _check_heuristics) --
+the message-side half of the same AttackProtector "grouped flood" idea,
+where raid only ever covered the join side. Despite the name it was
+always generic (timestamp, nick) pruning, not join-specific; both
+callers need exactly this, and duplicating it under a second name would
+only be two things to keep in sync.
 
 No supybot import -- pure, unit-testable without the plugin harness, same
 convention as matcher.py/terms.py in this plugin.

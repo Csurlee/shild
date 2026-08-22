@@ -276,6 +276,52 @@ class Shild(callbacks.Plugin):
             self._report_event_name, now=False,
         )
 
+        self._pin_network_values()
+        self._pin_event_name = f"shildPinNetworkValues-{id(self)}"
+        try:
+            schedule.removeEvent(self._pin_event_name)
+        except KeyError:
+            pass
+        schedule.addPeriodicEvent(
+            self._pin_network_values, 60, self._pin_event_name, now=False)
+
+    def _pin_network_values(self) -> None:
+        """2026-08-22: relayChannel (registerNetworkValue) is only
+        persisted through a clean shutdown's registry write-back if it was
+        actually READ during this process's run -- a network override
+        sitting untouched in the conf file for a short-lived process
+        silently gets dropped from the NEXT write-back, with zero error or
+        log trace either way (_relay() just no-ops on an empty channel).
+        Confirmed live: this repeatedly dropped a working relayChannel
+        override across ordinary restarts, meaning real ban/warn decisions
+        went completely unannounced with no visible sign anything was
+        wrong. Force-activates every configured network's relayChannel by
+        immediately writing it back to its own current value (a genuine
+        .setValue(), not just a read) -- guarantees it survives the next
+        write-back regardless of whether real relay traffic happens to
+        occur first. A network with no relayChannel configured at all is
+        untouched (writing back an empty string would create a spurious
+        override where none was ever intended).
+
+        Called both once from __init__ AND on a 60-second periodic timer,
+        not just once -- confirmed live that a single __init__-time call
+        is NOT enough: getSpecific(network=X) silently falls back to the
+        bare (unset) value whenever world.getIrc(X) isn't registered yet
+        at that exact moment (registry.py's own network-validity check),
+        and Undernet's own connection sequence (~15-45s to fully sync,
+        already documented elsewhere in this file) routinely hasn't
+        finished by the time Shild's single, process-wide __init__ runs
+        -- so Undernet's relayChannel was silently skipped by the very
+        first version of this fix while Libera's worked, with the two
+        indistinguishable without added diagnostic logging to tell them
+        apart. The periodic retry is what actually closes the gap once
+        every configured network has finished connecting; it stays cheap
+        and harmless to keep running indefinitely afterward."""
+        for network in conf.supybot.networks():
+            current = self.registryValue("relayChannel", network=network)
+            if current:
+                self.setRegistryValue("relayChannel", current, network=network)
+
     def die(self):
         try:
             schedule.removeEvent(self._reload_event_name)
@@ -283,6 +329,10 @@ class Shild(callbacks.Plugin):
             pass
         try:
             schedule.removeEvent(self._report_event_name)
+        except KeyError:
+            pass
+        try:
+            schedule.removeEvent(self._pin_event_name)
         except KeyError:
             pass
         for event_name in list(self._pending_unbans):

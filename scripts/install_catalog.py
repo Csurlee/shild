@@ -209,6 +209,10 @@ CATALOG: dict[str, list] = {
         Ask("raidEnabled", tier="advanced", kind="bool", default=False,
             question="Enable the raid (coordinated-join) heuristic globally as a default for new "
                      "channels? Caution: a real netsplit-reconnect burst can resemble a raid."),
+        Ask("groupFloodEnabled", tier="advanced", kind="bool", default=False,
+            question="Enable the group-flood (coordinated multi-nick message burst) heuristic "
+                     "globally as a default for new channels? Caution: an ordinary busy moment "
+                     "in an active channel can resemble one."),
         Skip("floodMessageLimit", "internal tuning"),
         Skip("floodWindowSecs", "internal tuning"),
         Skip("hilightNickLimit", "internal tuning"),
@@ -218,6 +222,8 @@ CATALOG: dict[str, list] = {
         Skip("mojibakeScore", "internal tuning"),
         Skip("raidJoinLimit", "internal tuning"),
         Skip("raidWindowSecs", "internal tuning"),
+        Skip("groupFloodMessageLimit", "internal tuning"),
+        Skip("groupFloodWindowSecs", "internal tuning"),
         Skip("words", "legacy migration-only field, superseded by the `spamguard word add` command"),
         Skip("phrases", "legacy migration-only field"),
         Skip("patterns", "legacy migration-only field"),

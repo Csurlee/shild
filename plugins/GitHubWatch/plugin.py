@@ -14,7 +14,7 @@ reasoning as Shild's auto-unban scheduling in plugins/Shild/plugin.py).
 """
 from __future__ import annotations
 
-from supybot import callbacks, ircmsgs, log, world
+from supybot import callbacks, conf, ircmsgs, log, schedule, world
 from supybot.commands import wrap
 
 from . import github
@@ -35,9 +35,40 @@ class GitHubWatch(callbacks.Plugin):
         self._state = SeenStateStore(self.registryValue("statePath"))
         self._worker = Worker(self._state, self._build_poll_config, self._on_events)
         self._worker.start()
+        self._pin_network_values()
+        self._pin_event_name = f"githubwatchPinNetworkValues-{id(self)}"
+        try:
+            schedule.removeEvent(self._pin_event_name)
+        except KeyError:
+            pass
+        schedule.addPeriodicEvent(
+            self._pin_network_values, 60, self._pin_event_name, now=False)
+
+    def _pin_network_values(self) -> None:
+        """2026-08-22: channel (registerNetworkValue) is only persisted
+        through a clean shutdown's registry write-back if it was actually
+        READ during this process's run -- see Shild's own matching fix
+        (plugins/Shild/plugin.py) for the full explanation, including WHY
+        this must also run on a periodic retry (a single __init__-time
+        call isn't enough: getSpecific(network=X) silently falls back to
+        the bare value whenever world.getIrc(X) isn't registered yet at
+        that exact moment, and Undernet routinely hasn't finished
+        connecting by the time this process-wide __init__ runs).
+        Force-activates every configured network's channel by writing it
+        back to its own current value, so it survives the next write-back
+        regardless of whether a poll happens to announce something
+        first."""
+        for network in conf.supybot.networks():
+            current = self.registryValue("channel", network=network)
+            if current:
+                self.setRegistryValue("channel", current, network=network)
 
     def die(self):
         self._worker.stop()
+        try:
+            schedule.removeEvent(self._pin_event_name)
+        except KeyError:
+            pass
         self.__parent.die()
 
     # ---- config -> worker ----

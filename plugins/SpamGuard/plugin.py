@@ -72,6 +72,16 @@ enforces against only the ONE joiner who tips the threshold, never the
 whole burst, since a legitimate netsplit-reconnect burst of real regulars
 can look identical to a coordinated raid at the network level.
 
+A seventh heuristic, "group_flood" (2026-08-22, see _check_heuristics), is
+the message-side counterpart to raid: groupFloodMessageLimit DISTINCT
+nicks each sending a message in the same channel within
+groupFloodWindowSecs, even where every individual nick stays under
+floodMessageLimit. Same "grouped flood" idea from progval's
+AttackProtector, adapted the same "idea, not code" way, and enforcing
+against only the ONE message that tips the count over the limit -- never
+the whole burst -- for the same reason raid only acts on the
+tipping-point joiner.
+
 Every matched message is logged to data/spamguard_actions.jsonl and
 relayed (if configured) REGARDLESS of whether it was acted on, tagged
 with why (killswitch / not-opped / outside-window / exempt / enforced)
@@ -94,7 +104,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from supybot import callbacks, ircdb, ircmsgs, ircutils, log, schedule, world
+from supybot import callbacks, conf, ircdb, ircmsgs, ircutils, log, schedule, world
 from supybot.commands import wrap
 from supybot.commands import any as anyArgs
 
@@ -123,7 +133,7 @@ _CATEGORIES = ("word", "ident", "nick", "realname", "pattern", "black")
 # satisfying every place that reads term.id/term.text (the kick reason,
 # the JSONL log, spamguardstatus).
 _HEURISTIC_IDS = {"flood": -1, "hilight": -2, "caps": -3, "mojibake": -4, "raid": -5,
-                   "host_history": -6}
+                   "host_history": -6, "group_flood": -7}
 
 
 def _heuristic_term(category: str, text: str) -> termstore.Term:
@@ -161,6 +171,14 @@ class SpamGuard(callbacks.Plugin):
         # _recent_messages -- see _prune_recent_joins -- and only
         # populated at all while raidEnabled is on somewhere.
         self._recent_joins: dict[tuple[str, str], list[tuple[float, str]]] = {}
+        # (network, channel) -> [(message timestamp, nick), ...], for the
+        # group_flood heuristic (2026-08-22) -- deliberately the SAME
+        # shape as _recent_joins above, not _recent_messages': this
+        # counts DISTINCT nicks across the whole channel, not one nick's
+        # own message rate, so it must not be keyed by nick. Pruned via
+        # _prune_recent_group_messages and only populated at all while
+        # groupFloodEnabled is on somewhere.
+        self._recent_group_messages: dict[tuple[str, str], list[tuple[float, str]]] = {}
         self._stats = {"messages": 0, "matches": 0, "enforced": 0}
         self._pending_unbans: dict[str, None] = {}
 
@@ -185,6 +203,34 @@ class SpamGuard(callbacks.Plugin):
         self._realname_matchers: list[tuple[termstore.Term, object]] = []
         self._black_matchers: list[tuple[termstore.Term, object]] = []
         self._rebuild_matchers()
+
+        self._pin_network_values()
+        self._pin_event_name = f"spamguardPinNetworkValues-{id(self)}"
+        try:
+            schedule.removeEvent(self._pin_event_name)
+        except KeyError:
+            pass
+        schedule.addPeriodicEvent(
+            self._pin_network_values, 60, self._pin_event_name, now=False)
+
+    def _pin_network_values(self) -> None:
+        """2026-08-22: relayChannel (registerNetworkValue) is only
+        persisted through a clean shutdown's registry write-back if it was
+        actually READ during this process's run -- see Shild's own
+        matching fix (plugin.py) for the full explanation, including WHY
+        this must also run on a periodic retry (a single __init__-time
+        call isn't enough: getSpecific(network=X) silently falls back to
+        the bare value whenever world.getIrc(X) isn't registered yet at
+        that exact moment, and Undernet routinely hasn't finished
+        connecting by the time this process-wide __init__ runs).
+        Force-activates every configured network's relayChannel by
+        writing it back to its own current value, so it survives the next
+        write-back regardless of whether real relay traffic happens to
+        occur first."""
+        for network in conf.supybot.networks():
+            current = self.registryValue("relayChannel", network=network)
+            if current:
+                self.setRegistryValue("relayChannel", current, network=network)
 
     def _migrate_legacy_registry_terms(self) -> None:
         """One-time migration from the old flat config-registry lists
@@ -227,6 +273,10 @@ class SpamGuard(callbacks.Plugin):
                 pass
         try:
             schedule.removeEvent(self._host_ban_prune_event_name)
+        except KeyError:
+            pass
+        try:
+            schedule.removeEvent(self._pin_event_name)
         except KeyError:
             pass
         self.__parent.die()
@@ -326,6 +376,13 @@ class SpamGuard(callbacks.Plugin):
                  if not events or now - events[-1][0] > window]
         for key in stale:
             self._recent_joins.pop(key, None)
+
+    def _prune_recent_group_messages(self, now: float) -> None:
+        window = self.registryValue("groupFloodWindowSecs")
+        stale = [key for key, events in self._recent_group_messages.items()
+                 if not events or now - events[-1][0] > window]
+        for key in stale:
+            self._recent_group_messages.pop(key, None)
 
     def _is_exempt(self, irc, channel: str, msg) -> bool:
         """Halfop+ in-channel, holding this channel's own ircdb 'op'
@@ -484,16 +541,21 @@ class SpamGuard(callbacks.Plugin):
         adapted from ideas in Libera Chat's own `ozone` network-abuse bot
         -- see heuristics.py/mojibake.py's own module docstrings): flood,
         mass nick-highlight, excessive caps, and mojibake/garbled
-        encoding. Each is a per-channel opt-in (default off, see
-        config.py's module comment on this block) -- unlike content/
-        ident/nick/realname, which are implicitly off until a term is
-        added, these have no natural "off" state otherwise, since a
-        threshold always applies once code exists to check it. First hit
-        wins, same convention as doJoin's nick/ident/realname chain --
-        checked in this order: flood, hilight, caps, mojibake. None
-        require the join window (require_join_window=False) -- these are
-        general per-message conduct signals, not specifically the
-        "just joined and pasted a template" pattern content matching
+        encoding, plus group_flood (2026-08-22, message-side counterpart
+        to raid -- see heuristics.py's prune_join_events docstring).
+        Each is a per-channel opt-in (default off, see config.py's
+        module comment on this block) -- unlike content/ident/nick/
+        realname, which are implicitly off until a term is added, these
+        have no natural "off" state otherwise, since a threshold always
+        applies once code exists to check it. First hit wins, same
+        convention as doJoin's nick/ident/realname chain -- checked in
+        this order: flood, group_flood, hilight, caps, mojibake.
+        group_flood is checked right after flood since it's flood's
+        grouped sibling -- same window mechanics, but counting distinct
+        nicks across the whole channel instead of one nick's own rate.
+        None require the join window (require_join_window=False) --
+        these are general per-message conduct signals, not specifically
+        the "just joined and pasted a template" pattern content matching
         targets.
         """
         network = irc.network
@@ -516,6 +578,30 @@ class SpamGuard(callbacks.Plugin):
                                     field="flood", require_join_window=False)
                 return
             self._prune_recent_messages(now)
+
+        if self.registryValue("groupFloodEnabled", channel, network):
+            key = (network, channel)
+            window = self.registryValue("groupFloodWindowSecs")
+            # prune_join_events, despite the name, is generic
+            # (timestamp, nick) pruning -- shared with the raid
+            # heuristic rather than duplicated under a second name.
+            events = heuristics.prune_join_events(
+                self._recent_group_messages.get(key, []) + [(now, nick)], now, window)
+            self._recent_group_messages[key] = events
+            distinct = {n for _, n in events}
+            limit = self.registryValue("groupFloodMessageLimit")
+            if len(distinct) >= limit:
+                # Reset so the next message doesn't immediately
+                # re-trigger before a fresh window has genuinely built
+                # back up -- same convention as flood and raid.
+                self._recent_group_messages.pop(key, None)
+                term = _heuristic_term(
+                    "group_flood",
+                    f"{len(distinct)} distinct nicks messaging within {window:.0f}s")
+                self._handle_match(irc, msg, channel, nick, ident, host, term,
+                                    field="group_flood", require_join_window=False)
+                return
+            self._prune_recent_group_messages(now)
 
         if self.registryValue("hilightEnabled", channel, network):
             chan_state = irc.state.channels.get(channel)
@@ -804,7 +890,7 @@ class SpamGuard(callbacks.Plugin):
 
         Reports SpamGuard's match/enforcement counters and kill-switch
         state. Run in a channel to also see that channel's per-heuristic
-        (flood/hilight/caps/mojibake) enable state.
+        (flood/groupflood/hilight/caps/mojibake/raid) enable state.
         """
         counts = {cat: len(self._terms.by_category(cat)) for cat in termstore.CATEGORIES}
         irc.reply(
@@ -828,6 +914,7 @@ class SpamGuard(callbacks.Plugin):
                 return "on" if self.registryValue(name, msg.channel, irc.network) else "off"
             irc.reply(
                 f"SpamGuard heuristics in {msg.channel}: flood={on('floodEnabled')} "
+                f"groupflood={on('groupFloodEnabled')} "
                 f"hilight={on('hilightEnabled')} caps={on('capsEnabled')} "
                 f"mojibake={on('mojibakeEnabled')} raid={on('raidEnabled')}"
             )
