@@ -417,6 +417,32 @@ conf.registerGlobalValue(
         result per IP. Default 6h.""")),
 )
 conf.registerGlobalValue(
+    Shild.dnsbl, "staggerMs",
+    registry.NonNegativeInteger(250, _(
+        """Delay (milliseconds) between LAUNCHING each successive DNSBL
+        zone query (dronebl/spamcop/bogon/torexit) in the same Tier 1
+        check, instead of firing all 4 in one asyncio.gather burst at the
+        same instant. Added 2026-08-21: a corpus scan (11,037 events since
+        the 2026-08-16 dnsbl.timeout fix) found all 4 zones still failing
+        TOGETHER in 10.6% of events, median lookup_ms ~3.0s -- higher than
+        dnsbl.timeout itself, meaning the timeout bound the worst case but
+        never fixed the correlated failures. A live concurrent test the
+        same day reproduced 3 zones landing at the exact same millisecond,
+        while the SAME zones queried one at a time answered independently
+        (some fast, some slow) -- pointing at local resolver-side queueing
+        of simultaneous queries from this box (systemd-resolved's stub at
+        127.0.0.53) rather than the remote zones themselves being down.
+        Staggering each zone's actual query start spreads them across
+        separate resolver transactions instead of one burst. Costs up to
+        3x this value in added worst-case Tier 1 latency if every zone
+        still times out (~750ms at the default) -- bounded and small next
+        to the multi-second cost of a correlated failure. Set to 0 to
+        restore the old fire-all-at-once behavior. Read fresh into
+        ReputationConfig at plugin __init__, same as dnsbl.timeout -- a
+        live @config change needs @reload Shild, not just a registry
+        set.""")),
+)
+conf.registerGlobalValue(
     Shild.dnsbl, "ircblEnabled",
     registry.Boolean(False, _(
         """Whether rbl.ircbl.org is included in the automatic, LIVE

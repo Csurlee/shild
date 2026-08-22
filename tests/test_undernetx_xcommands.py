@@ -18,7 +18,10 @@ from plugins.UndernetX.xcommands import (
 
 
 def test_build_ban_default_duration_and_access():
-    assert build_ban("#windrop", "*!*@1.2.3.4") == "BAN #windrop *!*@1.2.3.4 0d 0"
+    # access default is 75 (2026-08-17) -- the lowest X "banlevel" that
+    # actually removes the target from the channel; 0 (the old default)
+    # is flatly rejected by X, confirmed live.
+    assert build_ban("#windrop", "*!*@1.2.3.4") == "BAN #windrop *!*@1.2.3.4 0d 75"
 
 
 def test_build_ban_with_duration_access_and_reason():

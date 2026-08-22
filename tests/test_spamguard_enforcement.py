@@ -45,16 +45,28 @@ def test_is_opped_false_when_channel_unknown():
     assert enforcement.is_opped(irc, "#nope") is False
 
 
-def test_ban_mask_is_host_based_for_content_matches():
+def test_ban_mask_is_host_based_for_content_matches_unverified_ident():
+    # 2026-08-22: an unverified ident (leading '~' -- no real identd,
+    # the common spam-bot case) narrows the host fallback so it can only
+    # ever match another unverified-ident connection from that host.
     assert enforcement.ban_mask("content", "primaryocelo", "~ocelo", "192.0.2.1") \
+        == "*!~*@192.0.2.1"
+
+
+def test_ban_mask_is_host_based_for_content_matches_verified_ident():
+    # A real ident server response (no '~') means a person actually
+    # spammed right now with a real ident -- ban them normally, full
+    # host wildcard, same as before this feature existed.
+    assert enforcement.ban_mask("content", "primaryocelo", "ocelo", "192.0.2.1") \
         == "*!*@192.0.2.1"
 
 
 def test_ban_mask_is_host_based_for_realname_matches():
     # realname isn't part of an IRC ban mask at all -- no mask field to
-    # target, so this falls back to host, same as content.
+    # target, so this falls back to host, same as content -- and is
+    # still ident-aware just like the content case above.
     assert enforcement.ban_mask("realname", "newuser", "~x", "192.0.2.1") \
-        == "*!*@192.0.2.1"
+        == "*!~*@192.0.2.1"
 
 
 def test_ban_mask_is_ident_based_for_ident_matches():
@@ -75,7 +87,17 @@ def test_ban_mask_is_nick_based_for_nick_matches():
 
 
 def test_ban_mask_nick_field_falls_back_to_host_if_nick_somehow_empty():
-    assert enforcement.ban_mask("nick", "", "~x", "192.0.2.1") == "*!*@192.0.2.1"
+    # Falls through to the host fallback branch, which is ident-aware --
+    # "~x" is unverified, so the narrowed mask applies here too.
+    assert enforcement.ban_mask("nick", "", "~x", "192.0.2.1") == "*!~*@192.0.2.1"
+
+
+def test_ban_mask_host_fallback_treats_missing_ident_as_verified():
+    # An empty/missing ident isn't the same signal as an unverified '~'
+    # ident -- ambiguous, so fail toward the pre-existing, safer default
+    # (full host ban) rather than guessing it's a bot.
+    assert enforcement.ban_mask("content", "somenick", "", "192.0.2.1") \
+        == "*!*@192.0.2.1"
 
 
 def test_enforce_ban_queues_ban_then_kick_in_order():

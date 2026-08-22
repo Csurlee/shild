@@ -183,6 +183,7 @@ def load_secrets(path: str) -> dict:
 @dataclass
 class ReputationConfig:
     dns_timeout: float = 5.0
+    dns_stagger_secs: float = 0.0
     http_timeout: float = 8.0
     dnsbl_ttl: float = 6 * 3600.0
     geo_ttl: float = 24 * 3600.0
@@ -241,6 +242,21 @@ class TTLCache:
 
 def _reverse_ipv4(ip: str) -> str:
     return ".".join(reversed(ip.split(".")))
+
+
+async def _staggered(delay: float, coro):
+    """Delay LAUNCHING coro by delay seconds, without delaying its own
+    timeout clock any further than that -- the coroutine object passed in
+    hasn't started executing yet (Python doesn't run coroutine bodies
+    until awaited/scheduled), so `_check_dronebl`'s own asyncio.wait_for
+    timeout only starts counting once this delay elapses and `coro` is
+    actually awaited. See dnsbl.staggerMs's config docstring for why this
+    exists: spreads a burst of simultaneous DNSBL queries across separate
+    resolver transactions instead of firing them all in the same instant.
+    """
+    if delay:
+        await asyncio.sleep(delay)
+    return await coro
 
 
 async def _dnsbl_query(loop, query: str, timeout: float) -> tuple[bool, Optional[str]]:
@@ -514,12 +530,13 @@ class ReputationGatherer:
             is_bogon, dronebl_type, spamcop_hit, is_tor = cached
             ev.checks_run.extend(["dronebl", "spamcop", "bogon", "torexit"])
         else:
+            stagger = self.config.dns_stagger_secs
             (dronebl_type, dronebl_failed), (spamcop_hit, spamcop_failed), \
                 (is_bogon, bogon_failed), (tor_hit, tor_failed) = await asyncio.gather(
-                _check_dronebl(loop, ip, self.config.dns_timeout),
-                _check_spamcop(loop, ip, self.config.dns_timeout),
-                _check_bogon(loop, ip, self.config.dns_timeout),
-                _check_torexit(loop, ip, self.config.dns_timeout),
+                _staggered(0.0, _check_dronebl(loop, ip, self.config.dns_timeout)),
+                _staggered(stagger, _check_spamcop(loop, ip, self.config.dns_timeout)),
+                _staggered(stagger * 2, _check_bogon(loop, ip, self.config.dns_timeout)),
+                _staggered(stagger * 3, _check_torexit(loop, ip, self.config.dns_timeout)),
             )
             is_tor = tor_hit or ev.is_tor_exit
             for name, failed in (

@@ -11,14 +11,15 @@ string this bot sends can be pinned down in a test without a live
 network connection.
 
 Command syntax is taken from https://www.undernet.org/docs/x-commands-english
-(2026-08-14) -- BAN's "access" argument in particular is thinly
-documented there (it's the minimum access level EXEMPT from the ban, per
-X's own convention for this kind of parameter, but this was not
-confirmed against a live `/msg X help ban`). Treated as an explicit,
-overridable parameter with a conservative default (0 -- exempts no one)
-rather than silently guessing a value into the vendored login-only
-codepath. Verify against the real network before trusting this for
-anything but a manual, supervised command.
+(2026-08-14). BAN's fourth argument was originally guessed from that
+page as "the minimum access level EXEMPT from the ban" -- CONFIRMED
+WRONG live 2026-08-17 via `/msg X help ban`. It's actually a ban
+*severity* level ("banlevel"), 1 to the caller's own X access level:
+1-74 only blocks +o; 75-500 removes the target from the channel
+entirely (X auto-kicks anyone present who matches a 75+ ban). See
+config.py's commands.defaultBanAccess docstring for the full incident
+this correction is based on (a real X-routed ban silently failing
+outright with the old default of 0, which X flatly rejects).
 """
 from __future__ import annotations
 
@@ -37,11 +38,14 @@ def _split_targets(text: str) -> list:
 
 
 def build_ban(channel: str, target: str, duration: str = "0d",
-              access: int = 0, reason: str = "") -> str:
-    """BAN <#channel> <nick!ident@host> <duration> <access> [reason]
+              access: int = 75, reason: str = "") -> str:
+    """BAN <#channel> <nick!ident@host> <duration> <banlevel> [reason]
     duration: "0d" is permanent; X accepts values from "5m" to "365d".
-    access: minimum access level exempt from this ban (0 -- everyone is
-    subject to it). See module docstring's caveat on this parameter.
+    access (really a ban SEVERITY level, 1 to the caller's own X access
+    level): 1-74 only blocks +o; 75-500 removes the target from the
+    channel entirely, auto-kicking anyone present who matches. 0 (the
+    old default here) is flatly rejected by X -- confirmed live
+    2026-08-17, see module docstring.
     """
     parts = ["BAN", channel, target, duration, str(access)]
     if reason:

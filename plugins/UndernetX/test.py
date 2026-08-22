@@ -208,11 +208,11 @@ class UndernetXTestCase(ChannelPluginTestCase):
     def test_xban_sends_correct_command_to_x(self):
         sent = self.getMsg("xban #test *!*@1.2.3.4 7d spamming here")
         self.assertEqual(sent.command, "PRIVMSG")
-        self.assertEqual(sent.args[1], "BAN #test *!*@1.2.3.4 7d 0 spamming here")
+        self.assertEqual(sent.args[1], "BAN #test *!*@1.2.3.4 7d 75 spamming here")
 
     def test_xban_defaults_duration_when_omitted(self):
         sent = self.getMsg("xban #test *!*@1.2.3.4")
-        self.assertEqual(sent.args[1], "BAN #test *!*@1.2.3.4 0d 0")
+        self.assertEqual(sent.args[1], "BAN #test *!*@1.2.3.4 0d 75")
 
     def test_xban_replies_sent_immediately(self):
         self.getMsg("xban #test *!*@1.2.3.4")  # the BAN command itself
@@ -585,7 +585,7 @@ class UndernetXTestCase(ChannelPluginTestCase):
         self.assertTrue(result)
         ban = self.irc.takeMsg()
         kick = self.irc.takeMsg()
-        self.assertEqual(ban.args[1], f"BAN {self.channel} *!*@1.2.3.4 60m 0 spamming")
+        self.assertEqual(ban.args[1], f"BAN {self.channel} *!*@1.2.3.4 60m 75 spamming")
         self.assertEqual(kick.args[1], f"KICK {self.channel} spammer spamming")
 
     def test_enforce_ban_via_x_with_no_cache_entry_queues_no_ban_or_kick(self):

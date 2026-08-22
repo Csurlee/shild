@@ -113,6 +113,61 @@ conf.registerGlobalValue(
 )
 
 conf.registerGlobalValue(
+    SpamGuard, "hostBansPath",
+    registry.String("data/spamguard_host_bans.json", _(
+        """Path to the persisted host/IP ban history (hostbans.py) --
+        auto-populated every time a real, HOST-based enforcement fires
+        (never an ident- or nick-field match, which already target
+        something narrower and more durable than a host). Resolved
+        relative to the bot's own working directory (runtime/), same
+        convention as termsPath -- do NOT prefix with "runtime/" (see
+        Shild's budgetPath/secretsPath docstrings for the double-
+        "runtime/" bug this exact mistake caused elsewhere). Recording
+        into this file always happens regardless of
+        hostBanAutoRebanEnabled below -- only the real auto-reban ACTION
+        is gated by that switch.""")),
+)
+conf.registerGlobalValue(
+    SpamGuard, "hostBanAutoRebanEnabled",
+    registry.Boolean(False, _(
+        """Master arm switch (2026-08-22) for automatically re-banning a
+        host that's already in the persisted host-ban history
+        (hostBansPath) the moment it rejoins under ANY nick/ident/
+        realname, using the exact original kick message -- rather than
+        needing a fresh term match every time. Default False, off until
+        deliberately armed: recording into the store is always on and
+        harmless (watch it fill in via `spamguardhostbans` first), but
+        real auto-reban is a new, automatic enforcement path and gets
+        the same staged-rollout treatment as everything else in this
+        plugin that changes real enforcement behavior. Only ever fires
+        for a rejoining identity whose ident is ALSO unverified (leading
+        `~`) -- see enforcement.py's ban_mask() docstring; a rejoin with
+        a real ident server is left alone entirely, by design.""")),
+)
+conf.registerGlobalValue(
+    SpamGuard, "hostBanRetentionDays",
+    registry.PositiveInteger(30, _(
+        """How many days of inactivity before a persisted host-ban
+        record stops being eligible to trigger an auto-reban. Refreshed
+        on every hit (a fresh match OR a reban both count), so a repeat
+        offender stays flagged indefinitely -- this only ages out a host
+        that hasn't been seen in a long time, protecting against a
+        dynamic/residential IP later being reassigned by its ISP to a
+        completely unrelated, innocent person. An expired record is
+        still visible in `spamguardhostbans` output (kept until the next
+        prune sweep, see hostBanPruneIntervalSecs) but will not fire.""")),
+)
+conf.registerGlobalValue(
+    SpamGuard, "hostBanPruneIntervalSecs",
+    registry.PositiveInteger(3600, _(
+        """How often (seconds) a background sweep actually deletes
+        host-ban records past hostBanRetentionDays from the persisted
+        file, so it doesn't grow unbounded with ancient, already-inert
+        entries. Purely storage hygiene -- get()'s own expiry check
+        already refuses to act on an expired record between sweeps.""")),
+)
+
+conf.registerGlobalValue(
     SpamGuard, "joinWindowSecs",
     registry.PositiveInteger(60, _(
         """Only messages sent within this many seconds of a tracked join

@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 from plugins.Shild import reputation
 from plugins.Shild.budget import BudgetManager, ProviderLimits
@@ -147,6 +148,92 @@ def test_dronebl_hit_populates_evidence(tmp_path, monkeypatch):
     assert ev.verdict() == "corroborates"
     assert "dronebl" in ev.checks_run
     assert ev.isp == "Some ISP"
+
+
+def test_dnsbl_zone_queries_staggered_when_configured(tmp_path, monkeypatch):
+    """2026-08-21: a corpus scan found all 4 DNSBL zones failing TOGETHER
+    in 10.6% of real events even after dnsbl.timeout was already lowered
+    to bound the worst case -- pointing at local resolver-side batching of
+    simultaneous queries, not the remote zones being down. dns_stagger_secs
+    spreads each zone's actual query launch apart; this pins that the
+    launch order/spacing is dronebl (immediate), then spamcop/bogon/torexit
+    each one stagger interval later -- not just that gather() still returns
+    the right tuple shape (already covered by every other test above).
+    """
+    launch_times = {}
+
+    async def resolve_ip(loop, host, timeout):
+        return "203.0.113.9"
+
+    def _recorder(name):
+        async def check(loop, ip, timeout):
+            launch_times[name] = time.monotonic()
+            return False, False
+        return check
+
+    async def ipapi_clean(session, ip, timeout):
+        return {"status": "success", "proxy": False, "hosting": False,
+                "as": "AS1234", "isp": "Some ISP", "countryCode": "US"}, False
+
+    monkeypatch.setattr(reputation, "_resolve_ip", resolve_ip)
+    monkeypatch.setattr(reputation, "_check_dronebl", _recorder("dronebl"))
+    monkeypatch.setattr(reputation, "_check_spamcop", _recorder("spamcop"))
+    monkeypatch.setattr(reputation, "_check_bogon", _recorder("bogon"))
+    monkeypatch.setattr(reputation, "_check_torexit", _recorder("torexit"))
+    monkeypatch.setattr(reputation, "_check_ipapi", ipapi_clean)
+
+    stagger = 0.05
+    g = _gatherer(tmp_path, dns_stagger_secs=stagger)
+
+    async def run():
+        return await g.gather(session=None, host="203.0.113.9", account=None, allow_tier2=False)
+
+    t0 = time.monotonic()
+    asyncio.run(run())
+
+    # dronebl launches immediately (no stagger ahead of it); the rest are
+    # spaced roughly `stagger` seconds apart, in declaration order.
+    assert launch_times["dronebl"] - t0 < stagger / 2
+    assert launch_times["spamcop"] - launch_times["dronebl"] >= stagger * 0.8
+    assert launch_times["bogon"] - launch_times["spamcop"] >= stagger * 0.8
+    assert launch_times["torexit"] - launch_times["bogon"] >= stagger * 0.8
+
+
+def test_dnsbl_zone_queries_not_staggered_by_default(tmp_path, monkeypatch):
+    """dns_stagger_secs defaults to 0.0 -- every pre-existing test above
+    (and the live behavior before this feature existed) relies on all 4
+    zones launching essentially simultaneously when unconfigured."""
+    launch_times = {}
+
+    async def resolve_ip(loop, host, timeout):
+        return "203.0.113.9"
+
+    def _recorder(name):
+        async def check(loop, ip, timeout):
+            launch_times[name] = time.monotonic()
+            return False, False
+        return check
+
+    async def ipapi_clean(session, ip, timeout):
+        return {"status": "success", "proxy": False, "hosting": False,
+                "as": "AS1234", "isp": "Some ISP", "countryCode": "US"}, False
+
+    monkeypatch.setattr(reputation, "_resolve_ip", resolve_ip)
+    monkeypatch.setattr(reputation, "_check_dronebl", _recorder("dronebl"))
+    monkeypatch.setattr(reputation, "_check_spamcop", _recorder("spamcop"))
+    monkeypatch.setattr(reputation, "_check_bogon", _recorder("bogon"))
+    monkeypatch.setattr(reputation, "_check_torexit", _recorder("torexit"))
+    monkeypatch.setattr(reputation, "_check_ipapi", ipapi_clean)
+
+    g = _gatherer(tmp_path)
+
+    async def run():
+        return await g.gather(session=None, host="203.0.113.9", account=None, allow_tier2=False)
+
+    asyncio.run(run())
+
+    spread = max(launch_times.values()) - min(launch_times.values())
+    assert spread < 0.02
 
 
 def test_geoip_local_country_used_when_available(tmp_path, monkeypatch):

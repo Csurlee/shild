@@ -73,9 +73,14 @@ yourself so the change survives a `scripts/bootstrap_runtime.py` regen.
 Bans via X's own `BAN` command instead of a raw IRC `MODE +b` — works even without the bot
 holding real channel op, as long as it's identified to X with enough access on `<channel>`.
 `[duration]` defaults to `commands.defaultBanDuration` (`0d`, permanent) when omitted; X accepts
-`5m` through `365d`. The ban's access-level exemption comes from `commands.defaultBanAccess`, not
-a command argument — X's own documentation of this parameter is thin (see `xcommands.py`'s module
-docstring); verify against a live `/msg X help ban` before relying on a non-default value.
+`5m` through `365d`. The ban's severity level (X calls it "banlevel") comes from
+`commands.defaultBanAccess`, not a command argument — **confirmed live 2026-08-17 via
+`/msg X help ban`**: it ranges 1 to the caller's own X access level; 1–74 only blocks `+o`, 75–500
+removes the target from the channel entirely (X auto-kicks anyone present who matches). The old
+default of `0` is flatly rejected by X — a real incident found every X-routed ban silently failing
+outright (only the separate `KICK` was ever removing anyone) until this was caught and the default
+raised to `75` (X's own stated default when the level argument is omitted, and the lowest level
+that actually works).
 
 ### `xunban <channel> <host/nick>`, `xkick <channel> <nick> [reason]`
 
@@ -175,9 +180,9 @@ set `enforcement.xFallbackEnabled=True` anywhere live before running this verifi
 1. On a channel the bot is genuinely X-registered/opped on, run `xaccess <#channel> =<botnick>` and
    capture the raw reply. Confirm a line contains the bot's own `auth.username` next to a plain
    integer — if not, `xprobe.py`'s `_ACCESS_LEVEL_RE`/`classify_access_line` need adjusting.
-2. Note the real access level shown; lower `enforcement.minAccessLevel` to match reality if needed
-   (cross-check with `/msg X help ban`/`help kick` while at it — this also finally resolves the
-   long-standing unverified `commands.defaultBanAccess` caveat above).
+2. Note the real access level shown; lower `enforcement.minAccessLevel` to match reality if needed.
+   `commands.defaultBanAccess`'s own caveat is now resolved — confirmed live 2026-08-17 via
+   `/msg X help ban`, see that value's own docstring.
 3. On a channel with no X presence, run the same query and confirm the reply lands `unusable`
    (either via a matched marker or the fail-closed default) — add the real string to
    `NEGATIVE_MARKERS` either way so future logs show *why*.
@@ -207,7 +212,7 @@ set `enforcement.xFallbackEnabled=True` anywhere live before running this verifi
 | `plugins.UndernetX.auth.noJoinsUntilAuthed` | global | Boolean | `True` | Hold JOINs until identified. **Set `False` in this deployment** (see CLAUDE.md) — blank credentials would otherwise block every Undernet join forever. |
 | `plugins.UndernetX.commands.replyTimeoutSecs` | global | Positive integer | `10` | How long an `x*` command waits for X's NOTICE reply before reporting "no reply". |
 | `plugins.UndernetX.commands.defaultBanDuration` | global | String | `0d` | Default `xban` duration when omitted. |
-| `plugins.UndernetX.commands.defaultBanAccess` | global | Non-negative integer | `0` | Default `xban` access-level exemption when omitted — see `xban`'s own docs above. |
+| `plugins.UndernetX.commands.defaultBanAccess` | global | Non-negative integer | `75` | Default `xban`/X-fallback ban severity level ("banlevel") when omitted — see `xban`'s own docs above. Confirmed live 2026-08-17; the old default of `0` was flatly rejected by X. |
 | `plugins.UndernetX.enforcement.preferXCommands` | **channel** | Boolean | `False` | Per-channel opt-in for the X-routed enforcement fallback. Not op-settable. As of 2026-08-16 this has a real consumer (`x_enforcement_available()`) — see "X-routed enforcement fallback" above for the full gating and the required verification before setting this True live. |
 | `plugins.UndernetX.enforcement.xFallbackEnabled` | global | Boolean | `False` | Master arm switch for the whole feature — separate from the per-channel opt-in specifically because the risk (an unverified reply-text classifier) is code-shaped, not per-channel; one flip backs the whole thing out. |
 | `plugins.UndernetX.enforcement.minAccessLevel` | global | Non-negative integer | `100` | Minimum X access level the probe must see for the bot's own username before a channel counts as usable. UNVERIFIED against a live reply — see the verification steps above. |

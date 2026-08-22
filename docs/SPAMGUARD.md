@@ -212,6 +212,10 @@ mojibake/raid enable state.
 |---|---|---|---|---|
 | `plugins.SpamGuard.enabled` | channel | Boolean | `False` | Whether SpamGuard watches this channel at all. Not op-settable. |
 | `plugins.SpamGuard.termsPath` | global | String | `data/spamguard_terms.json` | The persisted, id-keyed term store — the actual source of truth for matching. |
+| `plugins.SpamGuard.hostBansPath` | global | String | `data/spamguard_host_bans.json` | The persisted host-ban history store (see below). |
+| `plugins.SpamGuard.hostBanAutoRebanEnabled` | global | Boolean | `False` | Arm switch for real auto-reban on a rejoin from a known-bad host. Recording into the store always happens regardless. |
+| `plugins.SpamGuard.hostBanRetentionDays` | global | Positive integer | `30` | Days of inactivity before a host-ban record stops being eligible to trigger a reban. Refreshed on every hit. |
+| `plugins.SpamGuard.hostBanPruneIntervalSecs` | global | Positive integer | `3600` | How often expired host-ban records are actually deleted from the file. |
 | `plugins.SpamGuard.joinWindowSecs` | global | Positive integer | `60` | How long after a tracked join a **content** match is still eligible to enforce. Ident/realname matches ignore this. |
 | `plugins.SpamGuard.exemptRegistered` | global | Boolean | `True` | Whether any ircdb-registered user is exempt from enforcement, on top of the always-exempt halfop+/channel-op cases. |
 | `plugins.SpamGuard.logPath` | global | String | `data/spamguard_actions.jsonl` | JSONL log of every match seen, acted on or not. |
@@ -257,12 +261,65 @@ blocking enforcement.
   sense: nicks are the most freely reusable identity of the three — without NickServ registration
   and enforcement, literally anyone can pick up a banned nick next. Still useful for a known-bad
   literal nick (a bot's fixed default), just don't expect it to survive a determined nick change.
-- `content` and `realname` matches still ban by host (`*!*@<host>`): content has no identity
-  component of its own, and realname isn't part of an IRC ban mask at all (masks are strictly
+- `content`, `realname`, `black`, and every heuristic (flood/hilight/caps/mojibake/raid/
+  `host_history`) fall back to a host-based mask: content/black-by-nick/heuristics have no identity
+  component of their own, and realname isn't part of an IRC ban mask at all (masks are strictly
   `nick!ident@host`).
+
+**The host-based fallback is itself ident-aware (2026-08-22)**: an ident beginning with `~` means
+the ircd could not verify it against a real identd response — the overwhelming majority of spam
+bots connect this way. In that case the mask is narrowed to `*!~*@<host>`, which can ONLY ever
+match another unverified-ident connection from that host — a later, unrelated person connecting
+from the same IP/host with a real ident server running is never caught by it. A verified ident (no
+`~`) is treated as real evidence this is a person, not a bot: banned normally with the full
+`*!*@<host>` mask, exactly as before this feature existed.
 
 Since the mask can differ from the hostmask shown in the kick reason, check `/mode <channel> +b`
 live for the real active mask.
+
+## Persisted host-ban history: auto-reban a known-bad host (2026-08-22)
+
+A real, host-based enforcement (content/realname/pattern/black/any heuristic — never an ident- or
+nick-field match) is automatically recorded to a small JSON store (`plugins.SpamGuard.hostBansPath`,
+`hostbans.py`) the moment it fires, keyed by host/IP: the exact kick message, the term/field that
+triggered it, first/last-seen timestamps, and a hit count. This survives both the temporary ban's
+own auto-unban (`protection.banDurationSecs`, default 1h) and a bot restart — the whole point is
+remembering a convicted host well after either of those.
+
+**Recording always happens** and is harmless on its own (see `spamguardhostbans` below). **Real
+auto-reban action is a separate, explicit arm switch**: `plugins.SpamGuard.hostBanAutoRebanEnabled`
+(default `False`, global). Once armed, every JOIN checks the store FIRST — ahead of even `black` —
+and if the host has a live (non-expired) record, **and the rejoining identity is ALSO running
+unverified ident** (leading `~`), it's immediately re-kicked+banned using the exact original kick
+message, no fresh term match needed. A rejoin from that same host with a *real* ident server is left
+completely alone — same "not evidence this is the same actor" reasoning as the mask change above,
+and it's a plain fall-through to the normal black/nick/ident/realname/heuristic chain, not a special
+exemption.
+
+A record ages out after `hostBanRetentionDays` (default 30) of inactivity — refreshed on every hit,
+so a repeat offender stays flagged indefinitely, but a host that hasn't been seen in a long time
+stops being eligible to auto-reban, protecting against a dynamic/residential IP later being
+reassigned by its ISP to someone completely unrelated. A background sweep
+(`hostBanPruneIntervalSecs`, default 1h) actually deletes expired records from the file; an expired
+but not-yet-swept record still shows in `spamguardhostbans` output, just marked `expired`.
+
+### `spamguardhostbans`
+
+```
+takes no arguments
+```
+
+Lists every persisted record: host, the field/term it was originally convicted on, hit count, how
+long ago it was last seen, and whether it's currently `active` (would fire) or `expired`.
+
+### `spamguardhostbansremove <host>`
+
+```
+<host or IP>
+```
+
+Manual override for a false positive — removes one record outright. Find the exact host string via
+`spamguardhostbans` first.
 
 ### Legacy — migration-only, do not use
 
@@ -284,12 +341,13 @@ plugin startup, and **only if the term store is still completely empty** — a b
 
 Every command (`spamguard add/remove`, `spamguardremove`) rebuilds the compiled matchers
 immediately — no reload needed. `protection.killSwitch`, `enabled`, `joinWindowSecs`,
-`exemptRegistered`, and `relayChannel` are all read live, per event. Nothing in this plugin
-requires a full bot restart.
+`exemptRegistered`, `relayChannel`, `hostBanAutoRebanEnabled`, and `hostBanRetentionDays` are all
+read live, per event. Nothing in this plugin requires a full bot restart.
 
 ## Files it reads/writes
 
 | File | Purpose |
 |---|---|
 | `data/spamguard_terms.json` | The id-keyed term store — source of truth for matching. |
+| `data/spamguard_host_bans.json` | Persisted host-ban history — auto-reban source of truth. |
 | `data/spamguard_actions.jsonl` | Every match seen, acted on or not, with its outcome tag. |

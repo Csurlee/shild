@@ -46,6 +46,13 @@ class SpamGuardTestCase(ChannelPluginTestCase):
         for name in ("floodEnabled", "hilightEnabled", "capsEnabled", "mojibakeEnabled",
                      "raidEnabled"):
             getattr(conf.supybot.plugins.SpamGuard, name).get(self.channel).setValue(False)
+        # hostBanAutoRebanEnabled (2026-08-22) is global, not channel-
+        # scoped -- same cross-test state-leak risk as everything else
+        # in this list. Off by default; each host-ban test flips it
+        # explicitly.
+        conf.supybot.plugins.SpamGuard.hostBanAutoRebanEnabled.setValue(False)
+        self._host_bans_path = str(Path(self._tmpdir) / "spamguard_host_bans.json")
+        conf.supybot.plugins.SpamGuard.hostBansPath.setValue(self._host_bans_path)
         # Protection defaults to safe (killSwitch=True) -- each
         # enforcement test below flips it explicitly, same convention as
         # Shild's own test.py, so the test itself documents the state it
@@ -149,7 +156,11 @@ class SpamGuardTestCase(ChannelPluginTestCase):
         self.assertEqual(len(kicks), 1, "expected a real KICK")
         self.assertEqual(len(bans), 1, "expected a real MODE +b")
         self.assertEqual(kicks[0].args[1], "primaryocelo")
-        self.assertEqual(bans[0].args[2], f"*!*@{self._DEFAULT_HOST}")
+        # Default test ident "~ocelo" is unverified, so the host fallback
+        # is narrowed to *!~*@host, not the old unconditional *!*@host
+        # (2026-08-22) -- see test_content_match_with_verified_ident_gets_full_host_mask
+        # below for the verified-ident case.
+        self.assertEqual(bans[0].args[2], f"*!~*@{self._DEFAULT_HOST}")
 
         records = self._log_records()
         self.assertEqual(records[-1]["outcome"], "enforced")
@@ -296,6 +307,180 @@ class SpamGuardTestCase(ChannelPluginTestCase):
         self.irc.feedMsg(self._spam_msg())
         self.assertEqual(self._log_records(), [])
 
+    def test_content_match_with_verified_ident_gets_full_host_mask(self):
+        """2026-08-22: a REAL ident server response (no leading '~') means
+        a person actually spammed right now with a real ident -- ban them
+        normally, full host wildcard, same as before the ident-aware mask
+        feature existed."""
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        self._join("primaryocelo", "ocelo", self._DEFAULT_HOST)  # no leading '~'
+        self.irc.feedMsg(self._spam_msg(ident="ocelo"))
+
+        bans = [m for m in self._queued() if m.command == "MODE" and m.args[1] == "+b"]
+        self.assertEqual(bans[0].args[2], f"*!*@{self._DEFAULT_HOST}")
+
+    # ---- persisted host-ban history (2026-08-22) ----
+
+    def test_host_based_enforcement_records_a_host_ban(self):
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        self._join()
+        self.irc.feedMsg(self._spam_msg())
+
+        records = self._plugin._host_bans.all()
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record.host, self._DEFAULT_HOST)
+        self.assertEqual(record.field, "content")
+        self.assertEqual(record.term_text.lower(), "czura")
+        self.assertIn('"Czura"', record.kick_reason)
+        self.assertEqual(record.hit_count, 1)
+
+    def test_ident_field_match_never_records_a_host_ban(self):
+        """Scope check: only host-fallback-masked enforcement records --
+        ident/nick matches already target something narrower and more
+        durable than a host."""
+        self._plugin._terms.add("ident", "badident")
+        self._plugin._rebuild_matchers()
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        self._join("spammer", "badident", self._DEFAULT_HOST)
+
+        self.assertEqual(len(self._plugin._host_bans), 0)
+
+    def test_rejoin_with_unverified_ident_auto_rebans_with_original_message(self):
+        """The core feature: a rejoin from a previously-convicted host,
+        under an entirely different nick, with unverified ident, is
+        auto-rebanned using the EXACT original kick message -- no fresh
+        term match involved at all."""
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        conf.supybot.plugins.SpamGuard.hostBanAutoRebanEnabled.setValue(True)
+        self._grant_op(self.channel)
+        self._join()
+        self.irc.feedMsg(self._spam_msg())
+        original_reason = [m for m in self._queued() if m.command == "KICK"][0].args[2]
+
+        # A totally different identity, same host, still unverified ident.
+        self._join("brandnewnick", "~different", self._DEFAULT_HOST)
+
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        bans = [m for m in self._queued() if m.command == "MODE" and m.args[1] == "+b"]
+        self.assertEqual(len(kicks), 2, "the rejoin must trigger a second real kick")
+        self.assertEqual(kicks[1].args[1], "brandnewnick")
+        self.assertEqual(kicks[1].args[2], original_reason, "must reuse the FIRST kick message verbatim")
+        self.assertEqual(bans[1].args[2], f"*!~*@{self._DEFAULT_HOST}")
+        self.assertEqual(self._log_records()[-1]["field"], "host_history")
+
+    def test_rejoin_with_verified_ident_is_not_auto_rebanned(self):
+        """A rejoin from a known-bad host with a REAL ident server is left
+        alone entirely -- no evidence they're the same actor."""
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        conf.supybot.plugins.SpamGuard.hostBanAutoRebanEnabled.setValue(True)
+        self._grant_op(self.channel)
+        self._join()
+        self.irc.feedMsg(self._spam_msg())
+
+        self._join("legituser", "realident", self._DEFAULT_HOST)  # no leading '~'
+
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        self.assertEqual(len(kicks), 1, "only the original offender was kicked, not the rejoin")
+
+    def test_auto_reban_toggle_off_by_default_does_not_reban(self):
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        # hostBanAutoRebanEnabled deliberately left at its default (False).
+        self._grant_op(self.channel)
+        self._join()
+        self.irc.feedMsg(self._spam_msg())
+
+        self._join("brandnewnick", "~different", self._DEFAULT_HOST)
+
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        self.assertEqual(len(kicks), 1, "recording happens, but no auto-reban without the toggle")
+
+    def test_reban_does_not_overwrite_stored_kick_reason(self):
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        conf.supybot.plugins.SpamGuard.hostBanAutoRebanEnabled.setValue(True)
+        self._grant_op(self.channel)
+        self._join()
+        self.irc.feedMsg(self._spam_msg())
+
+        self._join("second", "~x", self._DEFAULT_HOST)
+        self._join("third", "~y", self._DEFAULT_HOST)
+
+        records = self._plugin._host_bans.all()
+        self.assertEqual(len(records), 1)
+        self.assertIn('"Czura"', records[0].kick_reason)
+        self.assertEqual(records[0].hit_count, 3)
+
+    def test_reban_still_respects_killswitch(self):
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        conf.supybot.plugins.SpamGuard.hostBanAutoRebanEnabled.setValue(True)
+        self._grant_op(self.channel)
+        self._join()
+        self.irc.feedMsg(self._spam_msg())
+
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(True)
+        self._join("brandnewnick", "~different", self._DEFAULT_HOST)
+
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        self.assertEqual(len(kicks), 1, "the reban itself must still honor the kill switch")
+        self.assertEqual(self._log_records()[-1]["outcome"], "killswitch")
+
+    def test_reban_still_respects_exemption(self):
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        conf.supybot.plugins.SpamGuard.hostBanAutoRebanEnabled.setValue(True)
+        self._grant_op(self.channel)
+        self._join()
+        self.irc.feedMsg(self._spam_msg())
+
+        nick, ident, host = "regular", "~different", self._DEFAULT_HOST
+        prefix = f"{nick}!{ident}@{host}"
+        u = ircdb.users.newUser()
+        u.name = "a-regular-on-the-same-host"
+        u.addHostmask(prefix)
+        ircdb.users.setUser(u)
+
+        self._join(nick, ident, host)
+
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        self.assertEqual(len(kicks), 1, "a registered user on the same host is still exempt")
+
+    def test_spamguardhostbans_lists_records(self):
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        self._join()
+        self.irc.feedMsg(self._spam_msg())
+        # Drain the enforcement's own queued KICK/MODE +b first -- getMsg's
+        # internal takeMsg() would otherwise return one of THOSE instead
+        # of the command's actual reply (same gotcha already documented
+        # in CLAUDE.md for a similar mixed enforcement+command test).
+        while self.irc.takeMsg():
+            pass
+
+        reply = self.getMsg("spamguardhostbans").args[1]
+        self.assertIn(self._DEFAULT_HOST, reply)
+        self.assertIn("content", reply)
+
+    def test_spamguardhostbans_requires_owner_capability(self):
+        self._assert_denied_owner_capability("spamguardhostbans")
+
+    def test_spamguardhostbansremove_removes_and_replies(self):
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        self._join()
+        self.irc.feedMsg(self._spam_msg())
+        while self.irc.takeMsg():  # drain the enforcement's own queued KICK/MODE +b
+            pass
+
+        reply = self.getMsg(f"spamguardhostbansremove {self._DEFAULT_HOST}")
+        self.assertIn("removed", reply.args[1].lower())
+        self.assertEqual(len(self._plugin._host_bans), 0)
+
+    def test_spamguardhostbansremove_unknown_host_errors(self):
+        reply = self.getMsg("spamguardhostbansremove 9.9.9.9__not_real__")
+        self.assertIn("no host-ban", reply.args[1].lower())
+
     # ---- full gate chain: ident (checked at JOIN, no join-window concept) ----
 
     def test_bad_ident_enforces_at_join_with_killswitch_off_and_opped(self):
@@ -412,7 +597,8 @@ class SpamGuardTestCase(ChannelPluginTestCase):
         self.assertEqual(len(kicks), 1, "bad realname must enforce immediately at join")
         # realname has no mask field of its own (IRC masks are strictly
         # nick!ident@host) -- falls back to host, unlike an ident match.
-        self.assertEqual(bans[0].args[2], f"*!*@{self._DEFAULT_HOST}")
+        # "~x" is unverified, so the host fallback is narrowed (2026-08-22).
+        self.assertEqual(bans[0].args[2], f"*!~*@{self._DEFAULT_HOST}")
         records = self._log_records()
         self.assertEqual(records[-1]["field"], "realname")
         self.assertEqual(records[-1]["term"].lower(), "spammer")
@@ -1063,6 +1249,17 @@ class SpamGuardXFallbackTestCase(ChannelPluginTestCase):
         conf.supybot.plugins.UndernetX.auth.password.setValue("")
         conf.supybot.plugins.UndernetX.enforcement.preferXCommands.get(
             self.channel).setValue(True)
+        # A network+channel-qualified override, once set by ANY test
+        # anywhere in this process, permanently takes precedence over the
+        # bare-channel value above -- see plugins/UndernetX/test.py's own
+        # setUp for the canonical fix/explanation (2026-08-16). Reset
+        # (not just re-assert) so this class is correct regardless of
+        # what ran before it, without itself becoming a source of the
+        # same leak for whatever runs after it.
+        net_specific = conf.supybot.plugins.UndernetX.enforcement.preferXCommands.get(
+            ":" + self.irc.network).get(self.channel)
+        net_specific.setValue(False)
+        net_specific._wasSet = False
         conf.supybot.plugins.UndernetX.enforcement.xFallbackEnabled.setValue(True)
         conf.supybot.plugins.UndernetX.enforcement.minAccessLevel.setValue(100)
         conf.supybot.plugins.UndernetX.enforcement.probeTtlSecs.setValue(3600)

@@ -7,7 +7,7 @@ module docstring for the motivating example and design.
 import supybot
 from supybot import world
 
-__version__ = "1.9"
+__version__ = "1.10"
 __author__ = supybot.authors.unknown
 __contributors__ = {}
 __url__ = "https://github.com/Csurlee/shild"
@@ -21,6 +21,7 @@ from . import enforcement
 from . import heuristics
 from . import mojibake
 from . import terms
+from . import hostbans
 from . import config
 from . import plugin
 from importlib import reload
@@ -30,6 +31,7 @@ reload(enforcement)
 reload(heuristics)
 reload(mojibake)
 reload(terms)
+reload(hostbans)
 reload(config)
 reload(plugin)
 

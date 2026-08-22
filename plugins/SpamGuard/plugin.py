@@ -92,6 +92,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from typing import Optional
 
 from supybot import callbacks, ircdb, ircmsgs, ircutils, log, schedule, world
 from supybot.commands import wrap
@@ -101,6 +102,7 @@ from shildml.schema import write_jsonl_line
 
 from . import enforcement
 from . import heuristics
+from . import hostbans
 from . import matcher
 from . import mojibake
 from . import terms as termstore
@@ -120,7 +122,8 @@ _CATEGORIES = ("word", "ident", "nick", "realname", "pattern", "black")
 # positive, sequentially-assigned int -- see terms.py) while still
 # satisfying every place that reads term.id/term.text (the kick reason,
 # the JSONL log, spamguardstatus).
-_HEURISTIC_IDS = {"flood": -1, "hilight": -2, "caps": -3, "mojibake": -4, "raid": -5}
+_HEURISTIC_IDS = {"flood": -1, "hilight": -2, "caps": -3, "mojibake": -4, "raid": -5,
+                   "host_history": -6}
 
 
 def _heuristic_term(category: str, text: str) -> termstore.Term:
@@ -163,6 +166,17 @@ class SpamGuard(callbacks.Plugin):
 
         self._terms = termstore.TermStore(self.registryValue("termsPath"))
         self._migrate_legacy_registry_terms()
+
+        # 2026-08-22: persisted host/IP ban history -- see hostbans.py's
+        # own module docstring. Recording is always on; only the real
+        # auto-reban action is gated (hostBanAutoRebanEnabled).
+        self._host_bans = hostbans.HostBanStore(self.registryValue("hostBansPath"))
+        self._host_ban_prune_event_name = f"spamguard-hostban-prune-{id(self)}"
+        schedule.addPeriodicEvent(
+            self._prune_host_bans,
+            self.registryValue("hostBanPruneIntervalSecs"),
+            self._host_ban_prune_event_name,
+        )
 
         self._content_matchers: list[tuple[termstore.Term, object]] = []
         self._matcher_skipped: list[termstore.Term] = []
@@ -211,7 +225,15 @@ class SpamGuard(callbacks.Plugin):
                 schedule.removeEvent(event_name)
             except KeyError:
                 pass
+        try:
+            schedule.removeEvent(self._host_ban_prune_event_name)
+        except KeyError:
+            pass
         self.__parent.die()
+
+    def _prune_host_bans(self) -> None:
+        retention = self.registryValue("hostBanRetentionDays") * 86400
+        self._host_bans.prune_expired(now=time.time(), retention_secs=retention)
 
     # ---- matchers (rebuilt on demand -- see `spamguard <category> add/remove`) ----
 
@@ -339,11 +361,33 @@ class SpamGuard(callbacks.Plugin):
 
         nick, ident, host = msg.nick, msg.user, msg.host
 
-        # "black" is checked FIRST, ahead of nick/ident/realname -- an
-        # explicit admin blacklist entry (2026-08-14) is the most
-        # deliberate signal SpamGuard has, and matches against BOTH the
-        # nick AND the host (whichever hits), unlike every category
-        # below it which only ever checks one specific field.
+        # Persisted host-ban history (2026-08-22) is checked FIRST, ahead
+        # of even "black" -- an exact host we've already convicted via a
+        # real host-based enforcement needs no string matching at all.
+        # Off by default (hostBanAutoRebanEnabled) -- recording into the
+        # store still always happens in _enforce(), so this can be
+        # watched via `spamguardhostbans` before being armed. Only fires
+        # when the REJOINING identity is ALSO running unverified (`~`)
+        # ident -- a real ident server here means "not evidence this is
+        # the same actor," and it's a plain fall-through to the normal
+        # black/nick/ident/realname chain below, not a separate exemption.
+        if host and self.registryValue("hostBanAutoRebanEnabled"):
+            retention = self.registryValue("hostBanRetentionDays") * 86400
+            record = self._host_bans.get(host, now=now, retention_secs=retention)
+            if record is not None and (ident or "").startswith("~"):
+                term = _heuristic_term("host_history", host)
+                self._handle_match(irc, msg, channel, nick, ident, host, term,
+                                    field="host_history", require_join_window=False,
+                                    override_kick_reason=record.kick_reason)
+                return
+
+        # "black" is checked first among the term-matching categories
+        # (after the persisted host-ban history above, which needs no
+        # term matching at all) -- an explicit admin blacklist entry
+        # (2026-08-14) is the most deliberate signal SpamGuard has, and
+        # matches against BOTH the nick AND the host (whichever hits),
+        # unlike every category below it which only ever checks one
+        # specific field.
         black_term = (
             matcher.first_match(self._black_matchers, nick) if nick else None
         ) or (
@@ -511,12 +555,19 @@ class SpamGuard(callbacks.Plugin):
     # ---- shared gate chain (content/ident/nick/realname all funnel through here) ----
 
     def _handle_match(self, irc, msg, channel, nick, ident, host, term, *,
-                       field: str, require_join_window: bool) -> None:
+                       field: str, require_join_window: bool,
+                       override_kick_reason: Optional[str] = None) -> None:
         """Common path once ANY matcher has found a hit: join-window check
         (content matches only -- ident/realname matches ARE the join
         event, nothing to be "outside" of), exemption, kill switch, real
         op -- then enforce. Every branch logs+relays with an outcome tag
         so a tuned-but-not-yet-armed word list is fully observable.
+
+        override_kick_reason (2026-08-22): set only by the persisted
+        host-ban-history reban path in doJoin -- when given, _enforce()
+        reuses this exact string instead of building a fresh one from
+        protection.kickReason, so a rejoin from a known-bad host shows
+        the SAME kick message the original conviction did.
         """
         self._stats["matches"] += 1
         network = irc.network
@@ -583,7 +634,8 @@ class SpamGuard(callbacks.Plugin):
                                   f"-- not opped{suffix}")
                 return
 
-        self._enforce(irc, network, channel, nick, ident, host, term, field, xcb=xcb)
+        self._enforce(irc, network, channel, nick, ident, host, term, field, xcb=xcb,
+                      override_kick_reason=override_kick_reason)
 
     def _x_fallback(self, irc, channel):
         """The live UndernetX plugin instance iff X-routed enforcement
@@ -650,30 +702,37 @@ class SpamGuard(callbacks.Plugin):
     # ---- enforcement ----
 
     def _enforce(self, irc, network, channel, nick, ident, host, term, field: str,
-                 *, xcb=None) -> None:
+                 *, xcb=None, override_kick_reason: Optional[str] = None) -> None:
         duration = self.registryValue("protection.banDurationSecs")
         mask = enforcement.ban_mask(field, nick, ident, host)
-        default_reason = self.registryValue("protection.kickReason")
-        # {term} is substituted if present in the configured reason text
-        # (2026-08-13, per explicit request) -- a malformed value (e.g. an
-        # unrelated stray '{' from a typo) falls back to the raw
-        # configured string rather than ever crashing enforcement over a
-        # bad config value.
-        try:
-            reason_text = default_reason.format(term=term.text)
-        except (KeyError, IndexError, ValueError):
-            reason_text = default_reason
-        # Shows the actual connecting hostmask (nick!ident@host), not the
-        # ban mask -- the mask is a wildcard pattern that can now differ
-        # from this (e.g. an ident match bans *!<ident>@*, not this exact
-        # host) and is always visible live via /mode +b regardless; this
-        # line is about showing ops exactly WHO was kicked. Format agreed
-        # with the user 2026-08-10/2026-08-13, mirroring Armour/idefix's
-        # own "(reason: ...) [id: N]" blacklist-kick style -- term text,
-        # hostmask, reason, and the term's permanent id are all visible
-        # directly in the channel, not just in the JSONL log/relay line.
-        hostmask = f"{nick}!{ident}@{host}"
-        kick_reason = f'SpamGuard: "{term.text}" - {hostmask} - reason: {reason_text} - [id: {term.id}]'
+        if override_kick_reason is not None:
+            # 2026-08-22: the persisted host-ban-history reban path --
+            # reuse the ORIGINAL conviction's kick message verbatim,
+            # rather than building a fresh one below (there's no live
+            # term match to build one from anyway).
+            kick_reason = override_kick_reason
+        else:
+            default_reason = self.registryValue("protection.kickReason")
+            # {term} is substituted if present in the configured reason text
+            # (2026-08-13, per explicit request) -- a malformed value (e.g. an
+            # unrelated stray '{' from a typo) falls back to the raw
+            # configured string rather than ever crashing enforcement over a
+            # bad config value.
+            try:
+                reason_text = default_reason.format(term=term.text)
+            except (KeyError, IndexError, ValueError):
+                reason_text = default_reason
+            # Shows the actual connecting hostmask (nick!ident@host), not the
+            # ban mask -- the mask is a wildcard pattern that can now differ
+            # from this (e.g. an ident match bans *!<ident>@*, not this exact
+            # host) and is always visible live via /mode +b regardless; this
+            # line is about showing ops exactly WHO was kicked. Format agreed
+            # with the user 2026-08-10/2026-08-13, mirroring Armour/idefix's
+            # own "(reason: ...) [id: N]" blacklist-kick style -- term text,
+            # hostmask, reason, and the term's permanent id are all visible
+            # directly in the channel, not just in the JSONL log/relay line.
+            hostmask = f"{nick}!{ident}@{host}"
+            kick_reason = f'SpamGuard: "{term.text}" - {hostmask} - reason: {reason_text} - [id: {term.id}]'
 
         via = "x" if xcb is not None else "native"
         try:
@@ -714,6 +773,21 @@ class SpamGuard(callbacks.Plugin):
         self._pending_unbans[event_name] = None
         schedule.addEvent(_do_unban, unban_at, name=event_name)
 
+        # Persisted host-ban history (2026-08-22): only for a HOST-based
+        # mask (never ident/nick, which already target something
+        # narrower and more durable than a host -- same scope as
+        # ban_mask()'s own fallback branch). A host_history-triggered
+        # reban itself only touches (bumps hit_count/last_seen_at) --
+        # there's nothing new to record, the reused kick_reason IS the
+        # thing being replayed. A fresh match records/refreshes,
+        # pinning kick_reason to whatever the FIRST real match set.
+        if field not in ("ident", "nick"):
+            if field == "host_history":
+                self._host_bans.touch(host, now=time.time())
+            else:
+                self._host_bans.record(host, kick_reason, term.id, term.text, field,
+                                        now=time.time())
+
         self._stats["enforced"] += 1
         self._log(network=network, channel=channel, nick=nick, ident=ident,
                    host=host, term=term, field=field, outcome="enforced", via=via)
@@ -745,7 +819,9 @@ class SpamGuard(callbacks.Plugin):
             + f" | ident: words={counts['ident']} | nick: words={counts['nick']} "
             f"| realname: words={counts['realname_word']} phrases={counts['realname_phrase']} "
             f"| black: entries={counts['black']} "
-            f"| total_terms={len(self._terms.all())}"
+            f"| total_terms={len(self._terms.all())} "
+            f"| host_bans={len(self._host_bans)} "
+            f"(auto-reban {'ON' if self.registryValue('hostBanAutoRebanEnabled') else 'off'})"
         )
         if msg.channel:
             def on(name: str) -> str:
@@ -807,6 +883,44 @@ class SpamGuard(callbacks.Plugin):
         self._rebuild_matchers()
         irc.replySuccess(f"removed [id:{removed.id}] {removed.category}: {removed.text!r}")
     spamguardremove = wrap(spamguardremove, ["owner", "int"])
+
+    def spamguardhostbans(self, irc, msg, args):
+        """takes no arguments
+
+        Lists every persisted host-ban record (2026-08-22) -- host,
+        field/term it was originally convicted on, hit count, and
+        whether it's still within the retention window (i.e. would
+        actually fire a reban right now). See hostBanAutoRebanEnabled
+        for the switch that arms real auto-reban action on these.
+        """
+        retention = self.registryValue("hostBanRetentionDays") * 86400
+        now = time.time()
+        records = self._host_bans.all()
+        if not records:
+            irc.reply("No persisted host-ban records.")
+            return
+        lines = []
+        for r in records[:20]:
+            live = "active" if r.last_seen_at + retention >= now else "expired"
+            age_days = (now - r.last_seen_at) / 86400
+            lines.append(f"{r.host} ({r.field} '{r.term_text}' [id:{r.term_id}], "
+                          f"hits={r.hit_count}, last seen {age_days:.1f}d ago, {live})")
+        suffix = "" if len(records) <= 20 else f" (+{len(records) - 20} more)"
+        irc.reply(f"{len(records)} host-ban record(s): " + "  ".join(lines) + suffix)
+    spamguardhostbans = wrap(spamguardhostbans, ["owner"])
+
+    def spamguardhostbansremove(self, irc, msg, args, host):
+        """<host or IP>
+
+        Removes a single persisted host-ban record -- manual override
+        for a false positive. See spamguardhostbans to find the exact
+        host string first.
+        """
+        if self._host_bans.remove(host):
+            irc.replySuccess(f"removed host-ban record for {host}")
+        else:
+            irc.error(f"No host-ban record for {host!r}.")
+    spamguardhostbansremove = wrap(spamguardhostbansremove, ["owner", "something"])
 
     def spamguard(self, irc, msg, args, category, action, terms):
         """<word|ident|nick|realname|pattern|black> <add|remove> <term> [...]

@@ -38,8 +38,47 @@ kicks+bans; it never voices, ops, or otherwise moderates beyond that.
 
 ## Commands
 
-All six commands are **owner-only** — they surface real people's nicks, hosts, and reputation
+All seven commands are **owner-only** — they surface real people's nicks, hosts, and reputation
 data, and `shildcheck` spends real third-party API budget per call.
+
+### `shildconfig <#channel>`
+
+```
+<#channel>
+```
+
+**Private-message only** (2026-08-22, extended same day with UndernetX) — a live `MODE +b/kick
+decision` can wait for `shildstatus`; this is for "what's actually configured to run in this
+channel, right now." Reports the real protection posture for one channel in one place: Shild's own
+per-channel toggles (`enabled`, `messageAnalysis`), SpamGuard's (`enabled`, `floodEnabled`,
+`hilightEnabled`, `capsEnabled`, `mojibakeEnabled`, `raidEnabled`), and UndernetX's
+(`enforcement.preferXCommands`), plus the global switches that still determine whether anything
+actually happens there regardless of channel (`protection.killSwitch` for both plugins,
+`Shild.ollama.enabled`, `SpamGuard.hostBanAutoRebanEnabled`, `UndernetX.enforcement.xFallbackEnabled`)
+— one `Plugin.path: enabled/disabled` line each. Read via the plain registry tree, not a Python
+import, so any of the other two plugins can be missing entirely and this still works — it just
+replies `SpamGuard: not loaded` / `UndernetX: not loaded` for that section instead of erroring.
+**"enabled" always means the registry value itself reads `True`** — for `protection.killSwitch`
+specifically, that means the safety switch is *engaged* (no real enforcement can happen), the
+opposite of "armed."
+
+```
+</query> shildconfig #windrop
+<Shild> Shild.enabled: enabled
+<Shild> Shild.messageAnalysis: disabled
+<Shild> Shild.protection.killSwitch: disabled
+<Shild> Shild.ollama.enabled: disabled
+<Shild> SpamGuard.enabled: enabled
+<Shild> SpamGuard.floodEnabled: disabled
+<Shild> SpamGuard.hilightEnabled: disabled
+<Shild> SpamGuard.capsEnabled: disabled
+<Shild> SpamGuard.mojibakeEnabled: disabled
+<Shild> SpamGuard.raidEnabled: disabled
+<Shild> SpamGuard.protection.killSwitch: disabled
+<Shild> SpamGuard.hostBanAutoRebanEnabled: disabled
+<Shild> UndernetX.enforcement.preferXCommands: disabled
+<Shild> UndernetX.enforcement.xFallbackEnabled: disabled
+```
 
 ### `shildstatus`
 
@@ -260,6 +299,7 @@ Plugin-side only (no `shildml/` change) — `@reload Shild` picks it up.
 | Value | Type | Default | Description |
 |---|---|---|---|
 | `plugins.Shild.dnsbl.timeout` | Positive float | `2.0` | DNS lookup timeout (seconds) for DNSBL/DroneBL/bogon/Tor-exit checks (and IRCBL, when queried — see `ircblEnabled` below). Lowered from `5.0` on 2026-08-16 after live timing showed a slow zone can stall the whole Tier 1 stage for the full timeout. |
+| `plugins.Shild.dnsbl.staggerMs` | Non-negative integer | `250` | Delay (ms) between *launching* each successive DNSBL zone query, instead of firing all 4 in one `asyncio.gather` burst. Added 2026-08-21: even after the timeout above bounded the worst case, a corpus scan found all 4 zones still failing together in 10.6% of events — a live test reproduced multiple zones landing at the exact same millisecond, pointing at local resolver-side queueing of a simultaneous burst (this box's `systemd-resolved` stub), not the remote zones being down. Staggering the launches spreads them across separate resolver transactions. Costs up to 3× this value in added worst-case Tier 1 latency (~750ms at the default) if every zone still times out. `0` restores the old fire-all-at-once behavior. |
 | `plugins.Shild.dnsbl.cacheTtl` | Positive integer | `21600` (6h) | Cache TTL per IP for DNSBL results; also reused as the Tier 2 cache TTL. |
 | `plugins.Shild.dnsbl.ircblEnabled` | Boolean | `False` | Whether `rbl.ircbl.org` is queried on the **live** join/message evidence path. Off by default (2026-08-16): live concurrent timing showed it's consistently the slowest of the 5 DNSBL zones and drags the other 4 down when fired together (`asyncio.gather`), and Undernet's own X service already g-lines off this same list, so a live ban here is often duplicate enforcement. Always still queried on a manual `!shildcheck`/`!shcheck`, regardless of this setting — an operator investigating a host gets every available signal with no live-enforcement risk. |
 | `plugins.Shild.ipapi.timeout` | Positive float | `8.0` | HTTP timeout for ip-api.com geo/proxy lookups. |
@@ -394,7 +434,7 @@ lookup just finds nothing, same as before this feature existed.
 | Live (re-read per event) | Needs `@reload Shild` | Needs a full restart |
 |---|---|---|
 | `thresholds.*` (incl. `classifierBanSecondaryFloor`) | `evidence.abuseipdbThreshold` / `ipqsThreshold` / `scamalyticsThreshold` / `requireHardEvidenceForBan` / `scamalyticsExtreme` / `abuseipdbExtreme` / `ipqsExtreme` / `enableSecondaryBanEscalation` | Never for config values — but the `shildml/fusion.py` + `shildml/evidence.py` code behind the two new `evidence.*Extreme`/`enableSecondaryBanEscalation`-gated escalation sub-rules (2026-08-14) needs a full restart to load at all, same as any other `shildml/` change |
-| `protection.*` | `dnsbl.timeout`, `dnsbl.cacheTtl`, `ipapi.*`, `abuseipdb.*`, `ipqs.*`, `scamalytics.*`, `proxyscan.*`, `geoip.*`, `blocklist.*` | |
+| `protection.*` | `dnsbl.timeout`, `dnsbl.staggerMs`, `dnsbl.cacheTtl`, `ipapi.*`, `abuseipdb.*`, `ipqs.*`, `scamalytics.*`, `proxyscan.*`, `geoip.*`, `blocklist.*` | |
 | `ollama.*` | `classifier.*`, `worker.*` | |
 | `evidence.enabled`, `dnsbl.ircblEnabled` | all `*Path` values, `report.checkIntervalSecs` | |
 | `enabled`, `messageAnalysis`, `relayChannel`, `ignoreList`, `report.dir`, `report.announce`, `decisionCache.enabled` | `decisionCache.ttlSecs` | |

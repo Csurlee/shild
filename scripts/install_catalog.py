@@ -141,6 +141,7 @@ CATALOG: dict[str, list] = {
         Skip("worker.maxQueue", "internal tuning"),
         Skip("worker.maxConcurrency", "internal tuning"),
         Skip("dnsbl.timeout", "internal tuning"),
+        Skip("dnsbl.staggerMs", "internal tuning"),
         Skip("dnsbl.cacheTtl", "internal tuning"),
         Ask("dnsbl.ircblEnabled", tier="advanced", kind="bool", default=False,
             question="Include rbl.ircbl.org in LIVE join/message evidence checks? "
@@ -186,6 +187,14 @@ CATALOG: dict[str, list] = {
         Skip("protection.banDurationSecs", "internal tuning"),
         Skip("protection.kickReason", "internal default reads fine; change later via @config"),
         Skip("termsPath", "derived path: runtime/data/spamguard_terms.json"),
+        Skip("hostBansPath", "derived path: runtime/data/spamguard_host_bans.json"),
+        Ask("hostBanAutoRebanEnabled", tier="advanced", kind="bool", default=False,
+            question="Automatically re-ban a host that's already been convicted before "
+                     "(persisted host-ban history), the moment it rejoins under any "
+                     "nick/ident/realname? Off by default -- recording still always happens "
+                     "so you can review it via spamguardhostbans before arming this."),
+        Skip("hostBanRetentionDays", "internal tuning"),
+        Skip("hostBanPruneIntervalSecs", "internal tuning"),
         Skip("logPath", "derived path"),
         Skip("joinWindowSecs", "internal tuning"),
         Skip("exemptRegistered", "correct default (True), not a first-install decision"),

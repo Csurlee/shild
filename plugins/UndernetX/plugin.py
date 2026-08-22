@@ -664,9 +664,11 @@ class UndernetX(callbacks.Plugin):
         channel op, as long as it's identified to X with enough access
         on <channel>. <duration> defaults to "commands.defaultBanDuration"
         ("0d", permanent) when omitted; X accepts "5m" through "365d".
-        The ban's access-level exemption comes from
-        "commands.defaultBanAccess", not a command argument -- see that
-        value's own docstring for why it isn't exposed here directly.
+        The ban's severity level ("banlevel" in X's own terminology --
+        75+ actually removes the target from the channel, 1-74 only
+        blocks ops) comes from "commands.defaultBanAccess", not a
+        command argument -- see that value's own docstring for why it
+        isn't exposed here directly.
         """
         if not self._require_undernet(irc):
             irc.error(_("This only works on UnderNet."))

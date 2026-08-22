@@ -77,11 +77,30 @@ def ban_mask(field: str, nick: str, ident: str, host: str) -> str:
     IRC ban mask at all -- masks are strictly `nick!ident@host`, with no
     realname slot -- so both of those, like every field before this
     function existed, fall back to the host-based mask.
+
+    2026-08-22: that host-based fallback is itself now ident-aware, per a
+    real incident where a temporary host ban expired and the same spam
+    host simply rejoined under a new nick. An ident beginning with `~`
+    means the ircd could not verify it against a real identd response on
+    that connection -- the overwhelming majority of spam bots connect
+    this way, since running a real ident server is extra effort a
+    disposable bot has no reason to bother with. Narrowing the mask to
+    `*!~*@host` in that case means it can ONLY ever match another
+    unverified-ident connection from that host -- a later, unrelated
+    person connecting from the same IP/host with a real ident server
+    running is never caught by it. A verified ident (no `~`) is treated
+    as real evidence this IS a person, not a bot -- ban them normally
+    with the full `*!*@host` mask, same as before this change. See
+    plugin.py's `hostbans.py`-backed persisted-reban feature, which reuses
+    this exact same function (and therefore this exact same ident check)
+    for a rejoin days or weeks after the original, now-expired ban.
     """
     if field == "ident" and ident:
         return f"*!{ident}@*"
     if field == "nick" and nick:
         return f"{nick}!*@*"
+    if (ident or "").startswith("~"):
+        return f"*!~*@{host}"
     return f"*!*@{host}"
 
 

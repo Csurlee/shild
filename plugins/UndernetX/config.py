@@ -123,13 +123,26 @@ conf.registerGlobalValue(
 conf.registerGlobalValue(
     UndernetX.commands,
     "defaultBanAccess",
-    registry.NonNegativeInteger(0, _(
-        """Default access-level argument passed to "xban" when omitted
-        -- the minimum access level EXEMPT from the ban (0 exempts no
-        one). Under-documented by X itself as of this writing -- see
-        xcommands.py's module docstring -- verify against a live
-        "/msg X help ban" before relying on a non-default value for
-        anything but a supervised, manual ban.""")),
+    registry.NonNegativeInteger(75, _(
+        """Default "banlevel" argument passed to "xban"/enforce_ban_via_x
+        when omitted. CONFIRMED LIVE 2026-08-17 via "/msg X help ban"
+        (the module's own earlier "access level exempt from the ban"
+        guess was WRONG -- kept here as a historical note so a future
+        edit doesn't reintroduce it): this is a BAN SEVERITY level, 1 to
+        the bot's own X access level (100 in this deployment) --
+        1-74 only prevents the target from getting ops; 75-500 removes
+        them from the channel entirely (X auto-kicks anyone currently
+        present who matches a 75+ ban). A level below 75 would silently
+        never remove a spammer/abuser at all. 0 (the old default) is
+        flatly REJECTED by X ("Invalid banlevel range. Valid range is
+        1-100") -- confirmed live the same day as a real incident: every
+        X-routed ban was failing outright, so only the separate explicit
+        KICK ever actually removed anyone. 75 is X's own stated default
+        when the level argument is omitted entirely (per its help text),
+        and is the lowest level that actually accomplishes real removal
+        -- deliberately not maxed at 100, which would only matter if this
+        bot's own account needed to out-rank another automated banner's
+        level, not a concern here.""")),
 )
 
 conf.registerGroup(UndernetX, "enforcement")

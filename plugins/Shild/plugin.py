@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Optional
 
 import aiohttp
-from supybot import callbacks, ircmsgs, ircutils, log, schedule, world
+from supybot import callbacks, conf, ircmsgs, ircutils, log, schedule, world
 from supybot.commands import additional, wrap
 
 from shildml import evidence as evidence_mod
@@ -199,6 +199,7 @@ class Shild(callbacks.Plugin):
         self._reputation = ReputationGatherer(
             ReputationConfig(
                 dns_timeout=self.registryValue("dnsbl.timeout"),
+                dns_stagger_secs=self.registryValue("dnsbl.staggerMs") / 1000.0,
                 http_timeout=self.registryValue("ipapi.timeout"),
                 dnsbl_ttl=self.registryValue("dnsbl.cacheTtl"),
                 geo_ttl=self.registryValue("ipapi.cacheTtl"),
@@ -1006,6 +1007,90 @@ class Shild(callbacks.Plugin):
         irc.reply(" | ".join(protection))
 
     shildstatus = wrap(shildstatus, ["owner"])
+
+    @staticmethod
+    def _bool_label(value: bool) -> str:
+        return "enabled" if value else "disabled"
+
+    @staticmethod
+    def _channel_value(group_value, channel: str, network: str) -> bool:
+        """Reads a channel-scoped registry Value (from ANOTHER plugin's
+        own registry tree, not self.registryValue -- see shildconfig's
+        docstring) with the exact same network->channel->generic
+        resolution `self.registryValue(name, channel, network)` uses
+        internally (`getSpecific`, confirmed in callbacks.py) -- NOT a
+        bare `.get(channel)()`, which would silently miss a
+        network-specific override (e.g. the live conf's
+        `preferXCommands.\\:undernet.#erdely` compound key) and could
+        show the wrong value for a channel name shared across networks.
+        """
+        return group_value.getSpecific(network=network, channel=channel)()
+
+    def shildconfig(self, irc, msg, args, channel):
+        """<#channel>
+
+        Private-message only (2026-08-22): reports the real protection
+        posture for one channel in one place -- every relevant Shild,
+        SpamGuard, and UndernetX config value (both the per-channel
+        toggles and the global switches that still determine whether
+        anything actually happens there), one `Plugin.path:
+        enabled/disabled` line each. "enabled" always means the registry
+        value itself reads True -- for protection.killSwitch
+        specifically, that means the safety switch is ENGAGED (no real
+        enforcement), the opposite of "armed".
+        """
+        network = irc.network
+        lines = [
+            f"Shild.enabled: {self._bool_label(self.registryValue('enabled', channel, network))}",
+            f"Shild.messageAnalysis: "
+            f"{self._bool_label(self.registryValue('messageAnalysis', channel, network))}",
+            f"Shild.protection.killSwitch: "
+            f"{self._bool_label(self.registryValue('protection.killSwitch'))}",
+            f"Shild.ollama.enabled: {self._bool_label(self.registryValue('ollama.enabled'))}",
+        ]
+
+        # Read via the plain registry tree, not self.registryValue (which
+        # only ever resolves paths under Shild's OWN registered group) --
+        # config values are globally addressable regardless of which
+        # plugin's code reads them, same as @config itself. Gated on the
+        # callback actually being loaded so a config group that was never
+        # registered this process (plugin not loaded at all) can't
+        # raise, rather than showing stale/meaningless values.
+        if irc.getCallback("SpamGuard") is not None:
+            sg = conf.supybot.plugins.SpamGuard
+            for name in ("enabled", "floodEnabled", "hilightEnabled", "capsEnabled",
+                         "mojibakeEnabled", "raidEnabled"):
+                value = self._channel_value(getattr(sg, name), channel, network)
+                lines.append(f"SpamGuard.{name}: {self._bool_label(value)}")
+            lines.append(
+                f"SpamGuard.protection.killSwitch: "
+                f"{self._bool_label(sg.protection.killSwitch())}")
+            lines.append(
+                f"SpamGuard.hostBanAutoRebanEnabled: "
+                f"{self._bool_label(sg.hostBanAutoRebanEnabled())}")
+        else:
+            lines.append("SpamGuard: not loaded")
+
+        # UndernetX's X-routed enforcement fallback (2026-08-16) -- only
+        # meaningful on Undernet, but still shown (as its real, honestly
+        # inert value) on Libera too rather than hidden, since
+        # preferXCommands is a plain global-registry value with no
+        # network gate of its own; a Libera channel simply never reads
+        # it in practice (Shild's/SpamGuard's own _x_fallback only ever
+        # calls UndernetX at all).
+        if irc.getCallback("UndernetX") is not None:
+            ux = conf.supybot.plugins.UndernetX.enforcement
+            prefer = self._channel_value(ux.preferXCommands, channel, network)
+            lines.append(f"UndernetX.enforcement.preferXCommands: {self._bool_label(prefer)}")
+            lines.append(
+                f"UndernetX.enforcement.xFallbackEnabled: "
+                f"{self._bool_label(ux.xFallbackEnabled())}")
+        else:
+            lines.append("UndernetX: not loaded")
+
+        for line in lines:
+            irc.reply(line)
+    shildconfig = wrap(shildconfig, ["owner", "private", "channel"])
 
     def shildreport(self, irc, msg, args, date):
         """[<YYYY-MM-DD>]

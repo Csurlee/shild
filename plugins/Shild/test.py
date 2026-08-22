@@ -950,6 +950,44 @@ class ShildTestCase(ChannelPluginTestCase):
     def test_shildlistignore_requires_owner_capability(self):
         self._assert_denied_owner_capability("shildlistignore")
 
+    # ---- shildconfig (2026-08-22) ----
+
+    def test_shildconfig_requires_owner_capability(self):
+        self._assert_denied_owner_capability(f"shildconfig {self.channel}")
+
+    def test_shildconfig_must_be_sent_privately(self):
+        # Sent to the channel, not a query -- the 'private' wrap
+        # converter should reject this before ever reading the registry.
+        m = self.getMsg(f"shildconfig {self.channel}")
+        self.assertIn("Error", m.args[1])
+
+    def test_shildconfig_shows_shild_values_and_others_not_loaded(self):
+        # This class (ShildTestCase, plugins=("Shild",)) doubles as the
+        # "SpamGuard/UndernetX not loaded" proof, same convention as
+        # ShildXFallbackTestCase's own docstring for UndernetX.
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.messageAnalysis.get(self.channel).setValue(False)
+        conf.supybot.plugins.Shild.protection.killSwitch.setValue(True)
+        conf.supybot.plugins.Shild.ollama.enabled.setValue(False)
+
+        # getMsg() itself consumes the FIRST queued reply internally
+        # (returns it) -- must be captured, or every later line in the
+        # manual drain loop shifts up by one and the first is lost.
+        first = self.getMsg(f"shildconfig {self.channel}", private=True)
+        lines = [first.args[1]]
+        while True:
+            m = self.irc.takeMsg()
+            if m is None:
+                break
+            lines.append(m.args[1])
+
+        self.assertIn("Shild.enabled: enabled", lines)
+        self.assertIn("Shild.messageAnalysis: disabled", lines)
+        self.assertIn("Shild.protection.killSwitch: enabled", lines)
+        self.assertIn("Shild.ollama.enabled: disabled", lines)
+        self.assertIn("SpamGuard: not loaded", lines)
+        self.assertIn("UndernetX: not loaded", lines)
+
     def _queued(self):
         """All messages currently queued to be sent, without dequeuing
         them (avoids the outgoing-queue's real-time throttling, which
@@ -1029,6 +1067,17 @@ class ShildXFallbackTestCase(ChannelPluginTestCase):
         conf.supybot.plugins.UndernetX.auth.password.setValue("")
         conf.supybot.plugins.UndernetX.enforcement.preferXCommands.get(
             self.channel).setValue(True)
+        # A network+channel-qualified override, once set by ANY test
+        # anywhere in this process, permanently takes precedence over the
+        # bare-channel value above -- see plugins/UndernetX/test.py's own
+        # setUp for the canonical fix/explanation (2026-08-16). Reset
+        # (not just re-assert) so this class is correct regardless of
+        # what ran before it, without itself becoming a source of the
+        # same leak for whatever runs after it.
+        net_specific = conf.supybot.plugins.UndernetX.enforcement.preferXCommands.get(
+            ":" + self.irc.network).get(self.channel)
+        net_specific.setValue(False)
+        net_specific._wasSet = False
         conf.supybot.plugins.UndernetX.enforcement.xFallbackEnabled.setValue(True)
         conf.supybot.plugins.UndernetX.enforcement.minAccessLevel.setValue(100)
         conf.supybot.plugins.UndernetX.enforcement.probeTtlSecs.setValue(3600)
@@ -1139,3 +1188,145 @@ class ShildXFallbackTestCase(ChannelPluginTestCase):
         self.irc.feedMsg(self._make_join("baduser9", "~bad", "203.0.113.28"))
         record = json.loads(Path(self._enforcement_path).read_text().strip().splitlines()[-1])
         self.assertIn("[ID: 1]", record["reason"])
+
+
+class ShildConfigTestCase(ChannelPluginTestCase):
+    """shildconfig (2026-08-22) with real SpamGuard and UndernetX
+    instances loaded -- unlike ShildTestCase above (neither loaded,
+    proves both "not loaded" fallback lines), these tests exercise the
+    actual cross-plugin registry reads.
+    """
+    plugins = ("Shild", "SpamGuard", "UndernetX")
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._model_path = str(Path(self._tmpdir) / "model.npz")
+        self._data_path = str(Path(self._tmpdir) / "shadow.jsonl")
+        _write_dummy_model(self._model_path, bias_toward="allow")
+
+        conf.supybot.plugins.Shild.classifier.modelPath.setValue(self._model_path)
+        conf.supybot.plugins.Shild.shadowDataPath.setValue(self._data_path)
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.messageAnalysis.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.protection.killSwitch.setValue(False)
+        conf.supybot.plugins.Shild.ollama.enabled.setValue(True)
+
+        self._sg_terms_path = str(Path(self._tmpdir) / "spamguard_terms.json")
+        self._sg_host_bans_path = str(Path(self._tmpdir) / "spamguard_host_bans.json")
+        conf.supybot.plugins.SpamGuard.termsPath.setValue(self._sg_terms_path)
+        conf.supybot.plugins.SpamGuard.hostBansPath.setValue(self._sg_host_bans_path)
+        conf.supybot.plugins.SpamGuard.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.SpamGuard.floodEnabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.SpamGuard.hilightEnabled.get(self.channel).setValue(False)
+        conf.supybot.plugins.SpamGuard.capsEnabled.get(self.channel).setValue(False)
+        conf.supybot.plugins.SpamGuard.mojibakeEnabled.get(self.channel).setValue(False)
+        conf.supybot.plugins.SpamGuard.raidEnabled.get(self.channel).setValue(False)
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(True)
+        conf.supybot.plugins.SpamGuard.hostBanAutoRebanEnabled.setValue(False)
+
+        conf.supybot.plugins.UndernetX.enforcement.preferXCommands.get(
+            self.channel).setValue(True)
+        conf.supybot.plugins.UndernetX.enforcement.xFallbackEnabled.setValue(False)
+
+        super().setUp()
+
+        # preferXCommands is a real, already-documented cross-test leak
+        # risk -- see plugins/UndernetX/test.py's own setUp for the
+        # original, canonical fix and full explanation (2026-08-16): a
+        # network+channel-qualified override, once explicitly .setValue()'d
+        # by ANY test anywhere in this process, permanently takes
+        # precedence over the bare-channel value from then on
+        # (getSpecific()'s own resolution order), and merely setting it to
+        # a "safe" value doesn't help -- .setValue() always flips _wasSet,
+        # so it still wins over the bare form. Must clear ._wasSet directly
+        # to genuinely restore "never touched", exactly like UndernetX's
+        # own test.py already does. Confirmed live (2026-08-22): a first
+        # attempt here that instead tried to defensively re-assert a value
+        # in setUp (rather than truly resetting) fixed THIS class but
+        # broke ShildXFallbackTestCase/SpamGuardXFallbackTestCase, which
+        # only defended the bare-channel form -- this reset avoids the
+        # whack-a-mole entirely by never leaving a precedence-winning node
+        # behind for any other class to trip over.
+        net_specific = conf.supybot.plugins.UndernetX.enforcement.preferXCommands.get(
+            ":" + self.irc.network).get(self.channel)
+        net_specific.setValue(False)
+        net_specific._wasSet = False
+
+    def _lines(self, command):
+        # getMsg() itself calls irc.takeMsg() once internally to fetch
+        # its return value -- the FIRST queued reply -- so it must be
+        # captured here too, or it's silently dropped and every
+        # subsequent line in the manual drain loop below shifts up by
+        # one (same class of gotcha already documented repeatedly in
+        # this codebase for a command issued right after real
+        # enforcement queued its own messages first).
+        first = self.getMsg(command, private=True)
+        lines = [first.args[1]] if first is not None else []
+        while True:
+            m = self.irc.takeMsg()
+            if m is None:
+                break
+            lines.append(m.args[1])
+        return lines
+
+    def test_shows_every_shild_and_spamguard_value_for_the_channel(self):
+        lines = self._lines(f"shildconfig {self.channel}")
+
+        self.assertIn("Shild.enabled: enabled", lines)
+        self.assertIn("Shild.messageAnalysis: enabled", lines)
+        self.assertIn("Shild.protection.killSwitch: disabled", lines)
+        self.assertIn("Shild.ollama.enabled: enabled", lines)
+        self.assertIn("SpamGuard.enabled: enabled", lines)
+        self.assertIn("SpamGuard.floodEnabled: enabled", lines)
+        self.assertIn("SpamGuard.hilightEnabled: disabled", lines)
+        self.assertIn("SpamGuard.capsEnabled: disabled", lines)
+        self.assertIn("SpamGuard.mojibakeEnabled: disabled", lines)
+        self.assertIn("SpamGuard.raidEnabled: disabled", lines)
+        self.assertIn("SpamGuard.protection.killSwitch: enabled", lines)
+        self.assertIn("SpamGuard.hostBanAutoRebanEnabled: disabled", lines)
+        self.assertIn("UndernetX.enforcement.preferXCommands: enabled", lines)
+        self.assertIn("UndernetX.enforcement.xFallbackEnabled: disabled", lines)
+
+    def test_reflects_a_different_channel_toggle_state_independently(self):
+        # Per-channel values are genuinely per-channel -- a second
+        # channel with different settings must show its OWN state, not
+        # leak self.channel's.
+        other = "#otherchannel"
+        conf.supybot.plugins.Shild.enabled.get(other).setValue(False)
+        conf.supybot.plugins.SpamGuard.floodEnabled.get(other).setValue(False)
+        conf.supybot.plugins.UndernetX.enforcement.preferXCommands.get(other).setValue(False)
+
+        lines = self._lines(f"shildconfig {other}")
+        self.assertIn("Shild.enabled: disabled", lines)
+        self.assertIn("SpamGuard.floodEnabled: disabled", lines)
+        self.assertIn("UndernetX.enforcement.preferXCommands: disabled", lines)
+
+    def test_channel_value_resolves_network_specific_override(self):
+        # 2026-08-22 fix: a bare .get(channel)() would miss a
+        # network-qualified override entirely -- must use the same
+        # getSpecific(network=, channel=) resolution self.registryValue()
+        # itself uses. Sets the network-specific override with the exact
+        # same construction callbacks.py's own setRegistryValue() uses
+        # internally (group.get(':' + network).get(channel)) -- confirmed
+        # by reading that method's source, not guessed; a naive
+        # .get(channel).get(':' + network) ordering does NOT work
+        # (getSpecific looks for the network segment first).
+        val = conf.supybot.plugins.UndernetX.enforcement.preferXCommands
+        val.get(self.channel).setValue(True)
+        val.get(":" + self.irc.network).get(self.channel).setValue(False)
+
+        lines = self._lines(f"shildconfig {self.channel}")
+        self.assertIn("UndernetX.enforcement.preferXCommands: disabled", lines)
+
+    def test_global_switches_unaffected_by_which_channel_is_queried(self):
+        # protection.killSwitch/hostBanAutoRebanEnabled/ollama.enabled
+        # are global, not channel-scoped -- must read identically
+        # regardless of which channel argument is passed.
+        lines_a = self._lines(f"shildconfig {self.channel}")
+        lines_b = self._lines("shildconfig #some-other-channel-entirely")
+        for line in ("Shild.protection.killSwitch: disabled",
+                     "SpamGuard.protection.killSwitch: enabled",
+                     "SpamGuard.hostBanAutoRebanEnabled: disabled",
+                     "UndernetX.enforcement.xFallbackEnabled: disabled"):
+            self.assertIn(line, lines_a)
+            self.assertIn(line, lines_b)
