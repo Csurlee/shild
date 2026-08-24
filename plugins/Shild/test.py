@@ -10,6 +10,7 @@ that module) and by actual shadow-mode running (M5).
 """
 import json
 import tempfile
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -904,6 +905,68 @@ class ShildTestCase(ChannelPluginTestCase):
     def test_shildlistignore_empty_shows_none(self):
         m = self.getMsg("shildlistignore")
         self.assertIn("(none)", m.args[1])
+
+    # ---- web_add_ignore / web_remove_ignore (WebPanel write-route entry points) ----
+
+    def test_web_add_ignore_stores_host(self):
+        cb = self.irc.getCallback("Shild")
+        ok, code = cb.web_add_ignore("203.0.113.90")
+        self.assertTrue(ok)
+        self.assertEqual(code, "ignore_added")
+        self.assertIn("203.0.113.90", conf.supybot.plugins.Shild.ignoreList())
+
+    def test_web_add_ignore_rejects_nick_shaped_input(self):
+        cb = self.irc.getCallback("Shild")
+        ok, code = cb.web_add_ignore("someNick")
+        self.assertFalse(ok)
+        self.assertEqual(code, "ignore_needs_host")
+        self.assertNotIn("someNick", conf.supybot.plugins.Shild.ignoreList())
+
+    def test_web_add_ignore_twice_does_not_duplicate(self):
+        cb = self.irc.getCallback("Shild")
+        cb.web_add_ignore("203.0.113.91")
+        ok, code = cb.web_add_ignore("203.0.113.91")
+        self.assertTrue(ok)  # already-present is still success
+        self.assertEqual(list(conf.supybot.plugins.Shild.ignoreList()).count("203.0.113.91"), 1)
+
+    def test_web_remove_ignore_removes_host(self):
+        conf.supybot.plugins.Shild.ignoreList.setValue(["203.0.113.92"])
+        cb = self.irc.getCallback("Shild")
+        ok, code = cb.web_remove_ignore("203.0.113.92")
+        self.assertTrue(ok)
+        self.assertEqual(code, "ignore_removed")
+        self.assertNotIn("203.0.113.92", conf.supybot.plugins.Shild.ignoreList())
+
+    def test_web_remove_ignore_not_present_fails_cleanly(self):
+        cb = self.irc.getCallback("Shild")
+        ok, code = cb.web_remove_ignore("203.0.113.93")
+        self.assertFalse(ok)
+        self.assertEqual(code, "ignore_not_found")
+
+    def test_concurrent_web_add_ignore_never_loses_a_host(self):
+        """Regression, 2026-08-24 (found via a post-ship code review):
+        ignoreList is a plain registry value with no locking of its own
+        -- before this session's WebPanel write-support feature, it was
+        only ever touched from the main IRC thread, so a read-modify-
+        write race was impossible. web_add_ignore/web_remove_ignore made
+        it reachable from a second thread (the HTTP server thread) for
+        the first time, creating a genuine lost-update race: two
+        concurrent adds could both read the same starting list and each
+        write back a version missing the other's host. Fixed with
+        self._ignore_list_lock (see __init__). Many threads adding
+        DISTINCT hosts concurrently -- every single one must survive."""
+        cb = self.irc.getCallback("Shild")
+        hosts = [f"203.0.114.{i}" for i in range(40)]
+        threads = [
+            threading.Thread(target=cb.web_add_ignore, args=(h,)) for h in hosts
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        stored = set(conf.supybot.plugins.Shild.ignoreList())
+        missing = set(hosts) - stored
+        self.assertEqual(missing, set(), f"lost {len(missing)} host(s) to a concurrent-write race")
 
     # ---- owner-only gate (2026-08-09) ----
 

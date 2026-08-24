@@ -67,22 +67,51 @@ async def fetch_events(
         return [], type(e).__name__
 
 
-def relevant_events(events: list[dict], since_id: Optional[int] = None) -> list[dict]:
+def relevant_events(events: list[dict], since_ids: Optional[dict] = None) -> list[dict]:
     """Filter a raw (newest-first) event list down to the ones worth
-    announcing, stopping once `since_id` is reached (exclusive -- that
-    one and everything older was already announced on a prior poll).
+    announcing. `since_ids` maps event TYPE -> the highest id of that
+    type already seen/announced.
+
+    2026-08-24 fix (found via live investigation, not a hypothesis):
+    this used to take a single `since_id: int` and `break` the moment
+    any event's id fell at or below it -- built on the assumption that
+    GitHub's numeric event ids are one shared, roughly time-ordered
+    sequence across every event type. That's false. Confirmed against
+    Csurlee/shild's real event history: a PushEvent at 10:07:58 UTC
+    had id 18700998032, while IssuesEvent/IssueCommentEvent entries from
+    just two minutes earlier (10:05:xx UTC) sat around 13751500000 --
+    nearly 5 BILLION lower, despite being chronologically almost
+    simultaneous. Event ids are allocated from structurally different
+    ranges per type. A single combined "max id ever seen" cursor gets
+    permanently poisoned the first time a high-id-range type (PushEvent)
+    is polled -- every future Issues/PullRequest event, whose ids stay
+    in the much lower range, then silently fails the `<= since_id`
+    check forever. This is exactly what happened live for this repo:
+    pushes are frequent, so the shared cursor almost certainly blocked
+    every issue/PR announcement since the feature shipped.
+
+    Tracking the floor per type (not a single scalar, and no early
+    `break` -- types are interleaved in the API's response, so a global
+    break is never safe) fixes this. An event type with no entry in
+    `since_ids` (never independently seeded yet) is treated as "first
+    time seeing this type" and is never included here -- same
+    "seed the cursor, don't replay history" behavior this always had at
+    the whole-repo level, now applied per type too.
+
     Returned list is still newest-first; reverse it before announcing so
     channel output reads in chronological order.
     """
+    since_ids = since_ids or {}
     out = []
     for event in events:
         try:
             event_id = int(event["id"])
         except (KeyError, ValueError, TypeError):
             continue
-        if since_id is not None and event_id <= since_id:
-            break
         etype = event.get("type")
+        floor = since_ids.get(etype)
+        if floor is None or event_id <= floor:
+            continue
         payload = event.get("payload", {})
         if etype == "PushEvent":
             out.append(event)
@@ -95,19 +124,27 @@ def relevant_events(events: list[dict], since_id: Optional[int] = None) -> list[
     return out
 
 
-def max_event_id(events: list[dict]) -> Optional[int]:
-    """Highest numeric id across a raw event list, or None if empty/all
-    unparseable. Used to advance the polling cursor even for events that
-    weren't `relevant_events` (a repo that's all comments/labels for a
-    while shouldn't cause the same events to be re-fetched forever).
-    """
-    ids = []
+def max_event_ids_by_type(events: list[dict]) -> dict:
+    """Highest numeric id per event TYPE across a raw event list --
+    2026-08-24, replaces the old single-scalar `max_event_id` (see
+    relevant_events' own docstring for exactly why a combined max
+    across types is unsafe). Used to advance the per-type polling
+    cursor even for events that weren't `relevant_events` (e.g. a
+    comment shouldn't cause the same events to be re-fetched forever,
+    though re-fetching the API's fixed recent-events page is cheap
+    regardless)."""
+    out: dict = {}
     for event in events:
+        etype = event.get("type")
+        if etype is None:
+            continue
         try:
-            ids.append(int(event["id"]))
+            event_id = int(event["id"])
         except (KeyError, ValueError, TypeError):
             continue
-    return max(ids) if ids else None
+        if event_id > out.get(etype, -1):
+            out[etype] = event_id
+    return out
 
 
 def format_event(event: dict, max_commits_shown: int = 3) -> str:

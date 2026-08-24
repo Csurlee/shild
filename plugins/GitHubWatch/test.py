@@ -73,51 +73,106 @@ def _pr_event(event_id="102", action="opened", number=7, title="Add feature", me
 
 
 class RelevantEventsTest(unittest.TestCase):
+    # Every non-"first poll of an empty since_ids" case below needs a
+    # since_ids floor per type it expects to see -- relevant_events()
+    # treats a missing type entry as "never seeded, don't replay" (see
+    # its own docstring). -1 is a floor every real GitHub id (always
+    # positive) clears.
+    _SEED_ALL = {"PushEvent": -1, "IssuesEvent": -1, "PullRequestEvent": -1}
+
     def test_push_issue_opened_pr_opened_are_relevant(self):
         events = [_push_event(), _issue_event(action="opened"), _pr_event(action="opened")]
-        self.assertEqual(len(github.relevant_events(events)), 3)
+        self.assertEqual(len(github.relevant_events(events, since_ids=self._SEED_ALL)), 3)
 
     def test_issue_closed_is_not_relevant(self):
         events = [_issue_event(action="closed")]
-        self.assertEqual(github.relevant_events(events), [])
+        self.assertEqual(github.relevant_events(events, since_ids=self._SEED_ALL), [])
 
     def test_pr_synchronize_is_not_relevant(self):
         events = [_pr_event(action="synchronize")]
-        self.assertEqual(github.relevant_events(events), [])
+        self.assertEqual(github.relevant_events(events, since_ids=self._SEED_ALL), [])
 
     def test_pr_closed_without_merge_is_not_relevant(self):
         events = [_pr_event(action="closed", merged=False)]
-        self.assertEqual(github.relevant_events(events), [])
+        self.assertEqual(github.relevant_events(events, since_ids=self._SEED_ALL), [])
 
     def test_pr_closed_with_merge_is_relevant(self):
         events = [_pr_event(action="closed", merged=True)]
-        self.assertEqual(len(github.relevant_events(events)), 1)
+        self.assertEqual(len(github.relevant_events(events, since_ids=self._SEED_ALL)), 1)
 
     def test_since_id_excludes_already_seen(self):
         events = [_push_event(event_id="103"), _push_event(event_id="102"), _push_event(event_id="101")]
-        result = github.relevant_events(events, since_id=101)
+        result = github.relevant_events(events, since_ids={"PushEvent": 101})
         self.assertEqual([e["id"] for e in result], ["103", "102"])
 
-    def test_since_id_none_includes_everything(self):
+    def test_since_ids_none_includes_nothing(self):
+        # 2026-08-24 fix: a type with no floor at all (since_ids=None, or
+        # missing that type's key) is treated as "never independently
+        # seeded" and never included -- this is the correct fail-safe
+        # behavior (seed, don't replay), replacing the old, unsafe
+        # "since_id=None means include everything" semantics.
         events = [_push_event(event_id="103"), _push_event(event_id="102")]
-        result = github.relevant_events(events, since_id=None)
-        self.assertEqual(len(result), 2)
+        result = github.relevant_events(events, since_ids=None)
+        self.assertEqual(result, [])
 
     def test_malformed_id_is_skipped_not_crashed(self):
         events = [{"id": "not-a-number", "type": "PushEvent", "payload": {}}]
-        self.assertEqual(github.relevant_events(events), [])
+        self.assertEqual(github.relevant_events(events, since_ids=self._SEED_ALL), [])
+
+    # ---- regression: cross-event-type id ranges are NOT comparable
+    # (2026-08-24, found live against Csurlee/shild's real event
+    # history -- see github.py's relevant_events docstring) ----
+
+    def test_a_high_id_pushevent_cursor_never_suppresses_a_lower_id_issuesevent(self):
+        # Real observed shape: a PushEvent's id can be billions higher
+        # than an IssuesEvent's id from almost the same moment. A single
+        # combined cursor at the push's id would make relevant_events
+        # (old behavior) discard the issue event outright, even though
+        # it was never actually seen before.
+        push_cursor = 18700998032  # a real observed PushEvent id
+        new_issue_id = 13751509200  # a real observed IssuesEvent id, LOWER
+        events = [_issue_event(event_id=str(new_issue_id), action="opened")]
+        since_ids = {"PushEvent": push_cursor, "IssuesEvent": 1}  # issue floor is genuinely low
+        result = github.relevant_events(events, since_ids=since_ids)
+        self.assertEqual(len(result), 1)
+
+    def test_each_event_type_is_filtered_against_its_own_floor_only(self):
+        events = [
+            _push_event(event_id="18700998032"),
+            _issue_event(event_id="13751509200", action="opened"),
+        ]
+        # Push's own floor already covers it (not new); issue's own floor
+        # does not (it IS new) -- only the issue should come back.
+        since_ids = {"PushEvent": 18700998032, "IssuesEvent": 1}
+        result = github.relevant_events(events, since_ids=since_ids)
+        self.assertEqual([e["type"] for e in result], ["IssuesEvent"])
 
 
-class MaxEventIdTest(unittest.TestCase):
-    def test_finds_max_across_mixed_order(self):
-        events = [_push_event(event_id="50"), _push_event(event_id="200"), _push_event(event_id="10")]
-        self.assertEqual(github.max_event_id(events), 200)
+class MaxEventIdsByTypeTest(unittest.TestCase):
+    def test_finds_max_per_type_independently(self):
+        events = [
+            _push_event(event_id="50"), _push_event(event_id="200"), _push_event(event_id="10"),
+            _issue_event(event_id="5", action="opened"),
+        ]
+        self.assertEqual(github.max_event_ids_by_type(events),
+                          {"PushEvent": 200, "IssuesEvent": 5})
 
-    def test_empty_list_is_none(self):
-        self.assertIsNone(github.max_event_id([]))
+    def test_empty_list_is_empty_dict(self):
+        self.assertEqual(github.max_event_ids_by_type([]), {})
 
-    def test_all_malformed_is_none(self):
-        self.assertIsNone(github.max_event_id([{"id": "x"}, {}]))
+    def test_all_malformed_is_empty_dict(self):
+        self.assertEqual(github.max_event_ids_by_type([{"id": "x", "type": "PushEvent"}, {}]), {})
+
+    def test_a_much_higher_id_type_does_not_affect_another_types_max(self):
+        # The exact real-world shape this whole fix is about: these two
+        # ids differ by ~5 billion despite being minutes apart.
+        events = [
+            _push_event(event_id="18700998032"),
+            _issue_event(event_id="13751509200", action="opened"),
+        ]
+        result = github.max_event_ids_by_type(events)
+        self.assertEqual(result["PushEvent"], 18700998032)
+        self.assertEqual(result["IssuesEvent"], 13751509200)
 
 
 class FormatEventTest(unittest.TestCase):
@@ -192,32 +247,56 @@ class FormatEventTest(unittest.TestCase):
 
 
 class SeenStateStoreTest(unittest.TestCase):
-    def test_unknown_repo_is_none(self):
+    def test_unknown_repo_is_empty_dict(self):
         with tempfile.TemporaryDirectory() as d:
             store = SeenStateStore(str(Path(d) / "state.json"))
-            self.assertIsNone(store.last_seen("owner/repo"))
+            self.assertEqual(store.last_seen("owner/repo"), {})
 
     def test_round_trip_across_instances(self):
         with tempfile.TemporaryDirectory() as d:
             path = str(Path(d) / "state.json")
             store1 = SeenStateStore(path)
-            store1.mark_seen("owner/repo", 42)
+            store1.mark_seen("owner/repo", "PushEvent", 42)
             store2 = SeenStateStore(path)
-            self.assertEqual(store2.last_seen("owner/repo"), 42)
+            self.assertEqual(store2.last_seen("owner/repo"), {"PushEvent": 42})
 
     def test_mark_seen_never_goes_backwards(self):
         with tempfile.TemporaryDirectory() as d:
             store = SeenStateStore(str(Path(d) / "state.json"))
-            store.mark_seen("owner/repo", 50)
-            store.mark_seen("owner/repo", 10)
-            self.assertEqual(store.last_seen("owner/repo"), 50)
+            store.mark_seen("owner/repo", "PushEvent", 50)
+            store.mark_seen("owner/repo", "PushEvent", 10)
+            self.assertEqual(store.last_seen("owner/repo"), {"PushEvent": 50})
 
     def test_corrupt_file_is_treated_as_empty(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "state.json"
             path.write_text("{not valid json")
             store = SeenStateStore(str(path))
-            self.assertIsNone(store.last_seen("owner/repo"))
+            self.assertEqual(store.last_seen("owner/repo"), {})
+
+    # ---- per-type tracking (2026-08-24 fix) ----
+
+    def test_different_event_types_track_independent_cursors(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = SeenStateStore(str(Path(d) / "state.json"))
+            store.mark_seen("owner/repo", "PushEvent", 18700998032)
+            store.mark_seen("owner/repo", "IssuesEvent", 13751509200)
+            seen = store.last_seen("owner/repo")
+            self.assertEqual(seen["PushEvent"], 18700998032)
+            self.assertEqual(seen["IssuesEvent"], 13751509200)
+
+    def test_old_flat_int_format_is_discarded_not_migrated(self):
+        # Regression, 2026-08-24: the pre-fix format was {repo: int} --
+        # a single combined cursor, which was the bug itself. Loading it
+        # must NOT try to treat that int as a seed for any one type
+        # (that would just carry the poisoning forward); it must be
+        # discarded, falling back to "never seen this repo", same as a
+        # corrupt file.
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "state.json"
+            path.write_text(json.dumps({"owner/repo": 18700998032}))
+            store = SeenStateStore(str(path))
+            self.assertEqual(store.last_seen("owner/repo"), {})
 
 
 if __name__ == "__main__":

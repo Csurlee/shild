@@ -113,9 +113,17 @@ class Worker:
         if not events:
             return
 
-        since_id = self._state.last_seen(repo)
-        newest_id = github.max_event_id(events)
-        relevant = github.relevant_events(events, since_id=since_id)
+        # 2026-08-24 fix: since_ids/newest_by_type are now per-EVENT-TYPE
+        # (see state.py's/github.py's own docstrings for why a single
+        # combined cursor is unsafe -- it gets permanently poisoned by
+        # PushEvent's much-higher id range). relevant_events() itself now
+        # handles "first time seeing this type -> don't replay, just
+        # seed" per type, so the old whole-repo "since_id is None" special
+        # case is gone -- seeding always happens the same way below,
+        # regardless of whether this is the very first poll or not.
+        since_ids = self._state.last_seen(repo)
+        newest_by_type = github.max_event_ids_by_type(events)
+        relevant = github.relevant_events(events, since_ids=since_ids)
         relevant = [
             e for e in relevant
             if (cfg.announce_pushes if e.get("type") == "PushEvent" else
@@ -123,14 +131,7 @@ class Worker:
                 cfg.announce_pull_requests if e.get("type") == "PullRequestEvent" else True)
         ]
 
-        if since_id is None:
-            # First time seeing this repo: don't replay its whole recent
-            # history into the channel, just establish the cursor.
-            if newest_id is not None:
-                self._state.mark_seen(repo, newest_id)
-            return
-
         if relevant:
             self._on_events(repo, list(reversed(relevant)))  # chronological order
-        if newest_id is not None:
-            self._state.mark_seen(repo, newest_id)
+        for event_type, event_id in newest_by_type.items():
+            self._state.mark_seen(repo, event_type, event_id)

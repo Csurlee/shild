@@ -11,6 +11,19 @@ most of them. Skipping escaping anywhere here is stored XSS reachable
 from any user in any logged channel; the Content-Security-Policy set in
 http.py (`default-src 'none'`, no script-src at all) is the second layer,
 not a replacement for this one.
+
+**Forms (2026-08-24, `controls_*` functions below)**: the first `<form>`
+elements this module has ever emitted, for the new scoped write surface
+(kill switches, per-channel toggles, SpamGuard terms, Shild ignore list
+-- see plugins/WebPanel/controls.py's own docstring for the allowlist
+these forms are restricted to). Every form is `method="post"`, carries a
+hidden CSRF field (csrf_field below), and every value a form could ever
+submit is escaped the same as any other untrusted content -- a form
+field is exactly as attacker-reachable as an IRC nick, since anyone who
+can view the page can also submit it. No JavaScript, no inline
+`style=` attributes (CSS classes only, same `style-src 'self'`
+constraint the existing heatmap already follows) -- every visual state
+(armed/safe, on/off) is a CSS class in STYLE_CSS, not inline styling.
 """
 from __future__ import annotations
 
@@ -32,7 +45,7 @@ _PAGE = """<!DOCTYPE html>
 <link rel="stylesheet" href="/panel/style.css">
 </head>
 <body>
-<div class="nav"><a href="/panel/">overview</a> | <a href="/panel/logs">logs</a> | <a href="/panel/live">live</a> | <a href="/panel/stats">stats</a> | <a href="/panel/gate">gate</a> | <a href="/panel/report">report</a> | <a href="/panel/commands">commands</a></div>
+<div class="nav"><a href="/panel/">overview</a> | <a href="/panel/logs">logs</a> | <a href="/panel/live">live</a> | <a href="/panel/stats">stats</a> | <a href="/panel/gate">gate</a> | <a href="/panel/report">report</a> | <a href="/panel/commands">commands</a> | <a href="/panel/controls">controls</a></div>
 <h1>{heading}</h1>
 {body}
 </body>
@@ -60,6 +73,16 @@ td.heat-4 { background: #9ee06a; color: #111; }
 code { color: #9ee06a; }
 .cmd-help { color: #999; }
 .parted { color: #d78a3a; }
+.flash-ok { color: #9ee06a; border: 1px solid #2e6b4a; padding: 0.5em 0.75em; }
+.flash-err { color: #e08a6a; border: 1px solid #a04a2e; padding: 0.5em 0.75em; }
+.switch-armed { color: #e08a6a; font-weight: bold; }
+.switch-safe { color: #9ee06a; }
+.toggle-row form { display: inline; }
+.toggle-row .state-on { color: #9ee06a; }
+.toggle-row .state-off { color: #999; }
+form.inline-form { display: inline-block; margin: 0.25em 1em 0.25em 0; }
+.controls-section { margin-bottom: 2em; }
+.dangerous-confirm { color: #e08a6a; }
 """
 
 
@@ -457,3 +480,255 @@ def scans_table(records: Iterable[dict], requested_n: int) -> str:
         "<th>host</th><th>action</th><th>confidence</th><th>source</th></tr>"
         "%s</table>" % (len(records), requested_n, "".join(rows))
     )
+
+
+# --- Controls (write surface, 2026-08-24) -----------------------------------
+
+
+def csrf_field(token: str) -> str:
+    return f'<input type="hidden" name="csrf" value="{escape(token)}">'
+
+
+def flash_banner(level: str, message: str) -> str:
+    """`level` is "ok" or "err" (see controls.FLASH's own two-tuples) --
+    anything else falls back to "err" styling rather than rendering
+    unclassed, so an unrecognized level fails toward the more visible
+    treatment instead of silently blending into the page."""
+    css_class = "flash-ok" if level == "ok" else "flash-err"
+    return f'<p class="{css_class}">{escape(message)}</p>'
+
+
+def controls_unavailable(plugin_name: str) -> str:
+    return simple_message(f"{plugin_name} isn't loaded -- nothing to show or change here.")
+
+
+def _switch_row(switch, current: "bool | None", loaded: bool, token: str) -> str:
+    if not loaded:
+        return (
+            f"<tr><td>{escape(switch.label)}</td>"
+            f"<td colspan=\"2\">({escape(switch.plugin)} not loaded)</td></tr>"
+        )
+    state_label = switch.true_state_label if current else switch.false_state_label
+    state_class = "switch-armed" if (current == switch.true_means_armed) else "switch-safe"
+    target_value = not current
+    action_label = (
+        switch.to_true_action_label if target_value else switch.to_false_action_label
+    )
+    confirm_html = ""
+    if target_value == switch.dangerous_value:
+        confirm_html = (
+            '<label class="dangerous-confirm">'
+            '<input type="checkbox" name="confirm" value="1" required> '
+            "I understand this makes enforcement MORE active</label> "
+        )
+    form = (
+        '<form class="inline-form" method="post" action="/panel/controls/killswitch">'
+        f'<input type="hidden" name="key" value="{escape(switch.key)}">'
+        f'<input type="hidden" name="value" value="{"true" if target_value else "false"}">'
+        f"{csrf_field(token)}{confirm_html}"
+        f'<button type="submit">{escape(action_label)}</button>'
+        "</form>"
+    )
+    return (
+        f'<tr><td>{escape(switch.label)}</td>'
+        f'<td class="{state_class}">{escape(state_label)}</td><td>{form}</td></tr>'
+    )
+
+
+def controls_overview(
+    switches: Iterable[Tuple[object, "bool | None", bool]],
+    ignore_hosts: Iterable[str],
+    channels: Iterable[Tuple[str, str]],
+    token: str,
+    flash_html: str,
+    write_enabled: bool,
+) -> str:
+    """switches: (GlobalSwitch, current_value_or_None_if_unloaded, loaded)
+    tuples, in controls.GLOBAL_SWITCHES order. ignore_hosts: Shild's
+    current ignoreList. channels: (network, channel) pairs known to the
+    per-channel-toggle warm pass -- see plugin.py's periodic warm event."""
+    if not write_enabled:
+        return (
+            flash_html
+            + "<p>Writing from the panel is currently disabled "
+              "(<code>plugins.WebPanel.writeEnabled</code> is False).</p>"
+        )
+
+    armed_true = [s for s in switches if s[0].true_means_armed]
+    safe_true = [s for s in switches if not s[0].true_means_armed]
+
+    def _section(title: str, rows) -> str:
+        body = "".join(_switch_row(s, cur, loaded, token) for s, cur, loaded in rows)
+        return f"<h2>{escape(title)}</h2><table>{body}</table>"
+
+    parts = [flash_html]
+    parts.append(_section("Kill switches (True = safe)", safe_true))
+    parts.append(_section("Arm switches (True = armed)", armed_true))
+
+    parts.append("<h2>Shild ignore list</h2>")
+    hosts = sorted(ignore_hosts)
+    if hosts:
+        items = "".join(
+            "<li><code>%s</code> "
+            '<form class="inline-form" method="post" action="/panel/controls/ignore">'
+            '<input type="hidden" name="action" value="remove">'
+            '<input type="hidden" name="host" value="%s">%s'
+            '<button type="submit">Remove</button></form></li>' % (
+                escape(h), escape(h), csrf_field(token),
+            )
+            for h in hosts
+        )
+        parts.append(f"<ul>{items}</ul>")
+    else:
+        parts.append("<p>(empty)</p>")
+    parts.append(
+        '<form method="post" action="/panel/controls/ignore">'
+        '<input type="hidden" name="action" value="add">'
+        'Add host/IP: <input type="text" name="host" placeholder="203.0.113.5">'
+        f'{csrf_field(token)} <button type="submit">Add</button>'
+        "</form>"
+        "<p><em>Host/IP only -- a nick isn't accepted here since resolving one needs live "
+        "IRC state this page can't safely touch. Use <code>shildignore</code> on IRC for a "
+        "nick.</em></p>"
+    )
+
+    parts.append("<h2>Channels</h2>")
+    ch = sorted(channels)
+    if ch:
+        items = "".join(
+            '<li><a href="/panel/controls/channel/%s/%s">%s / %s</a></li>' % (
+                urllib.parse.quote(network, safe=""), urllib.parse.quote(channel, safe=""),
+                escape(network), escape(channel),
+            )
+            for network, channel in ch
+        )
+        parts.append(f"<ul>{items}</ul>")
+    else:
+        parts.append("<p>No channels warmed up yet -- check back shortly.</p>")
+
+    parts.append('<p><a href="/panel/controls/terms">manage SpamGuard terms</a></p>')
+    return "".join(parts)
+
+
+def controls_channel(
+    network: str,
+    channel: str,
+    rows: Iterable[Tuple[str, str, str, bool, bool]],
+    token: str,
+    flash_html: str,
+    write_enabled: bool,
+) -> str:
+    """rows: (key, label, help_text, current_value, ready) tuples, in
+    controls.CHANNEL_TOGGLES order. `ready` mirrors
+    controls.channel_nodes_ready -- an unready toggle shows a disabled
+    note instead of a form, since a write would be refused anyway.
+
+    `write_enabled` (2026-08-24 fix, found via code review): matches
+    controls_overview's own early-return -- without this, a viewer with
+    writeEnabled=False still saw full per-channel toggle state AND live-
+    looking forms with valid CSRF tokens here, inconsistent with the
+    overview page's "hide it all" behavior for the exact same setting.
+    The underlying write was ALWAYS safely blocked server-side regardless
+    (_dispatch_post checks writeEnabled first, before any route), so this
+    was a UX/consistency bug, not a security hole -- fixed anyway, since
+    a form that always 403s on submit is a real, confusing dead end."""
+    if not write_enabled:
+        return (
+            flash_html
+            + "<p>Writing from the panel is currently disabled "
+              "(<code>plugins.WebPanel.writeEnabled</code> is False).</p>"
+        )
+    body_rows = []
+    for key, label, help_text, current, ready in rows:
+        if not ready:
+            body_rows.append(
+                f"<tr><td>{escape(label)}</td><td colspan=\"2\">"
+                "(not warmed up yet -- check back shortly)</td></tr>"
+            )
+            continue
+        state_class = "state-on" if current else "state-off"
+        state_label = "on" if current else "off"
+        target = not current
+        form = (
+            '<form class="inline-form" method="post" '
+            f'action="/panel/controls/channel/{urllib.parse.quote(network, safe="")}/'
+            f'{urllib.parse.quote(channel, safe="")}">'
+            f'<input type="hidden" name="key" value="{escape(key)}">'
+            f'<input type="hidden" name="value" value="{"true" if target else "false"}">'
+            f"{csrf_field(token)}"
+            f'<button type="submit">Turn {"on" if target else "off"}</button>'
+            "</form>"
+        )
+        body_rows.append(
+            f'<tr class="toggle-row"><td>{escape(label)}'
+            f'<br><span class="cmd-help">{escape(help_text)}</span></td>'
+            f'<td class="{state_class}">{state_label}</td><td>{form}</td></tr>'
+        )
+    return (
+        flash_html
+        + f"<p>{escape(network)} / {escape(channel)} -- "
+          '<a href="/panel/controls">back to controls</a></p>'
+        + f"<table>{''.join(body_rows)}</table>"
+    )
+
+
+def controls_terms(
+    add_categories: Iterable[str],
+    terms: Iterable[Tuple[int, str, str, str, float]],
+    token: str,
+    flash_html: str,
+    write_enabled: bool,
+) -> str:
+    """terms: (id, category, text, added_by, added_at) tuples across ALL
+    of TermStore's 8 storage categories (see terms.CATEGORIES) --
+    `add_categories` (the 6 IRC-facing ones) is only for the add form's
+    <select>; removal is always by id, unambiguous across all 8.
+
+    `write_enabled` (2026-08-24 fix, found via code review) -- same
+    consistency fix as controls_channel's own write_enabled param above;
+    see its docstring for the full reasoning."""
+    if not write_enabled:
+        return (
+            flash_html
+            + "<p>Writing from the panel is currently disabled "
+              "(<code>plugins.WebPanel.writeEnabled</code> is False).</p>"
+        )
+    terms = sorted(terms, key=lambda t: t[0])
+    parts = [flash_html]
+    parts.append(
+        '<form method="post" action="/panel/controls/terms/add">'
+        "Category: "
+        '<select name="category">'
+        + "".join(f'<option value="{escape(c)}">{escape(c)}</option>' for c in add_categories)
+        + "</select> "
+        'Text: <input type="text" name="text" size="40">'
+        f'{csrf_field(token)} <button type="submit">Add</button>'
+        "</form>"
+    )
+    if not terms:
+        parts.append("<p>No terms yet.</p>")
+        return "".join(parts)
+    rows = []
+    for term_id, category, text, added_by, added_at in terms:
+        when = (
+            datetime.datetime.fromtimestamp(added_at).strftime("%Y-%m-%d %H:%M")
+            if added_at else "?"
+        )
+        remove_form = (
+            '<form class="inline-form" method="post" action="/panel/controls/terms/remove">'
+            f'<input type="hidden" name="term_id" value="{term_id}">'
+            f"{csrf_field(token)}"
+            '<button type="submit">Remove</button></form>'
+        )
+        rows.append(
+            "<tr><td>%d</td><td>%s</td><td><code>%s</code></td><td>%s</td>"
+            "<td>%s</td><td>%s</td></tr>" % (
+                term_id, escape(category), escape(text), escape(added_by),
+                escape(when), remove_form,
+            )
+        )
+    parts.append(
+        "<table><tr><th>id</th><th>category</th><th>text</th><th>added by</th>"
+        "<th>added</th><th></th></tr>" + "".join(rows) + "</table>"
+    )
+    return "".join(parts)

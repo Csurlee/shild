@@ -188,6 +188,17 @@ class Shild(callbacks.Plugin):
         # change -- it previously and incorrectly claimed no lock was
         # needed here).
         self._stats_lock = threading.Lock()
+        # ignoreList (a plain registry.SpaceSeparatedListOfStrings, read-
+        # modify-write with no locking of its own) was, before the
+        # WebPanel write-support feature (2026-08-24), only ever touched
+        # from the main IRC thread (shildignore/shildunignore). It's now
+        # ALSO reachable from the HTTP server thread (web_add_ignore/
+        # web_remove_ignore below) -- a genuine lost-update race between
+        # two concurrent readers-then-writers (either thread pair, or two
+        # overlapping HTTP requests) without this lock: both could read
+        # the same starting list, then each write back a version missing
+        # the other's change. Found via a post-ship code review.
+        self._ignore_list_lock = threading.Lock()
         self._ollama_latencies_ms: list[float] = []  # bounded ring for p50/p99 in !shildstatus
         self._started_at = time.time()
 
@@ -1575,11 +1586,20 @@ class Shild(callbacks.Plugin):
             irc.error(f"No known nick and doesn't look like a host/IP: {target}")
             return
         host = resolved[2]
-        if self._is_ignored(host):
+        # Locked (2026-08-24, found via code review): ignoreList is now
+        # also reachable from the HTTP thread (web_add_ignore/
+        # web_remove_ignore below) -- see self._ignore_list_lock's own
+        # comment in __init__ for the lost-update race this closes.
+        with self._ignore_list_lock:
+            if self._is_ignored(host):
+                already = True
+            else:
+                already = False
+                hosts = self.registryValue("ignoreList")
+                self.setRegistryValue("ignoreList", sorted(hosts + [host]))
+        if already:
             irc.reply(f"{host} is already on the ignore list.")
             return
-        hosts = self.registryValue("ignoreList")
-        self.setRegistryValue("ignoreList", sorted(hosts + [host]))
         irc.replySuccess(f"{host} added to the ignore list.")
     shildignore = wrap(shildignore, ["owner", "somethingWithoutSpaces"])
 
@@ -1593,18 +1613,22 @@ class Shild(callbacks.Plugin):
         nick the same way !shildignore/!shildcheck do, in case it no
         longer resolves to the same host it was added under.
         """
-        hosts = self.registryValue("ignoreList")
-        matched = [h for h in hosts if h.lower() == target.lower()]
-        if not matched:
-            resolved = self._resolve_check_target(irc, target)
-            if resolved is not None:
-                host = resolved[2]
-                matched = [h for h in hosts if h.lower() == host.lower()]
+        # Locked (2026-08-24) -- see shildignore's own comment above /
+        # self._ignore_list_lock's comment in __init__.
+        with self._ignore_list_lock:
+            hosts = self.registryValue("ignoreList")
+            matched = [h for h in hosts if h.lower() == target.lower()]
+            if not matched:
+                resolved = self._resolve_check_target(irc, target)
+                if resolved is not None:
+                    host = resolved[2]
+                    matched = [h for h in hosts if h.lower() == host.lower()]
+            if matched:
+                remaining = [h for h in hosts if h not in matched]
+                self.setRegistryValue("ignoreList", sorted(remaining))
         if not matched:
             irc.error(f"{target} is not on the ignore list.")
             return
-        remaining = [h for h in hosts if h not in matched]
-        self.setRegistryValue("ignoreList", sorted(remaining))
         irc.replySuccess()
     shildunignore = wrap(shildunignore, ["owner", "somethingWithoutSpaces"])
 
@@ -1616,6 +1640,52 @@ class Shild(callbacks.Plugin):
         hosts = self.registryValue("ignoreList")
         irc.reply("ignored hosts: " + (" ".join(sorted(hosts)) if hosts else "(none)"))
     shildlistignore = wrap(shildlistignore, ["owner"])
+
+    # ---- WebPanel write-route entry points (2026-08-24) ----
+    #
+    # Called by plugins/WebPanel/http.py's _post_ignore via
+    # irc.getCallback("Shild") -- never a Python import, this project's
+    # standing cross-plugin discipline (see UndernetX's enforcement.py
+    # docstring for the original reasoning). Both methods return
+    # (ok: bool, flash_code: str) rather than replying directly --
+    # flash_code is ALWAYS a valid plugins/WebPanel/controls.FLASH key
+    # (a success code when ok, an error code when not), which the caller
+    # renders into the redirect's flash banner.
+
+    def web_add_ignore(self, host: str):
+        """Deliberately does NOT call _resolve_check_target -- that
+        touches live irc.state (ContextStore.identity_for_nick is safe,
+        but irc.state.nickToHostmask is not), which plugins/WebPanel/
+        http.py's write routes must never do since they run on the HTTP
+        server thread, not the main IRC thread (see
+        plugins/WebPanel/controls.py's module docstring for the general
+        reasoning). Validates host-shape itself instead -- the same
+        "contains '.' or ':'" heuristic _resolve_check_target's own step
+        3 already uses -- and rejects anything nick-shaped outright,
+        pointing at the IRC-only !shildignore for that case (which keeps
+        its full nick-resolution behavior, unchanged)."""
+        host = (host or "").strip()
+        if not host or not ("." in host or ":" in host):
+            return False, "ignore_needs_host"
+        # Locked -- see self._ignore_list_lock's own comment in __init__
+        # for the lost-update race this closes (this method runs on the
+        # HTTP thread; shildignore/shildunignore run on the main thread).
+        with self._ignore_list_lock:
+            if not self._is_ignored(host):
+                hosts = self.registryValue("ignoreList")
+                self.setRegistryValue("ignoreList", sorted(hosts + [host]))
+        return True, "ignore_added"  # already-present is still success, same as shildignore's own reply
+
+    def web_remove_ignore(self, host: str):
+        host = (host or "").strip()
+        with self._ignore_list_lock:
+            hosts = self.registryValue("ignoreList")
+            matched = [h for h in hosts if h.lower() == host.lower()]
+            if not matched:
+                return False, "ignore_not_found"
+            remaining = [h for h in hosts if h not in matched]
+            self.setRegistryValue("ignoreList", sorted(remaining))
+        return True, "ignore_removed"
 
 
 Class = Shild

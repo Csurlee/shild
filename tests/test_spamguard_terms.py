@@ -2,6 +2,7 @@
 no plugin test harness needed.
 """
 import json
+import threading
 
 from plugins.SpamGuard.terms import TermStore
 
@@ -139,3 +140,89 @@ def test_missing_next_id_still_falls_back_to_max_plus_one(tmp_path):
     store = TermStore(path)
     added = store.add("word", "new")
     assert added.id == 8
+
+
+def test_concurrent_add_never_duplicates_or_loses_ids(tmp_path):
+    """Regression, 2026-08-24 (WebPanel write-support work): add() used
+    to be an unguarded read-modify-write on self._next_id -- fine when
+    only the main IRC thread ever called it, but WebPanel's new POST
+    routes write this same store from the HTTP server thread. 8 threads
+    x 200 adds each; every id handed out must be unique, and the final
+    persisted file must contain exactly that many terms (proves no add
+    was silently lost to a torn/overlapping save either)."""
+    store = TermStore(tmp_path / "terms.json")
+    ids: list[int] = []
+    lock = threading.Lock()
+
+    def worker(n):
+        for i in range(200):
+            t = store.add("word", f"term-{n}-{i}")
+            with lock:
+                ids.append(t.id)
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(ids) == len(set(ids)) == 1600
+    assert len(store.all()) == 1600
+
+
+def test_concurrent_remove_by_text_does_not_double_remove(tmp_path):
+    """Regression, 2026-08-24: remove_by_text() used to be a separate
+    find_by_text() + remove(id) pair -- a genuine check-then-act race
+    between two concurrent callers racing to remove the SAME term. Now
+    one atomic find-then-remove under a single lock acquisition. Many
+    threads race to remove the one term; exactly one must report success."""
+    store = TermStore(tmp_path / "terms.json")
+    store.add("word", "Czura")
+    results: list = []
+    lock = threading.Lock()
+
+    def worker():
+        got = store.remove_by_text("word", "Czura")
+        with lock:
+            results.append(got)
+
+    threads = [threading.Thread(target=worker) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    successes = [r for r in results if r is not None]
+    assert len(successes) == 1
+    assert store.all() == []
+
+
+def test_save_is_atomic_temp_file_then_replace(tmp_path):
+    """Regression, 2026-08-24: _save() used to be a bare write_text(),
+    so a crash mid-write (or a concurrent reader) could see a truncated
+    file -- which _load()'s fail-closed-on-JSONDecodeError path turns
+    into a silently EMPTIED block list. Confirms no stray .tmp file is
+    left behind after a normal save (proves replace() actually ran, not
+    just that the write didn't crash)."""
+    path = tmp_path / "terms.json"
+    store = TermStore(path)
+    store.add("word", "Czura")
+    assert path.exists()
+    assert not path.with_suffix(".tmp").exists()
+    # And the file is genuinely valid JSON, not a partial write.
+    raw = json.loads(path.read_text())
+    assert raw["terms"][0]["text"] == "Czura"
+
+
+def test_truncated_file_still_fails_closed_to_empty_not_crash(tmp_path):
+    """A truncated/partial JSON file (the exact failure mode the atomic
+    save above is meant to prevent from ever being PRODUCED by this
+    store itself) must still be handled the same fail-safe way as any
+    other corrupt file -- this is the regression anchor proving the
+    atomic-save fix didn't change _load()'s own fail-closed contract."""
+    path = tmp_path / "terms.json"
+    path.write_text('{"next_id": 3, "terms": [{"id": 1, "category":')  # cut off mid-write
+    store = TermStore(path)
+    assert store.all() == []
+    t = store.add("word", "x")
+    assert t.id == 1

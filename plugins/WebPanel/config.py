@@ -1,7 +1,9 @@
-"""Config registry for WebPanel -- a read-only, LAN-only, authenticated
-web dashboard for shild-py. See plugin.py's module docstring for the
-phase-1 read-only boundary this deliberately does not cross (no settings
-routes, no POST handlers that change anything).
+"""Config registry for WebPanel -- a LAN-only, authenticated web
+dashboard for shild-py. See plugin.py's module docstring for the full
+read/write boundary -- most of the panel is still read-only, but
+`writeEnabled` (below) arms a small, explicitly allowlisted set of write
+routes under /panel/controls/ (see controls.py's own module docstring
+for exactly what that allowlist covers).
 
 Nothing registered here is a credential. The panel's username/password
 hash live in runtime/secrets.json (see secrets.py), specifically so an
@@ -288,4 +290,64 @@ conf.registerGlobalValue(
         elapsed. Runs on Limnoria's main thread (cheap: a directory
         listing plus small JSON read/write, not the request path), only
         while the panel itself is enabled.""")),
+)
+
+# ---------------------------------------------------------------------
+# Controls (write surface, 2026-08-24): kill switches, per-channel
+# toggles, SpamGuard terms, Shild's ignore list. See
+# plugins/WebPanel/controls.py's module docstring for the allowlist this
+# is scoped to, and CLAUDE.md's WebPanel section for the full design
+# (CSRF, Origin/Referer check, the registry-node-creation-race the
+# peek/warm split exists to avoid).
+# ---------------------------------------------------------------------
+
+conf.registerGlobalValue(
+    WebPanel, "writeEnabled",
+    registry.Boolean(False, _(
+        """Master arm switch for every POST route under /panel/controls/.
+        False by default -- ships fully wired but completely dead until
+        deliberately turned on, same convention as
+        plugins.Shild.protection.killSwitch. Checked FIRST in doPost,
+        before even the Host/auth gate, so a disabled panel is a hard
+        wall regardless of anything else.""")),
+)
+
+conf.registerGlobalValue(
+    WebPanel, "csrfTokenTtlSecs",
+    registry.PositiveInteger(1800, _(
+        """Rounding bucket (seconds) for the CSRF token embedded in every
+        controls form -- see csrf.py's TokenSigner. A token remains valid
+        for between csrfTokenTtlSecs and 2x csrfTokenTtlSecs after being
+        rendered (the current-plus-previous-bucket tolerance), so an
+        admin who leaves a form open for a while doesn't hit a confusing
+        expiry the moment they submit it. Only read at plugin
+        load/reload -- a @reload WebPanel invalidates every currently
+        open form, since the signing key itself is also regenerated
+        then (see http.py's __init__).""")),
+)
+
+conf.registerGlobalValue(
+    WebPanel, "controlsWarmIntervalSecs",
+    registry.PositiveInteger(60, _(
+        """How often (seconds) the main-thread "warm" pass runs, which
+        pre-creates the registry nodes every per-channel toggle write
+        needs (see controls.py's own docstring for exactly why this must
+        happen on the main IRC thread, never the HTTP thread) and
+        refreshes the channel picker shown on /panel/controls. Runs with
+        now=True at plugin load, so the first controls page load after a
+        restart doesn't have to wait a full interval.""")),
+)
+
+conf.registerGlobalValue(
+    WebPanel, "auditPath",
+    registry.String("data/webpanel_actions.jsonl", _(
+        """Where every successful write action (kill switch flip,
+        ignore-list change, term add/remove, channel toggle) is recorded
+        -- who, what, when, from which client IP. Resolved relative to
+        the bot's own working directory (runtime/), so this must stay a
+        bare path (no "runtime/" prefix -- see the budgetPath/
+        secretsPath docstrings elsewhere in this codebase for the
+        double-"runtime/" bug this exact mistake caused before). Log
+        only -- no IRC relay line for these actions, by explicit design
+        choice.""")),
 )

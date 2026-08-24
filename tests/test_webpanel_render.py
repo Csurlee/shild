@@ -5,6 +5,7 @@ characters -- which show up in normal chat constantly -- never break a
 formatter the way httpserver.py's own %-substitution templates would.
 """
 from plugins.WebPanel import render
+from plugins.WebPanel.controls import CHANNEL_TOGGLES, GLOBAL_SWITCHES
 
 
 def test_escape_handles_script_tag():
@@ -290,3 +291,167 @@ def test_activity_heatmap_short_grid_does_not_crash():
     # of any more than aggregate_block does for its own inputs.
     html = render.activity_heatmap([[1, 2, 3]])
     assert "heat-" in html
+
+
+# --- Controls (write surface, 2026-08-24) -----------------------------------
+
+
+def test_csrf_field_escapes():
+    html = render.csrf_field('"><script>alert(1)</script>')
+    assert "<script>" not in html
+    assert 'name="csrf"' in html
+
+
+def test_flash_banner_ok_and_err_classes():
+    assert 'class="flash-ok"' in render.flash_banner("ok", "done")
+    assert 'class="flash-err"' in render.flash_banner("err", "bad")
+    # An unrecognized level falls toward the more visible ("err") styling.
+    assert 'class="flash-err"' in render.flash_banner("weird", "?")
+
+
+def test_flash_banner_escapes_attacker_controlled_message():
+    html = render.flash_banner("ok", '<script>alert(1)</script>')
+    assert "<script>" not in html
+
+
+def test_controls_unavailable_names_the_plugin():
+    html = render.controls_unavailable("SpamGuard")
+    assert "SpamGuard" in html
+
+
+def test_controls_overview_shows_disabled_notice_when_write_disabled():
+    switches = [(s, None, False) for s in GLOBAL_SWITCHES]
+    html = render.controls_overview(switches, [], [], "tok", "", write_enabled=False)
+    assert "disabled" in html
+    assert "<form" not in html  # no write forms rendered at all when disabled
+
+
+def test_controls_overview_two_kill_switch_sections_are_structurally_separate():
+    # Regression, load-bearing for the polarity design decision: the two
+    # kill switches (True=safe) and the X-fallback switch (True=armed)
+    # must render under two SEPARATE <h2> sections, never one shared
+    # "toggle" table -- an admin must never be able to confuse the two
+    # polarities from the page layout alone.
+    switches = [(s, False, True) for s in GLOBAL_SWITCHES]
+    html = render.controls_overview(switches, [], [], "tok", "", write_enabled=True)
+    kill_idx = html.index("Kill switches")
+    arm_idx = html.index("Arm switches")
+    assert kill_idx != -1 and arm_idx != -1
+    # Everything about the True=safe switches appears before the "Arm
+    # switches" heading, and vice versa -- i.e. genuinely two blocks,
+    # not one table with a stray heading string somewhere in it.
+    safe_switches = [s for s in GLOBAL_SWITCHES if not s.true_means_armed]
+    armed_switches = [s for s in GLOBAL_SWITCHES if s.true_means_armed]
+    for s in safe_switches:
+        assert kill_idx < html.index(s.label) < arm_idx
+    for s in armed_switches:
+        assert html.index(s.label) > arm_idx
+
+
+def test_controls_overview_dangerous_direction_requires_confirm_checkbox():
+    # The killSwitch's dangerous direction is disarming it (target=False);
+    # the button offered when current=True (safe) must carry the
+    # required confirmation checkbox.
+    switch = next(s for s in GLOBAL_SWITCHES if s.key == "shild_kill_switch")
+    html = render.controls_overview(
+        [(switch, True, True)], [], [], "tok", "", write_enabled=True)
+    assert 'name="confirm"' in html
+    assert "required" in html
+
+
+def test_controls_overview_safe_direction_has_no_confirm_checkbox():
+    switch = next(s for s in GLOBAL_SWITCHES if s.key == "shild_kill_switch")
+    # current=False (armed) -> the offered button re-engages the switch,
+    # which is the SAFE direction and needs no confirmation.
+    html = render.controls_overview(
+        [(switch, False, True)], [], [], "tok", "", write_enabled=True)
+    assert 'name="confirm"' not in html
+
+
+def test_controls_overview_escapes_ignore_hosts_and_channel_names():
+    html = render.controls_overview(
+        [(s, False, True) for s in GLOBAL_SWITCHES],
+        ["<script>alert(1)</script>"],
+        [("libera", "<script>#evil</script>")],
+        "tok", "", write_enabled=True,
+    )
+    assert "<script>" not in html
+
+
+def test_controls_overview_not_loaded_plugin_shows_note_not_error():
+    switches = [(s, None, False) for s in GLOBAL_SWITCHES]
+    html = render.controls_overview(switches, [], [], "tok", "", write_enabled=True)
+    assert "not loaded" in html
+
+
+def test_controls_channel_escapes_network_channel_host_and_labels():
+    toggle = CHANNEL_TOGGLES[0]
+    rows = [(toggle.key, toggle.label, toggle.help, True, True)]
+    html = render.controls_channel(
+        "<script>net</script>", "<script>#chan</script>", rows, "tok", "",
+        write_enabled=True)
+    assert "<script>" not in html
+
+
+def test_controls_channel_unready_toggle_has_no_form():
+    toggle = CHANNEL_TOGGLES[0]
+    rows = [(toggle.key, toggle.label, toggle.help, False, False)]
+    html = render.controls_channel("libera", "#windrop", rows, "tok", "", write_enabled=True)
+    assert "not warmed up" in html
+    assert "<form" not in html
+
+
+def test_controls_channel_shows_disabled_notice_when_write_disabled():
+    """Regression, 2026-08-24 (found via a post-ship code review):
+    controls_channel used to have NO write_enabled parameter at all --
+    the page rendered real toggle state and live, working-looking forms
+    (valid CSRF tokens included) even when plugins.WebPanel.writeEnabled
+    was False, inconsistent with controls_overview's own behavior for the
+    exact same setting. The underlying write was always safely blocked
+    server-side regardless (http.py's _dispatch_post checks writeEnabled
+    first), so this was a UX/consistency bug, not a security hole."""
+    toggle = CHANNEL_TOGGLES[0]
+    rows = [(toggle.key, toggle.label, toggle.help, True, True)]
+    html = render.controls_channel(
+        "libera", "#windrop", rows, "tok", "", write_enabled=False)
+    assert "disabled" in html
+    assert "<form" not in html
+    assert toggle.label not in html  # no toggle state leaked while disabled
+
+
+def test_controls_terms_escapes_term_text_and_added_by():
+    html = render.controls_terms(
+        ["word", "ident"],
+        [(1, "word", "<script>alert(1)</script>", "<b>admin</b>", 0.0)],
+        "tok", "", write_enabled=True,
+    )
+    assert "<script>" not in html
+    assert "<b>admin</b>" not in html
+
+
+def test_controls_terms_empty_shows_placeholder():
+    html = render.controls_terms(["word"], [], "tok", "", write_enabled=True)
+    assert "No terms yet" in html
+
+
+def test_controls_terms_shows_disabled_notice_when_write_disabled():
+    """Same regression/fix as test_controls_channel_shows_disabled_notice_
+    when_write_disabled above, for controls_terms."""
+    html = render.controls_terms(
+        ["word"], [(1, "word", "SecretTermText", "a", 0.0)], "tok", "",
+        write_enabled=False)
+    assert "disabled" in html
+    assert "<form" not in html
+    assert "SecretTermText" not in html  # no term data leaked while disabled
+
+
+def test_no_script_tag_is_ever_emitted_from_controls_pages():
+    switches = [(s, False, True) for s in GLOBAL_SWITCHES]
+    toggle_rows = [(t.key, t.label, t.help, False, True) for t in CHANNEL_TOGGLES]
+    overview = render.controls_overview(switches, ["1.2.3.4"], [("libera", "#w")],
+                                         "tok", "", write_enabled=True)
+    channel = render.controls_channel("libera", "#w", toggle_rows, "tok", "", write_enabled=True)
+    terms = render.controls_terms(["word"], [(1, "word", "x", "a", 0.0)], "tok", "",
+                                   write_enabled=True)
+    for html in (overview, channel, terms):
+        assert "<script" not in html.lower()

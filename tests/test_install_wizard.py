@@ -152,6 +152,7 @@ def test_webpanel_password_is_hashed_not_stored_plaintext():
         "y",                    # WebPanel on
         "127.0.0.1", "8080",    # bind, port
         "admin", "supersecret", # webpanel user, password
+        "n",                    # writeEnabled off (keep the panel read-only)
         "n", "n", "n",          # GitHubWatch off, Weather off, UndernetX off
         "n",                    # advanced?
     ]

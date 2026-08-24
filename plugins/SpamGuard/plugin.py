@@ -136,6 +136,7 @@ else (see that module's docstring).
 """
 from __future__ import annotations
 
+import itertools
 import time
 from pathlib import Path
 from typing import Optional
@@ -159,6 +160,44 @@ from . import terms as termstore
 _MAX_LINE = 400
 
 _CATEGORIES = ("word", "ident", "nick", "realname", "pattern", "black")
+
+# 2026-08-24 (WebPanel write-support): a monotonic counter feeding
+# unique schedule.addEvent names for the fire-and-forget "black" sweep
+# below -- schedule.py's own `assert name not in self.events` is OUTSIDE
+# its internal lock (confirmed by reading schedule.py directly), so two
+# near-simultaneous web-originated "black add"s could otherwise race on
+# a name collision. A plain module-level itertools.count() is fine here
+# (no lock needed) -- the GIL makes a single next() call atomic, and a
+# stale/skipped counter value from a genuine race would only ever cost
+# an extremely rare, harmless "name already used, this one sweep silently
+# skipped" outcome (caught defensively below anyway), never a crash.
+_web_sweep_event_counter = itertools.count()
+
+
+def _run_scheduled_black_sweep(term_id: int) -> None:
+    """The ACTUAL scheduled callback, run on Limnoria's main IRC thread
+    by schedule.py's own driver -- never call this directly. Re-resolves
+    a LIVE SpamGuard callback and re-looks-up the term by id at fire
+    time, deliberately NOT closing over a `self`/term reference captured
+    back when the HTTP thread scheduled this (sweep_black_term_by_id
+    below): a @reload SpamGuard between the POST and this firing would
+    otherwise sweep using a dead instance (same "never cache" rule
+    plugins/WebPanel/plugin.py's shild_callback()/spamguard_callback()
+    already document), and the term itself may have been removed again
+    in the meantime -- both cases are a silent, harmless no-op here,
+    not an error."""
+    cb = None
+    for irc in world.ircs:
+        cb = irc.getCallback("SpamGuard")
+        if cb is not None:
+            break
+    if cb is None:
+        return
+    term = cb._terms.get(term_id)
+    if term is None or term.category != "black":
+        return
+    cb._rebuild_matchers()
+    cb._sweep_black_term(term)
 
 # 2026-08-14: fixed pseudo-ids for the four message heuristics below --
 # these aren't TermStore entries (no user-managed text to add/remove, just
@@ -1403,6 +1442,67 @@ class SpamGuard(callbacks.Plugin):
         irc.reply(reply)
     spamguardclonescan = wrap(spamguardclonescan, ["owner", additional("channel")])
 
+    @staticmethod
+    def _store_category(category: str, term_text: str) -> str:
+        """Maps one of the 6 IRC-facing categories to the actual
+        terms.CATEGORIES storage category -- word/realname auto-split
+        into phrase/realname_phrase the moment the text contains a
+        space. Shared by the IRC command and the web write route
+        (2026-08-24 extraction) so the two can never classify the same
+        input differently."""
+        if category == "pattern":
+            return "pattern"
+        if category == "ident":
+            return "ident"
+        if category == "nick":
+            return "nick"
+        if category == "black":
+            return "black"
+        if category == "realname":
+            return "realname_phrase" if " " in term_text else "realname_word"
+        return "phrase" if " " in term_text else "word"  # word
+
+    def _apply_term_add(self, category: str, term_text: str, added_by: str):
+        """The full add-one-term logic (validation, dedupe, store,
+        black's own immediate sweep) -- extracted 2026-08-24 so the IRC
+        `spamguard` command and the new web write route
+        (web_add_term below) share exactly one implementation. Returns
+        one of:
+          ("rejected", reason_str, None)   -- invalid regex / ReDoS shape
+          ("duplicate", existing_term, None)
+          ("added", new_term, sweep_hits_or_None)
+        Caller is responsible for calling self._rebuild_matchers() once
+        more after this returns (mirrors the original code's own
+        "rebuild after the whole batch" behavior) -- NOT done here
+        unconditionally, only right before a black-category sweep so the
+        sweep itself sees the freshly-added term.
+        """
+        store_category = self._store_category(category, term_text)
+        if store_category == "pattern":
+            if matcher.compile_term(term_text, is_pattern=True) is None:
+                return "rejected", "invalid regex", None
+            # 2026-08-24 fix (found via code review): pattern terms run
+            # synchronously on this plugin's single, unthreaded main
+            # loop (threaded=False) for every message -- a catastrophic-
+            # backtracking pattern would hang the whole bot. Best-effort
+            # heuristic, not exhaustive -- see matcher.py's own comment.
+            if matcher.looks_catastrophically_backtracking(term_text):
+                return (
+                    "rejected",
+                    "looks like it could cause catastrophic regex "
+                    "backtracking (nested quantifier), refusing to add",
+                    None,
+                )
+        existing = self._terms.find_by_text(store_category, term_text)
+        if existing is not None:
+            return "duplicate", existing, None
+        added = self._terms.add(store_category, term_text, added_by=added_by)
+        sweep_hits = None
+        if store_category == "black":
+            self._rebuild_matchers()  # so the sweep below uses the new term
+            sweep_hits = self._sweep_black_term(added)
+        return "added", added, sweep_hits
+
     def spamguard(self, irc, msg, args, category, action, terms):
         """<word|ident|nick|realname|pattern|black> <add|remove> <term> [...]
 
@@ -1420,49 +1520,20 @@ class SpamGuard(callbacks.Plugin):
         added_by = msg.prefix
         results = []
         for term_text in terms:
-            if category == "pattern":
-                store_category = "pattern"
-            elif category == "ident":
-                store_category = "ident"
-            elif category == "nick":
-                store_category = "nick"
-            elif category == "black":
-                store_category = "black"
-            elif category == "realname":
-                store_category = "realname_phrase" if " " in term_text else "realname_word"
-            else:  # word
-                store_category = "phrase" if " " in term_text else "word"
-
             if action == "add":
-                if store_category == "pattern":
-                    if matcher.compile_term(term_text, is_pattern=True) is None:
-                        results.append(f"{term_text!r}: invalid regex, skipped")
-                        continue
-                    # 2026-08-24 fix (found via code review): pattern
-                    # terms run synchronously on this plugin's single,
-                    # unthreaded main loop (threaded=False) for every
-                    # message -- a catastrophic-backtracking pattern
-                    # would hang the whole bot. Best-effort heuristic,
-                    # not exhaustive -- see matcher.py's own comment.
-                    if matcher.looks_catastrophically_backtracking(term_text):
-                        results.append(
-                            f"{term_text!r}: looks like it could cause "
-                            "catastrophic regex backtracking (nested "
-                            "quantifier), refusing to add"
-                        )
-                        continue
-                existing = self._terms.find_by_text(store_category, term_text)
-                if existing is not None:
-                    results.append(f"{term_text!r}: already present [id:{existing.id}]")
-                    continue
-                added = self._terms.add(store_category, term_text, added_by=added_by)
-                results.append(f"{term_text!r}: added [id:{added.id}]")
-                if store_category == "black":
-                    self._rebuild_matchers()  # so the sweep below uses the new term
-                    hits = self._sweep_black_term(added)
-                    if hits:
-                        results[-1] += f" -- kbanned {hits} already-present match(es)"
+                outcome, payload, sweep_hits = self._apply_term_add(
+                    category, term_text, added_by)
+                if outcome == "rejected":
+                    results.append(f"{term_text!r}: {payload}, skipped")
+                elif outcome == "duplicate":
+                    results.append(f"{term_text!r}: already present [id:{payload.id}]")
+                else:  # added
+                    line = f"{term_text!r}: added [id:{payload.id}]"
+                    if sweep_hits:
+                        line += f" -- kbanned {sweep_hits} already-present match(es)"
+                    results.append(line)
             else:  # remove
+                store_category = self._store_category(category, term_text)
                 removed = self._terms.remove_by_text(store_category, term_text)
                 results.append(
                     f"{term_text!r}: removed [id:{removed.id}]" if removed
@@ -1478,6 +1549,82 @@ class SpamGuard(callbacks.Plugin):
     spamguard = wrap(spamguard, [
         "owner", ("literal", _CATEGORIES), ("literal", ("add", "remove")), anyArgs("something"),
     ])
+
+    # ---- WebPanel write-route entry points (2026-08-24) ----
+    #
+    # Called by plugins/WebPanel/http.py's terms routes via
+    # irc.getCallback("SpamGuard") -- never a Python import, this
+    # project's standing cross-plugin discipline.
+
+    def all_terms(self):
+        """Every stored term across all 8 categories -- read-only, used
+        by /panel/controls/terms' listing. TermStore.all() is already
+        locked/thread-safe (2026-08-24) -- safe to call from the HTTP
+        thread directly."""
+        return self._terms.all()
+
+    def web_add_term(self, category: str, text: str, added_by: str):
+        """`category` must be one of the 6 IRC-facing categories (module-
+        level _CATEGORIES) -- reuses _apply_term_add so the web and IRC
+        surfaces can never classify/validate the same input differently.
+        For "black", the live-membership sweep is instead deferred to
+        sweep_black_term_by_id (fire-and-forget on the main thread) --
+        this method itself runs on the HTTP thread and _apply_term_add's
+        OWN inline sweep call would touch irc.state directly, which is
+        unsafe from here (see plugins/WebPanel/controls.py's module
+        docstring for the general reasoning). Returns (ok, flash_code) --
+        flash_code is ALWAYS a plugins/WebPanel/controls.FLASH key."""
+        if category not in _CATEGORIES:
+            return False, "invalid_input"
+        if category == "black":
+            # Bypass _apply_term_add's own inline _sweep_black_term call
+            # entirely (that call is only safe on the main IRC thread) --
+            # do the store-only half here, then schedule the sweep.
+            store_category = "black"
+            existing = self._terms.find_by_text(store_category, text)
+            if existing is not None:
+                self._rebuild_matchers()
+                return True, "term_add_duplicate"
+            added = self._terms.add(store_category, text, added_by=added_by)
+            self._rebuild_matchers()
+            self.sweep_black_term_by_id(added.id)
+            return True, "term_added"
+
+        outcome, payload, _sweep_hits = self._apply_term_add(category, text, added_by)
+        self._rebuild_matchers()
+        if outcome == "rejected":
+            return False, "invalid_input"
+        if outcome == "duplicate":
+            return True, "term_add_duplicate"
+        return True, "term_added"
+
+    def web_remove_term_by_id(self, term_id: int) -> bool:
+        removed = self._terms.remove(term_id)
+        if removed is not None:
+            self._rebuild_matchers()
+        return removed is not None
+
+    def sweep_black_term_by_id(self, term_id: int) -> None:
+        """Fire-and-forget: schedules _run_scheduled_black_sweep (module-
+        level, above) onto Limnoria's main IRC thread via
+        schedule.addEvent -- confirmed thread-safe to call from the HTTP
+        thread (supybot's own schedule.py guards its event heap with a
+        lock), though the ASSERT that catches a colliding event name is
+        NOT itself inside that lock (read directly in schedule.py) --
+        hence the unique counter-suffixed name and the defensive
+        try/except below. Does not wait for the sweep to run or report
+        its hit count; the sweep's real effect surfaces via the existing
+        [spamguard] relay line / data/spamguard_actions.jsonl."""
+        name = (
+            f"webpanelBlackSweep-{term_id}-"
+            f"{next(_web_sweep_event_counter)}-{time.time()}"
+        )
+        try:
+            schedule.addEvent(
+                lambda: _run_scheduled_black_sweep(term_id), time.time(), name=name)
+        except AssertionError:
+            log.warning("WebPanel: skipped a black-term sweep due to a colliding "
+                        "schedule event name (term id %d)", term_id)
 
 
 Class = SpamGuard

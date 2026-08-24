@@ -11,20 +11,24 @@ to exercise the real overview/scans data path.
 """
 from __future__ import annotations
 
+import html
 import io
 import json
+import re
 import tempfile
 import time
+import urllib.parse
 from pathlib import Path
 
 import numpy as np
 import supybot.conf as conf
 import supybot.httpserver as httpserver
 import supybot.ircmsgs as ircmsgs
-from supybot.test import ChannelHTTPPluginTestCase, TestRequestHandler
+from supybot.test import ChannelHTTPPluginTestCase, ChannelPluginTestCase, TestRequestHandler
 
 from shildml import artifact, features
 
+from . import controls
 from .auth import hash_password
 
 
@@ -87,26 +91,72 @@ def _basic_auth_header(username: str, password: str) -> str:
     return "Basic " + base64.b64encode(raw).decode("ascii")
 
 
-def _raw_request(method: str, url: str, headers: dict | None = None,
-                  client_address=("127.0.0.1", 12345)):
-    """supybot.test.HTTPPluginTestCase.request() has no way to attach
-    custom headers (Authorization, Host), which every meaningful WebPanel
-    test needs -- so this builds a raw HTTP/1.0 request directly and
-    drives it through TestRequestHandler, same technique the plan calls
-    for. Returns (status, body_bytes).
-    """
+def _raw(method: str, url: str, headers: dict | None = None, body: bytes = b"",
+         client_address=("127.0.0.1", 12345)):
+    """The shared core both _raw_request and _raw_post_request (below)
+    build on -- builds a raw HTTP/1.0 request directly (headers +
+    optional body) and drives it through TestRequestHandler, since
+    supybot.test.HTTPPluginTestCase.request() has no way to attach
+    custom headers (Authorization, Host) OR a body at all. Returns
+    (status, body_bytes)."""
     headers = headers or {}
     lines = [f"{method} {url} HTTP/1.0"]
     for name, value in headers.items():
         lines.append(f"{name}: {value}")
     lines.append("")
-    lines.append("")
-    raw = "\r\n".join(lines).encode("utf-8")
+    raw = ("\r\n".join(lines) + "\r\n").encode("utf-8") + body
     rfile = io.BytesIO(raw)
     wfile = io.BytesIO()
     handler = _AddressedTestRequestHandler(rfile, wfile, client_address=client_address)
     wfile.seek(0)
     return handler._response, wfile.read()
+
+
+def _raw_request(method: str, url: str, headers: dict | None = None,
+                  client_address=("127.0.0.1", 12345)):
+    """Unchanged signature and behavior (2026-08-24: now a thin wrapper
+    over the shared _raw core, extracted so _raw_post_request below can
+    reuse it) -- every pre-existing caller of this function is untouched,
+    which is itself the proof the extraction didn't change GET/HEAD
+    request behavior."""
+    return _raw(method, url, headers=headers, client_address=client_address)
+
+
+def _raw_post_request(url: str, form: "dict[str, str] | None" = None,
+                       headers: "dict | None" = None, body: "bytes | None" = None,
+                       content_type: "str | None" = "application/x-www-form-urlencoded",
+                       client_address=("127.0.0.1", 12345)):
+    """POST counterpart to _raw_request (2026-08-24) -- the original
+    helper had NO way to send a request body at all, so every
+    pre-existing POST test only ever exercised the bare-405 no-body
+    path. `form` is url-encoded automatically into the body; pass `body`
+    directly instead (with a different `content_type`, e.g.
+    "application/json") to exercise the 415-unsupported-Content-Type
+    path, or `content_type=None` to omit the header entirely (exercises
+    httpserver.py's own "no Content-Type -> assume urlencoded" default).
+    """
+    if body is None:
+        body = urllib.parse.urlencode(form or {}).encode("utf-8")
+    headers = dict(headers or {})
+    if content_type is not None:
+        headers.setdefault("Content-Type", content_type)
+    headers.setdefault("Content-Length", str(len(body)))
+    return _raw("POST", url, headers=headers, body=body, client_address=client_address)
+
+
+_CSRF_TOKEN_RE = re.compile(rb'name="csrf" value="([^"]*)"')
+
+
+def _extract_csrf_token(body: bytes) -> str:
+    """Pulls the real, rendered CSRF token out of a GET response body --
+    used by the round-trip tests that prove render.csrf_field and
+    csrf.TokenSigner.verify actually agree with each other, not just
+    individually. Un-escapes the HTML entity encoding render.escape()
+    applies (harmless for the token's own alphanumeric+dot shape today,
+    but correct regardless)."""
+    m = _CSRF_TOKEN_RE.search(body)
+    assert m is not None, f"no CSRF token found in response body: {body[:500]!r}"
+    return html.unescape(m.group(1).decode("utf-8"))
 
 
 DEFAULT_HEADERS = {"Host": "127.0.0.1:8080"}
@@ -277,12 +327,20 @@ class WebPanelHTTPTestCase(ChannelHTTPPluginTestCase):
 
     # ---- routing ----
 
-    def test_post_is_405(self):
+    def test_post_is_403_when_writing_is_disabled(self):
+        # 2026-08-24: writeEnabled defaults False (this class's config
+        # dict doesn't override it, matching a real fresh deployment) --
+        # ANY POST now gets a hard 403 before even the route is matched,
+        # not the old blanket 405 (writeEnabled is checked first, "so a
+        # disabled panel is a hard wall regardless of anything else" --
+        # see http.py's _dispatch_post docstring). See
+        # WebPanelWriteTestCase's test_unallowlisted_post_path_is_405 for
+        # the 405-when-enabled-but-unknown-route case this superseded.
         self.assertNotError("config plugins.WebPanel.enable True")
         headers = dict(DEFAULT_HEADERS,
                        Authorization=_basic_auth_header(TEST_USER, TEST_PASS))
         status, _ = _raw_request("POST", "/panel/health", headers)
-        self.assertEqual(status, 405)
+        self.assertEqual(status, 403)
 
     def test_bare_panel_redirects(self):
         self.assertNotError("config plugins.WebPanel.enable True")
@@ -717,6 +775,20 @@ class WebPanelWithShildTestCase(ChannelHTTPPluginTestCase):
         conf.supybot.plugins.WebPanel.allowedHosts.setValue(
             ["127.0.0.1:8080", "localhost:8080"])
 
+        # 2026-08-24 fix: captured and restored in tearDown below --
+        # PluginTestCase's own restore machinery only tracks this
+        # class's `config` dict, not a direct .setValue() call like
+        # these three. Left unrestored, a later test/class in the same
+        # process (including Shild's OWN test suite) could read
+        # Shild.shadowDataPath pointing at THIS test's already-deleted
+        # tmpdir -- a real, reproducible cascade of FileNotFoundErrors
+        # found while adding WebPanelWriteTestCase, which had the
+        # identical, previously-latent leak (see that class's setUp/
+        # tearDown for the fuller incident writeup).
+        self._orig_shild_model_path = conf.supybot.plugins.Shild.classifier.modelPath()
+        self._orig_shild_shadow_path = conf.supybot.plugins.Shild.shadowDataPath()
+        self._orig_shild_evidence_enabled = conf.supybot.plugins.Shild.evidence.enabled()
+
         model_path = str(Path(self._tmpdir) / "model.npz")
         _write_dummy_model(model_path, bias_toward="allow")
         conf.supybot.plugins.Shild.classifier.modelPath.setValue(model_path)
@@ -729,6 +801,11 @@ class WebPanelWithShildTestCase(ChannelHTTPPluginTestCase):
 
     def tearDown(self):
         httpserver.stopServer()
+        conf.supybot.plugins.Shild.classifier.modelPath.setValue(
+            self._orig_shild_model_path)
+        conf.supybot.plugins.Shild.shadowDataPath.setValue(self._orig_shild_shadow_path)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(
+            self._orig_shild_evidence_enabled)
         super(ChannelHTTPPluginTestCase, self).tearDown()
 
     def _auth_headers(self):
@@ -853,3 +930,397 @@ class WebPanelWithShildTestCase(ChannelHTTPPluginTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"livejoiner", body)
         self.assertNotIn(b"not loaded", body)
+
+
+class WebPanelWriteTestCase(ChannelHTTPPluginTestCase):
+    """Covers the write surface added 2026-08-24 (/panel/controls/...) --
+    the shared gate chain (writeEnabled/host/auth/Content-Type/Origin/
+    CSRF), and one real round-trip per write route (GET the page, pull
+    the actually-rendered CSRF token, POST a real change, assert the
+    underlying state genuinely changed) -- see http.py's _dispatch_post
+    docstring for the exact gate order these tests pin.
+    """
+    plugins = ("WebPanel", "Shild", "SpamGuard")
+    config = {
+        "servers.http.keepAlive": True,
+        "plugins.WebPanel.enable": False,
+        "plugins.WebPanel.writeEnabled": True,
+    }
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        secrets_path = Path(self._tmpdir) / "secrets.json"
+        secrets_path.write_text(json.dumps({
+            "web_panel_user": TEST_USER,
+            "web_panel_password_hash": hash_password(TEST_PASS, iterations=100),
+        }))
+        conf.supybot.plugins.WebPanel.secretsPath.setValue(str(secrets_path))
+        conf.supybot.plugins.WebPanel.allowedHosts.setValue(
+            ["127.0.0.1:8080", "localhost:8080"])
+
+        # 2026-08-24 fix, found via a real cross-test failure cascade:
+        # every value below is set directly via .setValue(), which
+        # PluginTestCase's own restore machinery does NOT track (only
+        # this class's `config` dict is restored automatically -- see
+        # supybot/test.py's PluginTestCase.setUp/tearDown). Left
+        # unrestored, Shild.shadowDataPath in particular kept pointing at
+        # THIS test's own tmpdir (already deleted by the time a LATER
+        # test ran) into whatever ran next in the same process -- caught
+        # as a real, reproducible cascade of FileNotFoundErrors across
+        # ~26 of Shild's OWN, otherwise-unrelated tests. Capture the
+        # pre-test value of each and restore it in tearDown, same
+        # discipline already established elsewhere in this file for
+        # ignoreList/protection.killSwitch.
+        self._orig_shild_model_path = conf.supybot.plugins.Shild.classifier.modelPath()
+        self._orig_shild_shadow_path = conf.supybot.plugins.Shild.shadowDataPath()
+        self._orig_shild_evidence_enabled = conf.supybot.plugins.Shild.evidence.enabled()
+        self._orig_spamguard_terms_path = conf.supybot.plugins.SpamGuard.termsPath()
+
+        model_path = str(Path(self._tmpdir) / "model.npz")
+        _write_dummy_model(model_path, bias_toward="allow")
+        conf.supybot.plugins.Shild.classifier.modelPath.setValue(model_path)
+        conf.supybot.plugins.Shild.shadowDataPath.setValue(
+            str(Path(self._tmpdir) / "shadow.jsonl"))
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+        conf.supybot.plugins.Shild.ignoreList.setValue([])
+
+        conf.supybot.plugins.SpamGuard.termsPath.setValue(
+            str(Path(self._tmpdir) / "terms.json"))
+
+        super(ChannelHTTPPluginTestCase, self).setUp()
+        httpserver.startServer()
+
+    def tearDown(self):
+        httpserver.stopServer()
+        # ignoreList and protection.killSwitch are GLOBAL values tests
+        # set directly via real POST writes, not through this class's
+        # `config` dict (which is all PluginTestCase's own restore
+        # machinery tracks) -- same cross-test state-leak class
+        # documented repeatedly elsewhere in this codebase (UndernetX's
+        # auth.username/.password, Shild's own ignoreList history).
+        # Caught for real, 2026-08-24: test_write_gate_chain's own
+        # CSRF/Origin round-trip disarms the killSwitch as its very last
+        # step and never re-arms it, which made test_killswitch_writes's
+        # OWN initial assertTrue(killSwitch()) fail whenever it happened
+        # to run after test_write_gate_chain in the same process.
+        conf.supybot.plugins.Shild.ignoreList.setValue([])
+        conf.supybot.plugins.Shild.protection.killSwitch.setValue(True)
+        # Restore the values captured in setUp -- see the comment there
+        # for the real incident this fixes.
+        conf.supybot.plugins.Shild.classifier.modelPath.setValue(
+            self._orig_shild_model_path)
+        conf.supybot.plugins.Shild.shadowDataPath.setValue(self._orig_shild_shadow_path)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(
+            self._orig_shild_evidence_enabled)
+        conf.supybot.plugins.SpamGuard.termsPath.setValue(self._orig_spamguard_terms_path)
+        super(ChannelHTTPPluginTestCase, self).tearDown()
+
+    def _auth_headers(self, extra=None):
+        headers = dict(DEFAULT_HEADERS,
+                        Authorization=_basic_auth_header(TEST_USER, TEST_PASS))
+        if extra:
+            headers.update(extra)
+        return headers
+
+    def _get_token(self, path: str) -> str:
+        status, body = _raw_request("GET", path, self._auth_headers())
+        self.assertEqual(status, 200)
+        return _extract_csrf_token(body)
+
+    def _post(self, path: str, form: dict, origin_ok: bool = True):
+        headers = self._auth_headers()
+        if origin_ok:
+            headers["Origin"] = "http://127.0.0.1:8080"
+        return _raw_post_request(path, form=form, headers=headers)
+
+    # ---- gate chain (consolidated into few enable() cycles -- see class
+    # docstring: this box is resource-constrained and a separate real
+    # httpserver.startServer()/stopServer() + WebPanelCallback hook/unhook
+    # per test method adds up fast across many methods) ----
+
+    def test_write_gate_chain(self):
+        """One cohesive walk through _dispatch_post's exact gate order
+        (see its own docstring): writeEnabled -> Host+auth -> Content-Type
+        duck-typing -> Origin/Referer -> route match -> (per-handler) CSRF
+        token. Each stage is independently provoked and asserted."""
+        # 1. writeEnabled False -> 403 before even Host/auth is checked
+        # (no Authorization header at all -- would 401 if checked first).
+        self.assertNotError("config plugins.WebPanel.writeEnabled False")
+        self.assertNotError("config plugins.WebPanel.enable True")
+        status, _ = _raw_request("POST", "/panel/controls/killswitch", DEFAULT_HEADERS)
+        self.assertEqual(status, 403)
+
+        self.assertNotError("config plugins.WebPanel.writeEnabled True")
+
+        # 2. No auth -> 401.
+        status, _ = _raw_request("POST", "/panel/controls/killswitch", DEFAULT_HEADERS)
+        self.assertEqual(status, 401)
+
+        # 3. Bad Host -> 400, before auth.
+        headers = {"Host": "evil.example.com",
+                   "Authorization": _basic_auth_header(TEST_USER, TEST_PASS)}
+        status, _ = _raw_request("POST", "/panel/controls/killswitch", headers)
+        self.assertEqual(status, 400)
+
+        # 4. Non-urlencoded Content-Type -> 415.
+        status, _ = _raw_post_request(
+            "/panel/controls/killswitch", body=b'{"key": "x"}',
+            content_type="application/json", headers=self._auth_headers())
+        self.assertEqual(status, 415)
+
+        # 5. Origin present but wrong -> 403.
+        status, _ = _raw_post_request(
+            "/panel/controls/killswitch", form={},
+            headers=self._auth_headers({"Origin": "http://evil.example"}))
+        self.assertEqual(status, 403)
+
+        # 6. Neither Origin nor Referer -> 403 (the load-bearing rule --
+        # NOT silently allowed through).
+        status, _ = _raw_post_request(
+            "/panel/controls/killswitch", form={}, headers=self._auth_headers())
+        self.assertEqual(status, 403)
+
+        # 7. Unknown /controls/ path, but otherwise a valid request -> 405.
+        status, _ = self._post("/panel/controls/does-not-exist", {})
+        self.assertEqual(status, 405)
+
+        # 8. Wrong CSRF token -> 303 redirect, but NOTHING actually
+        # changes (the real assertion -- not just the status code).
+        conf.supybot.plugins.Shild.protection.killSwitch.setValue(True)
+        status, _ = self._post(
+            "/panel/controls/killswitch",
+            {"key": "shild_kill_switch", "value": "false", "csrf": "garbage",
+             "confirm": "1"})
+        self.assertEqual(status, 303)
+        self.assertTrue(conf.supybot.plugins.Shild.protection.killSwitch())
+
+        # 9. Same-origin Referer (no Origin header) is accepted --
+        # Referrer-Policy is "same-origin" (2026-08-24, was "no-referrer")
+        # specifically so this works for a real browser form submission
+        # that omits Origin. Also proves a REAL token round-trips.
+        token = self._get_token("/panel/controls")
+        headers = self._auth_headers({"Referer": "http://127.0.0.1:8080/panel/controls"})
+        status, _ = _raw_post_request(
+            "/panel/controls/killswitch",
+            form={"key": "shild_kill_switch", "value": "false", "csrf": token,
+                  "confirm": "1"},
+            headers=headers)
+        self.assertEqual(status, 303)
+        self.assertFalse(conf.supybot.plugins.Shild.protection.killSwitch())
+
+    # ---- round trips: one real GET -> extract token -> POST -> assert state changed ----
+
+    def test_killswitch_writes(self):
+        self.assertNotError("config plugins.WebPanel.enable True")
+
+        # Round trip: the dangerous direction (disarm) with confirmation
+        # actually flips the value.
+        self.assertTrue(conf.supybot.plugins.Shild.protection.killSwitch())
+        token = self._get_token("/panel/controls")
+        status, _ = self._post(
+            "/panel/controls/killswitch",
+            {"key": "shild_kill_switch", "value": "false", "csrf": token,
+             "confirm": "1"})
+        self.assertEqual(status, 303)
+        self.assertFalse(conf.supybot.plugins.Shild.protection.killSwitch())
+
+        # The safe direction (re-arm) needs no confirmation.
+        token = self._get_token("/panel/controls")
+        status, _ = self._post(
+            "/panel/controls/killswitch",
+            {"key": "shild_kill_switch", "value": "true", "csrf": token})
+        self.assertEqual(status, 303)
+        self.assertTrue(conf.supybot.plugins.Shild.protection.killSwitch())
+
+        # The dangerous direction WITHOUT confirmation is refused.
+        token = self._get_token("/panel/controls")
+        status, _ = self._post(
+            "/panel/controls/killswitch",
+            {"key": "shild_kill_switch", "value": "false", "csrf": token})
+        self.assertEqual(status, 303)
+        self.assertTrue(conf.supybot.plugins.Shild.protection.killSwitch(),
+                         "killswitch must NOT have been disarmed without confirmation")
+
+    def test_ignore_list_writes(self):
+        self.assertNotError("config plugins.WebPanel.enable True")
+
+        token = self._get_token("/panel/controls")
+        status, _ = self._post(
+            "/panel/controls/ignore",
+            {"action": "add", "host": "203.0.113.5", "csrf": token})
+        self.assertEqual(status, 303)
+        self.assertIn("203.0.113.5", conf.supybot.plugins.Shild.ignoreList())
+
+        # Nick-shaped input is rejected outright -- the web form is
+        # host/IP only (see controls.py's docstring for why).
+        token = self._get_token("/panel/controls")
+        status, _ = self._post(
+            "/panel/controls/ignore",
+            {"action": "add", "host": "someNick", "csrf": token})
+        self.assertEqual(status, 303)
+        self.assertNotIn("someNick", conf.supybot.plugins.Shild.ignoreList())
+
+        token = self._get_token("/panel/controls")
+        status, _ = self._post(
+            "/panel/controls/ignore",
+            {"action": "remove", "host": "203.0.113.5", "csrf": token})
+        self.assertEqual(status, 303)
+        self.assertNotIn("203.0.113.5", conf.supybot.plugins.Shild.ignoreList())
+
+    def test_channel_toggle_writes(self):
+        self.assertNotError("config plugins.WebPanel.enable True")
+        shild = self.irc.getCallback("Shild")
+
+        # Deliberately a network/channel Shild has NEVER processed a real
+        # event for (self.channel/"test" doesn't work for this half --
+        # ChannelPluginTestCase's own setUp already made Shild's doJoin
+        # hook read `enabled` for that exact pair via registryValue(),
+        # which -- via getSpecific()'s own node-creating side effect --
+        # already warms it through completely ordinary operation, before
+        # this test's own run_controls_warm() ever runs). The write must
+        # be refused (channel_not_ready) here, never silently create a
+        # registry node from the HTTP thread.
+        fresh_path = "/panel/controls/channel/fakenet/" + urllib.parse.quote("#neverwarmed", safe="")
+        # Can't use _get_token(fresh_path) here -- since EVERY toggle is
+        # unready for a genuinely fresh channel, the rendered page has
+        # zero <form> elements and therefore no CSRF token anywhere in
+        # it (correct: there's nothing submittable on this specific page
+        # state). Mint a token directly via the real signer instead, the
+        # same way a form WOULD carry one if any toggle happened to be
+        # ready -- this keeps the assertion about channel_nodes_ready's
+        # own refusal, not about token availability.
+        cb = self.irc.getCallback("WebPanel")._callback
+        token = cb._csrf.issue("controls-channel:fakenet:#neverwarmed")
+        # Compare before/after rather than asserting a specific boolean:
+        # the GENERIC (never-channel-set) default this inherits from is
+        # itself a global value another test elsewhere in this same
+        # process may have left at False via a bare `@config
+        # plugins.Shild.enabled False` (the exact cross-test state-leak
+        # class documented repeatedly throughout this codebase) -- the
+        # actual property under test is "the write was refused", not
+        # "the value happens to be True".
+        before = shild.registryValue("enabled", "#neverwarmed", "fakenet")
+        status, _ = self._post(
+            fresh_path,
+            {"key": "shild_enabled", "value": str(not before).lower(), "csrf": token})
+        self.assertEqual(status, 303)
+        after = shild.registryValue("enabled", "#neverwarmed", "fakenet")
+        self.assertEqual(before, after,
+                          "an unwarmed channel's toggle must be left completely unchanged")
+
+        path = "/panel/controls/channel/test/" + urllib.parse.quote(self.channel, safe="")
+        cb.run_controls_warm()
+        self.assertIn(("test", self.channel), cb._controls_channels)
+
+        token = self._get_token(path)
+        status, _ = self._post(
+            path, {"key": "shild_enabled", "value": "false", "csrf": token})
+        self.assertEqual(status, 303)
+        self.assertFalse(shild.registryValue("enabled", self.channel, "test"))
+
+    def test_term_writes(self):
+        self.assertNotError("config plugins.WebPanel.enable True")
+        spamguard = self.irc.getCallback("SpamGuard")
+
+        # Round trip: add then remove a plain word term.
+        token = self._get_token("/panel/controls/terms")
+        status, _ = self._post(
+            "/panel/controls/terms/add",
+            {"category": "word", "text": "TestSpamWord", "csrf": token})
+        self.assertEqual(status, 303)
+        self.assertEqual(len(spamguard.all_terms()), 1)
+        term = spamguard.all_terms()[0]
+        self.assertEqual(term.text, "TestSpamWord")
+
+        token = self._get_token("/panel/controls/terms")
+        status, _ = self._post(
+            "/panel/controls/terms/remove",
+            {"term_id": str(term.id), "csrf": token})
+        self.assertEqual(status, 303)
+        self.assertEqual(spamguard.all_terms(), [])
+
+        # A catastrophic-backtracking pattern is refused, not stored.
+        token = self._get_token("/panel/controls/terms")
+        status, _ = self._post(
+            "/panel/controls/terms/add",
+            {"category": "pattern", "text": "(a+)+", "csrf": token})
+        self.assertEqual(status, 303)
+        self.assertEqual(spamguard.all_terms(), [])
+
+        # A "black" add responds immediately (never blocks on the sweep)
+        # and schedules the fire-and-forget main-thread sweep.
+        token = self._get_token("/panel/controls/terms")
+        status, _ = self._post(
+            "/panel/controls/terms/add",
+            {"category": "black", "text": "evilnick", "csrf": token})
+        self.assertEqual(status, 303)
+        self.assertEqual(len(spamguard.all_terms()), 1)
+        import supybot.schedule as schedule
+        self.assertTrue(
+            any(name.startswith("webpanelBlackSweep-") for name in schedule.schedule.events),
+            "expected a scheduled black-sweep event to be pending")
+
+    def test_controls_degrade_gracefully_when_spamguard_unloaded(self):
+        self.assertNotError("config plugins.WebPanel.enable True")
+        token = self._get_token("/panel/controls/terms")
+        self.assertNotError("unload SpamGuard")
+
+        status, body = _raw_request("GET", "/panel/controls/terms", self._auth_headers())
+        self.assertEqual(status, 200)
+        self.assertIn(b"isn&#x27;t loaded", body)  # render.controls_unavailable's own wording
+
+        status, _ = self._post(
+            "/panel/controls/terms/add",
+            {"category": "word", "text": "x", "csrf": token})
+        self.assertEqual(status, 303)  # never a 500 -- degrades to a flash error instead
+
+
+class WebPanelControlsAllowlistPathsTestCase(ChannelPluginTestCase):
+    """Regression, found via a post-ship code review (2026-08-24):
+    nothing previously resolved EVERY entry in controls.GLOBAL_SWITCHES/
+    CHANNEL_TOGGLES against the REAL Limnoria registry tree -- a typo'd
+    `path` tuple (e.g. a wrong attribute name) would silently never be
+    caught by any existing test, and would only surface live as an
+    unhandled NonExistentRegistryEntry the first time an admin tried to
+    toggle that specific value -- swallowed by supybot's own request
+    firewall in production (doGetOrHead has no explicit try/except of
+    its own, unlike doPost), so the failure mode would be a silent no-op
+    with no clear error, not a crash. Loads all four plugins the
+    allowlist spans (Shild/SpamGuard/UndernetX plus WebPanel itself,
+    matching the combo Shild.test.py's own ShildXFallbackTestCase
+    already uses) purely to exercise real, live-registered config trees
+    -- no HTTP requests are made in this class at all.
+    """
+    plugins = ("WebPanel", "Shild", "SpamGuard", "UndernetX")
+
+    @staticmethod
+    def _resolve(plugin_name: str, path):
+        # Deliberately mirrors http.py's WebPanelCallback._resolve_toggle_node
+        # exactly, rather than reaching into a live WebPanelCallback instance
+        # (which only exists once the panel is actually enabled/hooked) --
+        # this test only cares whether the registry PATHS themselves are
+        # real, not about exercising the HTTP layer at all.
+        group = getattr(conf.supybot.plugins, plugin_name, None)
+        if group is None:
+            return None
+        node = group
+        for part in path:
+            node = node.get(part)
+        return node
+
+    def test_every_allowlisted_path_resolves_against_the_real_registry(self):
+        for switch in controls.GLOBAL_SWITCHES:
+            node = self._resolve(switch.plugin, switch.path)
+            self.assertIsNotNone(
+                node, f"{switch.key}: plugin group {switch.plugin} not found")
+            # Must not raise, and must return a real bool -- proves every
+            # hop in `path` is a genuinely registered group/value, not a
+            # typo that `.get()`'s own supplyDefault fallback happens to
+            # swallow into something silently wrong.
+            self.assertIn(node(), (True, False), f"{switch.key}: not a real Boolean value")
+
+        for toggle in controls.CHANNEL_TOGGLES:
+            node = self._resolve(toggle.plugin, toggle.path)
+            self.assertIsNotNone(
+                node, f"{toggle.key}: plugin group {toggle.plugin} not found")
+            self.assertIn(node(), (True, False), f"{toggle.key}: not a real Boolean value")

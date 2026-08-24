@@ -1,6 +1,7 @@
-"""WebPanel: a read-only, LAN-only, authenticated web dashboard for
-shild-py -- ZNC-style overview/stats/logs/live-preview/commands pages
-over data Shild/ChannelStats/ChannelLogger already produce.
+"""WebPanel: a LAN-only, authenticated web dashboard for shild-py --
+ZNC-style overview/stats/logs/live-preview/commands pages over data
+Shild/ChannelStats/ChannelLogger already produce, plus (2026-08-24) a
+small, explicitly allowlisted write surface.
 
 Separate plugin from Shild on purpose, same reasoning as GitHubWatch's
 own module docstring: this is a presentation layer over data that
@@ -8,14 +9,20 @@ already exists, not threat-analysis logic, and keeping it independent
 means it can be loaded/reloaded/disabled without touching Shild's state
 or its hermetic test suite at all.
 
-**Read-only in this phase.** WebPanelCallback.doPost (http.py) returns a
-bare 405 for every path -- no route accepts a form submission, changes a
-setting, or writes anything. Adding bot-settings management (nick, real
-name, server list, etc.) is a deliberate later phase that needs CSRF
-protection, an Origin/Referer check, a capability-based allowlist of
-which registry keys are settable at all, and an audit log -- all absent
-today on purpose, not by oversight. See this project's WebPanel design
-notes for the full reasoning.
+**Was read-only for a long time, on purpose -- now has a small, scoped
+write surface (2026-08-24).** `WebPanelCallback.doPost` (http.py)
+handles exactly the routes under `/panel/controls/...` (kill switches,
+per-channel toggles, SpamGuard terms, Shild's ignore list -- see
+controls.py's own module docstring for the exhaustive allowlist); every
+other path still gets a bare 405. This needed, and now has, real CSRF
+protection (csrf.py), an Origin/Referer check, a capability-based
+allowlist of exactly which registry keys are settable (controls.py --
+there is still no code path that writes an arbitrary registry key), and
+an audit log (audit.py) -- see this project's WebPanel design notes
+(CLAUDE.md) for the full reasoning, including the registry-node-creation
+race the peek/warm split below exists to avoid. Ships inert
+(`plugins.WebPanel.writeEnabled` defaults False) until deliberately
+armed.
 
 **Fail-closed on missing credentials**, unlike every other secrets
 loader in this repo -- see secrets.py's module docstring for why the
@@ -43,6 +50,7 @@ class WebPanel(callbacks.Plugin):
         # a name unique to this instance and always clear it first --
         # same convention as Shild's own periodic events.
         self._parted_check_event_name = f"webpanelPartedCheck-{id(self)}"
+        self._controls_warm_event_name = f"webpanelControlsWarm-{id(self)}"
         conf.supybot.plugins.WebPanel.enable.addCallback(self._configCallback)
         if self.registryValue("enable"):
             self._startHttp()
@@ -88,10 +96,28 @@ class WebPanel(callbacks.Plugin):
             self.registryValue("partedCheckIntervalSecs"),
             self._parted_check_event_name, now=True,
         )
+        try:
+            schedule.removeEvent(self._controls_warm_event_name)
+        except KeyError:
+            pass
+        # now=True, same reasoning as the parted-check event above: the
+        # per-channel toggle nodes (and the /panel/controls channel
+        # picker) must be populated on the very first page load after a
+        # restart/reload, not up to controlsWarmIntervalSecs (default
+        # 60s) later.
+        schedule.addPeriodicEvent(
+            self._run_controls_warm,
+            self.registryValue("controlsWarmIntervalSecs"),
+            self._controls_warm_event_name, now=True,
+        )
 
     def _stopHttp(self):
         try:
             schedule.removeEvent(self._parted_check_event_name)
+        except KeyError:
+            pass
+        try:
+            schedule.removeEvent(self._controls_warm_event_name)
         except KeyError:
             pass
         httpserver.unhook("panel")
@@ -101,6 +127,10 @@ class WebPanel(callbacks.Plugin):
     def _run_parted_check(self) -> None:
         if self._callback is not None:
             self._callback.run_parted_maintenance()
+
+    def _run_controls_warm(self) -> None:
+        if self._callback is not None:
+            self._callback.run_controls_warm()
 
     # ---- path resolution shared with http.py's file-backed routes ----
 
@@ -171,6 +201,28 @@ class WebPanel(callbacks.Plugin):
         """
         for irc in world.ircs:
             cb = irc.getCallback("Shild")
+            if cb is not None:
+                return cb
+        return None
+
+    def spamguard_callback(self):
+        """Same never-cache reasoning as shild_callback() above -- used
+        by the new /panel/controls/terms write routes (2026-08-24)."""
+        for irc in world.ircs:
+            cb = irc.getCallback("SpamGuard")
+            if cb is not None:
+                return cb
+        return None
+
+    def undernetx_callback(self):
+        """Same never-cache reasoning as shild_callback() above. Not
+        currently called by any route (the UndernetX per-channel toggle
+        is resolved via the plain registry tree, not this accessor,
+        exactly like every other controls.py entry) -- kept for
+        consistency/future use, mirroring the pattern established by the
+        other two accessors."""
+        for irc in world.ircs:
+            cb = irc.getCallback("UndernetX")
             if cb is not None:
                 return cb
         return None

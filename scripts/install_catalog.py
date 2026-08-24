@@ -270,6 +270,13 @@ CATALOG: dict[str, list] = {
         Skip("liveDecisionsCount", "cosmetic tuning"),
         Skip("partedRetentionDays", "internal tuning"),
         Skip("partedCheckIntervalSecs", "internal tuning"),
+        Ask("writeEnabled", tier="plugin", kind="bool", default=False,
+            question="Allow the web panel to CHANGE settings (kill switches, terms, "
+                     "ignore list, per-channel toggles), not just view them? "
+                     "(ships inert -- can be turned on later)"),
+        Skip("csrfTokenTtlSecs", "internal tuning"),
+        Skip("controlsWarmIntervalSecs", "internal tuning"),
+        Skip("auditPath", "derived path"),
     ],
     "GitHubWatch": [
         Ask("repos", tier="plugin", kind="list", default=[],
