@@ -32,6 +32,21 @@ Credentials come from either:
    registry (masked in `@config` output as of 2026-08-14); without also pasting the printed
    `secrets.json` lines in yourself, a future regen wipes it. See the command's own docstring.
 
+**Automatically retries a failed login (2026-08-23).** `do376` (and the reload-relogin path above)
+used to attempt login exactly once — if that single attempt failed for any reason, `identified`
+stayed `False` for the rest of that connection, and since `auth.noJoinsUntilAuthed` is `True` once
+real credentials exist, the bot would sit connected to Undernet in zero channels until a human
+noticed and restarted the whole process. Real incident: a PING-timeout reconnect raced a
+not-yet-dead prior session, colliding on the bot's own nick (`433`) and then failing X login
+(`"Maximum concurrent logins exceeded"` — the ghost session was still holding the account's login
+slot too) — an ~80 minute outage before a manual restart. Now retries automatically every
+`auth.retryIntervalSecs` (default 60s) up to `auth.maxLoginRetries` times (default 10, ~10 minutes)
+before giving up and logging an error for a human to check. Generic by design — fires on any
+still-not-identified state, not just this one failure mode, so a transient X-service hiccup or a
+dropped NOTICE self-heals the same way. See `_schedule_login_retry`'s own docstring in `plugin.py`
+for the full incident writeup and why the retry preserves any channel joins already queued waiting
+for identify (`_login(..., preserve_pending_joins=True)`) instead of silently discarding them.
+
 ## Commands
 
 All commands below require the **`admin`** capability (matching the plugin's own original `login`
@@ -209,7 +224,9 @@ set `enforcement.xFallbackEnabled=True` anywhere live before running this verifi
 | `plugins.UndernetX.auth.password` | global | String, **private** | `""` | X login password — masked in `@config` output (2026-08-14). Set via `xsetpass`, not `@config` directly. |
 | `plugins.UndernetX.auth.xservice` | global | String | `X@channels.undernet.org` | Where login/commands are sent. |
 | `plugins.UndernetX.auth.xserviceHostmask` | global | String | `X!cservice@undernet.org` | The FULL hostmask X actually authenticates from — used to detect a nick impersonating X. Deliberately more specific than `auth.xservice`. |
-| `plugins.UndernetX.auth.noJoinsUntilAuthed` | global | Boolean | `True` | Hold JOINs until identified. **Set `False` in this deployment** (see CLAUDE.md) — blank credentials would otherwise block every Undernet join forever. |
+| `plugins.UndernetX.auth.noJoinsUntilAuthed` | global | Boolean | `True` | Hold JOINs until identified. `bootstrap_runtime.py` derives this from whether real credentials are configured — `True` once they are (avoids joining before an auto-op-on-identify channel is ready), `False` with blank credentials (which would otherwise block every Undernet join forever). |
+| `plugins.UndernetX.auth.retryIntervalSecs` | global | Positive integer | `60` | Seconds between automatic X login retries while still not identified after the initial attempt. See "Automatically retries a failed login" above. |
+| `plugins.UndernetX.auth.maxLoginRetries` | global | Non-negative integer | `10` | How many automatic retries before giving up and logging an error for a human to notice (~10 minutes at the default interval). |
 | `plugins.UndernetX.commands.replyTimeoutSecs` | global | Positive integer | `10` | How long an `x*` command waits for X's NOTICE reply before reporting "no reply". |
 | `plugins.UndernetX.commands.defaultBanDuration` | global | String | `0d` | Default `xban` duration when omitted. |
 | `plugins.UndernetX.commands.defaultBanAccess` | global | Non-negative integer | `75` | Default `xban`/X-fallback ban severity level ("banlevel") when omitted — see `xban`'s own docs above. Confirmed live 2026-08-17; the old default of `0` was flatly rejected by X. |

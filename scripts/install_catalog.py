@@ -73,6 +73,7 @@ DEFAULT_ALIASES = {
     "shignore": "shildignore $*",
     "shunignore": "shildunignore $*",
     "shlistignore": "shildlistignore",
+    "shaudit": "shildaudit $*",
 }
 
 # Plugins that are always loaded, never asked about, and whose config
@@ -128,6 +129,7 @@ CATALOG: dict[str, list] = {
         Skip("proxyscan.connectTimeout", "internal tuning"),
         Skip("proxyscan.overallTimeout", "internal tuning"),
         Skip("ignoreList", "managed live via the shildignore command, not at install time"),
+        Skip("auditMaxUsers", "internal safety cap; raise deliberately via @config"),
         Skip("decisionCache.enabled", "correct default (True), not a first-install decision"),
         Skip("decisionCache.ttlSecs", "internal tuning"),
         Skip("report.dir", "derived: runtime/daily_analysis"),
@@ -213,6 +215,16 @@ CATALOG: dict[str, list] = {
             question="Enable the group-flood (coordinated multi-nick message burst) heuristic "
                      "globally as a default for new channels? Caution: an ordinary busy moment "
                      "in an active channel can resemble one."),
+        Ask("repeatCharsEnabled", tier="advanced", kind="bool", default=False,
+            question="Enable the repeat-chars (one character repeated many times in a row) "
+                     "heuristic globally as a default for new channels?"),
+        Ask("quitPartEnabled", tier="advanced", kind="bool", default=False,
+            question="Enable QUIT/PART reason-text observation globally as a default for new "
+                     "channels? This NEVER kicks or bans -- matches are only logged/relayed."),
+        Ask("cloneScanEnabled", tier="advanced", kind="bool", default=False,
+            question="Enable the clone-scan (multiple nicks sharing one host, present right now) "
+                     "heuristic globally as a default for new channels? Caution: a legitimately "
+                     "shared host (NAT, a bouncer) can look like a clone cluster."),
         Skip("floodMessageLimit", "internal tuning"),
         Skip("floodWindowSecs", "internal tuning"),
         Skip("hilightNickLimit", "internal tuning"),
@@ -224,6 +236,10 @@ CATALOG: dict[str, list] = {
         Skip("raidWindowSecs", "internal tuning"),
         Skip("groupFloodMessageLimit", "internal tuning"),
         Skip("groupFloodWindowSecs", "internal tuning"),
+        Skip("repeatCharsMinRun", "internal tuning"),
+        Skip("cloneScanMaxClones", "internal tuning"),
+        Skip("cloneScanIntervalSecs", "internal tuning"),
+        Skip("cloneScanRepeatSuppressSecs", "internal tuning"),
         Skip("words", "legacy migration-only field, superseded by the `spamguard word add` command"),
         Skip("phrases", "legacy migration-only field"),
         Skip("patterns", "legacy migration-only field"),
@@ -300,15 +316,18 @@ CATALOG: dict[str, list] = {
         Skip("nominatimRatePerMin", "tied to Nominatim's own policy, do not raise"),
         Skip("owmRatePerMin", "internal tuning"),
         Skip("openaqRatePerMin", "internal tuning"),
+        Skip("perCallerRatePerMin", "internal tuning -- per-caller budget-monopolization guard, added 2026-08-24"),
         Skip("airQualityRadiusMeters", "cosmetic tuning"),
         Skip("maxLineBytes", "internal tuning"),
     ],
     "UndernetX": [
         Skip("auth.username", "supplied via install.json's networks[].services credentials, not asked twice"),
         Skip("auth.password", "supplied via install.json's networks[].services credentials, not asked twice"),
-        Skip("auth.noJoinsUntilAuthed", "always forced False by bootstrap_runtime.py -- see its own comment"),
+        Skip("auth.noJoinsUntilAuthed", "derived from whether real credentials are configured (True once they are) -- see bootstrap_runtime.py's own comment"),
         Skip("auth.xservice", "correct default, X's own service name"),
         Skip("auth.xserviceHostmask", "correct default, impersonation-detection anchor"),
+        Skip("auth.retryIntervalSecs", "internal tuning -- automatic login-retry cadence, see its own docstring"),
+        Skip("auth.maxLoginRetries", "internal tuning -- automatic login-retry cap, see its own docstring"),
         Skip("modeXonID", "correct default"),
         Skip("commands.replyTimeoutSecs", "internal tuning"),
         Skip("commands.defaultBanDuration", "internal tuning"),

@@ -92,7 +92,20 @@ class TermStore:
             except (KeyError, TypeError, ValueError):
                 continue
             self._terms[t.id] = t
-        self._next_id = raw.get("next_id", max(self._terms, default=0) + 1)
+        # 2026-08-24 fix (found via code review): the stored next_id was
+        # trusted verbatim whenever present, only falling back to
+        # max(ids)+1 when the field was MISSING entirely -- a file
+        # restored from a stale backup or hand-edited could have a
+        # next_id lower than an id already in `terms`, and the next
+        # add() would silently reuse it, breaking this module's own "an
+        # id always means the same term forever" guarantee. Now always
+        # takes the max of both, so a stale-but-present next_id can
+        # never regress below what's actually in use.
+        try:
+            stored_next_id = int(raw.get("next_id", 1))
+        except (TypeError, ValueError):
+            stored_next_id = 1
+        self._next_id = max(stored_next_id, max(self._terms, default=0) + 1)
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

@@ -115,6 +115,30 @@ def test_classify_line_no_username_configured_never_matches_positive():
     assert v.state != USABLE
 
 
+def test_classify_line_stray_number_before_access_label_does_not_misclassify():
+    """Regression, 2026-08-24: _ACCESS_LEVEL_RE used to match the FIRST
+    bare 1-3 digit number anywhere in the line, not one anchored to the
+    ACCESS label. Here, a stray earlier number (a fake user id, 500)
+    clears min_access=100 while the REAL access level (10) does not --
+    the old unanchored regex would have grabbed "500" first and
+    misclassified this USABLE; the anchored regex correctly finds the
+    real access level after the "access" label and resolves UNUSABLE."""
+    v = classify_access_line("shild (id: 500) has access 10 in #windrop.",
+                              username="shild", min_access=100)
+    assert v.state == UNUSABLE
+    assert v.access_level == 10
+
+
+def test_classify_line_confirmed_live_shape_still_works_after_anchor_fix():
+    """The one confirmed-live positive reply shape must keep resolving
+    correctly after anchoring the regex to the ACCESS label (regression
+    guard for the 2026-08-24 fix above)."""
+    v = classify_access_line("USER: ExampleAccount ACCESS: 100 L",
+                              username="ExampleAccount", min_access=100)
+    assert v.state == USABLE
+    assert v.access_level == 100
+
+
 # ---- classify_access_reply (the fail-closed floor) ----
 
 def test_reply_positive_row_wins():

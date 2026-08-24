@@ -1,5 +1,8 @@
-"""Config registry for Weather. See CLAUDE.md's Weather section for the
-full design rationale -- this file just registers the values.
+"""Config registry for Weather. See docs/WEATHER.md for the full design
+rationale -- this file just registers the values. (Corrected 2026-08-24,
+found via code review: this used to point at "CLAUDE.md's Weather
+section", which has never existed -- docs/WEATHER.md is the real,
+complete reference doc for this plugin.)
 
 `enabled` defaults True (channel-scoped, opSettable=False), unlike
 Shild's/SpamGuard's own "enabled" (both default False). Those act ON
@@ -198,6 +201,21 @@ conf.registerGlobalValue(
     registry.PositiveInteger(50, _(
         """Requests/minute this plugin allows itself against OpenAQ --
         deliberate headroom under OpenAQ's free-tier 60/minute limit.""")),
+)
+
+conf.registerGlobalValue(
+    Weather, "perCallerRatePerMin",
+    registry.PositiveInteger(6, _(
+        """Requests/minute allowed per CALLER (registered account, or
+        nick+network if unregistered) across "weather"/"w"/"aqi" combined
+        -- separate from the per-PROVIDER rate limits above
+        (nominatimRatePerMin/owmRatePerMin/openaqRatePerMin), which protect
+        the shared upstream budget as a whole, not any one caller's share
+        of it. Without this, a single caller querying distinct place names
+        (each one bypasses the geocode/weather cache, since caching is
+        keyed by resolved place, not caller) could burn the entire shared
+        budget alone. Found via code review, 2026-08-24 -- see
+        docs/WEATHER.md.""")),
 )
 
 conf.registerGlobalValue(

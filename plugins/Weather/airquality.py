@@ -49,6 +49,15 @@ def pm25_to_aqi(pm25: float) -> Optional[tuple]:
     """
     if pm25 < 0:
         return None
+    # EPA spec (40 CFR Part 58 Appendix G): the concentration is rounded
+    # to 1 decimal place BEFORE the breakpoint lookup. _PM25_BREAKPOINTS'
+    # consecutive rows deliberately don't touch (12.0 then 12.1, etc.) --
+    # without this rounding, a raw value like 12.05 matched no row at
+    # all and silently returned None, dropping the whole air-quality
+    # fragment from an otherwise valid reading. Found via code review,
+    # 2026-08-24; this is the correct EPA-spec fix, not an ad hoc
+    # widening of the ranges.
+    pm25 = round(pm25, 1)
     for lo, hi, aqi_lo, aqi_hi, category in _PM25_BREAKPOINTS:
         if lo <= pm25 <= hi:
             aqi = ((aqi_hi - aqi_lo) / (hi - lo)) * (pm25 - lo) + aqi_lo

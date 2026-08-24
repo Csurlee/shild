@@ -283,6 +283,7 @@ def main() -> None:
     import supybot.plugins.ChannelLogger.config  # noqa: F401 -- registers conf.supybot.plugins.ChannelLogger.*
     import supybot.plugins.Channel.config  # noqa: F401 -- registers conf.supybot.plugins.Channel.* (partMsg)
     import supybot.plugins.Alias.config  # noqa: F401 -- registers conf.supybot.plugins.Alias.*
+    import supybot.plugins.Limiter.config  # noqa: F401 -- registers conf.supybot.plugins.Limiter.*
 
     conf.supybot.directories.data.setValue(str(RUNTIME_DIR / "data"))
     conf.supybot.directories.conf.setValue(str(RUNTIME_DIR / "conf"))
@@ -337,6 +338,24 @@ def main() -> None:
     conf.supybot.plugins.Anonymous.requireCapability.setValue("owner")
     conf.supybot.plugins.Anonymous.allowPrivateTarget.setValue(True)
     conf.supybot.plugins.get("Anonymous").public.setValue(False)
+
+    # Limiter: bundled Limnoria plugin, unmodified. Keeps a channel's +l
+    # (user limit) mode a small margin above the current headcount, so the
+    # ircd itself rejects new joins past that -- a standing deterrent
+    # against a mass-join clone/drone burst, orthogonal to SpamGuard's
+    # raid/groupFlood heuristics (which react AFTER a burst starts; this
+    # raises the cost of attempting one at all). Needs real IRC op --
+    # sends a raw MODE +l directly, no X-fallback path exists for it (see
+    # UndernetX's own enforcement.py docstring on why raw mode-setting
+    # plugins can't use that route). 2026-08-22: enabled only on
+    # libera/#windrop, the one channel confirmed holding real op (see
+    # CLAUDE.md's "Known state" -- Undernet's #windrop turned out to have
+    # no X registration at all, and #erdely's access is X-routed, not
+    # real op). Defaults (minimumExcess=5, maximumExcess=10) left
+    # untouched -- no reason yet to diverge from upstream's own numbers
+    # for a single low-traffic test channel.
+    conf.registerPlugin("Limiter", True)
+    conf.supybot.plugins.Limiter.enable.get(":libera").get("#windrop").setValue(True)
 
     conf.registerPlugin("Shild", True)
 
@@ -500,6 +519,22 @@ def main() -> None:
             if password:
                 conf.supybot.plugins.Services.nicks.get(":" + n.name).setValue([nick])
                 supybot.plugins.Services.config.registerNick(nick, password)
+                # 2026-08-23: some networks (confirmed live on Libera) now
+                # refuse the connection itself -- before NickServ identify
+                # can ever run -- unless SASL is used, for connections from
+                # certain source networks/IP ranges ("SASL authentication
+                # to a NickServ account with a verified email address is
+                # required to connect from your current network"). Reuses
+                # the SAME NickServ credentials for SASL PLAIN (the normal
+                # relationship between the two on networks that support
+                # both) rather than requiring a second secret. Left
+                # sasl.required at its own default (False) deliberately --
+                # this only offers the credential so SASL is ATTEMPTED and
+                # succeeds when the server asks for it; it doesn't force
+                # the connection to abort locally if SASL isn't offered or
+                # fails for some other reason.
+                conf.supybot.networks.get(n.name).sasl.username.setValue(nick)
+                conf.supybot.networks.get(n.name).sasl.password.setValue(password)
             conf.supybot.plugins.Services.noJoinsUntilIdentified.get(
                 ":" + n.name).setValue(bool(password))
             for channel in n.op_channels:

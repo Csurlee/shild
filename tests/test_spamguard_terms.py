@@ -108,3 +108,34 @@ def test_saved_file_shape_has_next_id_and_terms(tmp_path):
     assert raw["next_id"] == 2
     assert len(raw["terms"]) == 1
     assert raw["terms"][0]["text"] == "Czura"
+
+
+def test_stale_next_id_lower_than_an_existing_term_does_not_cause_reuse(tmp_path):
+    """Regression, 2026-08-24: a file with a next_id that's present but
+    STALE (lower than an existing term's own id -- e.g. restored from an
+    old backup, or hand-edited) used to be trusted verbatim, so the next
+    add() would silently reuse an id already in use, violating this
+    store's own "an id always means the same term forever" guarantee."""
+    path = tmp_path / "terms.json"
+    path.write_text(json.dumps({
+        "next_id": 2,  # stale -- term id 5 already exists below
+        "terms": [{"id": 5, "category": "word", "text": "existing",
+                   "added_by": "", "added_at": 0.0}],
+    }))
+    store = TermStore(path)
+    added = store.add("word", "new")
+    assert added.id == 6
+    assert store.get(5).text == "existing"  # untouched, not overwritten
+
+
+def test_missing_next_id_still_falls_back_to_max_plus_one(tmp_path):
+    """Same fallback as before this fix, for the genuinely-missing case
+    (not just the stale-but-present case above)."""
+    path = tmp_path / "terms.json"
+    path.write_text(json.dumps({
+        "terms": [{"id": 7, "category": "word", "text": "existing",
+                   "added_by": "", "added_at": 0.0}],
+    }))
+    store = TermStore(path)
+    added = store.add("word", "new")
+    assert added.id == 8

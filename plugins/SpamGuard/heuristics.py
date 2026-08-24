@@ -1,6 +1,7 @@
 """Pure, non-term, threshold-based heuristics: flood, mass nick-highlight,
 and excessive caps (message-based, 2026-08-14), plus raid/coordinated-join
-detection (join-based, 2026-08-16) and group_flood/coordinated-message
+detection (join-based, 2026-08-16), group_flood/coordinated-message
+detection (message-based, 2026-08-22), and longest_char_run/repeat_chars
 detection (message-based, 2026-08-22). See mojibake.py for the fourth
 message heuristic (garbled-encoding detection, vendored separately since
 it's a large regex table, not written here).
@@ -93,3 +94,30 @@ def caps_percentage(text: str) -> float:
         return 0.0
     upper = sum(1 for c in letters if c.isupper())
     return upper / len(letters)
+
+
+def longest_char_run(text: str) -> int:
+    """Length of the longest run of one repeated character in `text`
+    ("aaaaaaaa" -> 8, "abcabc" -> 1, "" -> 0). Case-SENSITIVE and
+    codepoint-exact: "AaAaAa" is a run of 1, not 6 -- a mixed-case
+    stutter is ordinary typing, an unbroken wall of one character is
+    not. Whitespace counts like any other character, so a message
+    padded with a long run of spaces triggers on its own merits;
+    plugin.py already strips mIRC formatting codes
+    (ircutils.stripFormatting) before this ever sees the text, so a
+    colour code can't inflate a run.
+
+    Adapted from the IDEA in BlackTools' `repetitivechars` Eggdrop/TCL
+    module (github.com/tclscripts/BlackTools-TCL, GPLv3) -- reimplemented
+    independently for this codebase's own conventions, nothing translated
+    or vendored, same treatment as the ozone/AttackProtector-derived
+    heuristics above.
+    """
+    longest = run = 0
+    prev = None
+    for ch in text:
+        run = run + 1 if ch == prev else 1
+        prev = ch
+        if run > longest:
+            longest = run
+    return longest

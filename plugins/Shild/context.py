@@ -86,10 +86,18 @@ class ContextStore:
     """
 
     def __init__(self, join_window_secs: float = 10.0, global_log_max: int = 300,
-                 max_tracked_nicks: int = 5000, max_nicks_per_host: int = 20):
+                 max_tracked_nicks: int = 5000, max_nicks_per_host: int = 20,
+                 max_tracked_hosts: int = 5000):
         self._chan: Dict[ChanKey, _ChannelState] = defaultdict(_ChannelState)
-        self._host_joins: Dict[Tuple[str, str], List[float]] = defaultdict(list)
-        self._host_channels: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+        # OrderedDict, not a plain defaultdict -- LRU-bounded by
+        # max_tracked_hosts (see snapshot()'s eviction below), same
+        # bounding discipline _nick_identity/_host_nicks already have
+        # right below this. A plain defaultdict here would grow one
+        # entry per distinct host ever seen, forever, over the stated
+        # 72h+ uptime target -- found via code review, 2026-08-24.
+        self._host_joins: "OrderedDict[Tuple[str, str], List[float]]" = OrderedDict()
+        self._host_channels: "OrderedDict[Tuple[str, str], Set[str]]" = OrderedDict()
+        self.max_tracked_hosts = max_tracked_hosts
         # (network, host) -> OrderedDict[nick.lower(), (display_nick, ts)],
         # oldest-first, LRU-bounded per host by max_nicks_per_host -- see
         # module docstring. A host cycling through many nicks (itself a
@@ -142,15 +150,22 @@ class ContextStore:
             self._note_host_nick(network, host, nick, now)
             cutoff = now - self.join_window_secs
 
-            joins = self._host_joins[(network, host)]
+            host_key = (network, host)
+            joins = self._host_joins.setdefault(host_key, [])
+            self._host_joins.move_to_end(host_key)
             while joins and joins[0] < cutoff:
                 joins.pop(0)
             join_rate = float(len(joins))
             joins.append(now)
+            while len(self._host_joins) > self.max_tracked_hosts:
+                self._host_joins.popitem(last=False)
 
-            chans = self._host_channels[(network, host)]
+            chans = self._host_channels.setdefault(host_key, set())
+            self._host_channels.move_to_end(host_key)
             cross_chan_count = len(chans)
             chans.add(channel)
+            while len(self._host_channels) > self.max_tracked_hosts:
+                self._host_channels.popitem(last=False)
 
             chan_state = self._chan[(network, channel)]
             channel_context = "\n".join(

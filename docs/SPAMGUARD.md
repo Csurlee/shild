@@ -13,11 +13,13 @@ evaluated and rejected — see `CLAUDE.md`).
 SpamGuard does nothing in a channel until `plugins.SpamGuard.enabled` is `True` for that channel,
 and takes no real enforcement action until **all** of the following hold:
 
-1. a term actually matches (content, ident, nick, or realname)
+1. a term actually matches (content, ident, nick, or realname) — nick terms are checked both at
+   JOIN and on a subsequent NICK change (2026-08-22, closes the "join clean, rename once nobody's
+   watching" evasion)
 2. for a **content** match only: the sender joined within `joinWindowSecs` (default 60s) — ident,
    nick, and realname matches have no such window, since the match *is* the join event
-3. the sender isn't exempt (channel halfop+, holds the channel's `op` capability, or —
-   if `exemptRegistered` — is any recognized registered user at all)
+3. the sender isn't exempt (channel voice+ — voiced, halfop, or op, see below — holds the
+   channel's `op` capability, or — if `exemptRegistered` — is any recognized registered user at all)
 4. `plugins.SpamGuard.protection.killSwitch` is `False` (**defaults `True`** — safe out of the box,
    independent of Shild's own kill switch)
 5. the bot actually holds op in that channel right now (checked live) **or** (Undernet only,
@@ -29,6 +31,13 @@ Every match is logged and relayed regardless of whether it acted, tagged with th
 didn't (`killswitch` / `not-opped` / `outside-window` / `exempt`) or that it did (`enforced`) — so
 the term list can be tuned against real traffic before ever arming the kill switch. Each `enforced`
 record's `via` field (2026-08-16) is `"native"` or `"x"`.
+
+**A separate, always-observe-only path** (2026-08-22, `quitPartEnabled`): a leaving user's QUIT/PART
+reason is checked against the same content word/phrase/pattern terms, but this NEVER reaches step 3
+onward above — the user is already gone from the channel by the time either event fires, so a match
+is always tagged `outcome: "observed"` and only ever logged/relayed, never kicked or banned. See
+"Message heuristics" below for the full reasoning; turning a real observation into real enforcement
+is the operator's own call (`spamguard black add <host>`).
 
 ## Terms: id-keyed, not registry lists
 
@@ -70,7 +79,7 @@ the first one checked is acted on/logged — one enforcement action per join, ne
 doesn't only block **future** joins/messages — the moment you add it, SpamGuard also immediately
 sweeps **every network the bot is currently connected to** for anyone already sitting in an
 enabled channel who matches, and kick+bans them right then (subject to the exact same exemption/
-kill-switch/op gates as any live match — an already-present halfop+ or registered user is still
+kill-switch/op gates as any live match — an already-present voice+ or registered user is still
 exempt, and nothing happens anywhere the kill switch is on, or the bot isn't opped and has no
 live-verified X capability fallback available either — see `docs/UNDERNETX.md`'s "X-routed
 enforcement fallback", 2026-08-16).
@@ -95,7 +104,7 @@ already `True` — adding a `black` entry does not override or bypass that per-c
 as every other mechanism in this plugin. "Every channel the bot is or joins" means every channel
 SpamGuard actually watches, not literally every channel the bot's IRC connection happens to be in.
 
-## Message heuristics (flood, groupFlood, hilight, caps, mojibake, raid)
+## Message heuristics (flood, groupFlood, hilight, caps, mojibake, raid, repeatChars, cloneScan)
 
 Four non-term, threshold-based message detectors (2026-08-14) — adapted from ideas in Libera
 Chat's own `ozone` network-abuse bot (`github.com/Libera-Chat/ozone`), reimplemented independently
@@ -126,6 +135,28 @@ Its defaults deliberately mirror `raidJoinLimit`/`raidWindowSecs` (8 / 15.0s) as
 unlike `raidJoinLimit`, there is no corpus measurement behind that number yet, so enable it per
 channel with the kill switch still on and watch the relay first.
 
+A seventh, **repeatChars** (2026-08-22), flags a message where one character repeats
+`repeatCharsMinRun` or more times in a row (`"!!!!!!!!!!"`, `"aaaaaaaaaa"`) — adapted from the idea
+in BlackTools' `repetitivechars` Eggdrop/TCL module (`github.com/tclscripts/BlackTools-TCL`,
+GPLv3), reimplemented independently, nothing vendored. Case-sensitive: a mixed-case stutter like
+`"AaAaAa"` is a run of 1, not abuse. Checked last in the existing chain (lowest-risk position to
+add).
+
+An eighth, **cloneScan** (2026-08-22), is a different kind of check entirely: a periodic (every
+`cloneScanIntervalSecs`, default 600s) AND on-demand (`spamguardclonescan [<channel>]`)
+**stateless snapshot** of who's currently sitting in a channel, grouped by host — `cloneScanMaxClones`
+(default 4) or more distinct nicks sharing one host right now is acted on. Unlike `raid`/`groupFlood`
+(both burst-in-a-time-window detectors that reset after acting), this catches slow trickle-in clones
+and clones that were already present before the feature existed — adapted from the idea in
+BlackTools' `CloneScan` module, reimplemented independently, nothing vendored. Every member of a
+qualifying cluster is acted on (not just one "tipping" member) since a clone cluster has no innocent
+members by construction, and the host-scoped ban mask already covers the whole cluster after the
+first call. If **any** member of a cluster is exempt (voice+, `op` capability, or a registered user),
+the **whole cluster** is skipped — the ban mask is host-scoped, so acting on the unvoiced members
+would also lock out the exempt one on their next reconnect. A repeated report of the same
+still-present cluster is suppressed for `cloneScanRepeatSuppressSecs` (default 3600s) by the
+periodic sweep only — `spamguardclonescan` always ignores that window.
+
 Unlike a term list (implicitly inert until a word/phrase/pattern is added), a threshold is always
 *live* the moment code exists to check it — so each heuristic is its own **per-channel opt-in,
 default off**, the equivalent safety property. Enable them one at a time and watch `[spamguard]`
@@ -139,12 +170,15 @@ relay lines with the kill switch still on, same staged-rollout discipline as the
 | **caps** | `plugins.SpamGuard.capsEnabled` | `capsPercent` (default 70%) or more of a message's *letters* are uppercase, once it's at least `capsMinLength` (default 10) characters |
 | **mojibake** | `plugins.SpamGuard.mojibakeEnabled` | `mojibake.mojibake_score()` (garbled-character-encoding detection) is at/above `mojibakeScore` (default 2) |
 | **raid** | `plugins.SpamGuard.raidEnabled` | `raidJoinLimit` (default 8) *distinct* nicks join the channel within `raidWindowSecs` (default 15.0s) — acts only on the tipping-point joiner |
+| **repeatChars** | `plugins.SpamGuard.repeatCharsEnabled` | the longest run of one repeated character in a message is at/above `repeatCharsMinRun` (default 10) |
+| **cloneScan** | `plugins.SpamGuard.cloneScanEnabled` | `cloneScanMaxClones` (default 4) *distinct* nicks share one host, present right now — periodic sweep + `spamguardclonescan` command, acts on EVERY member unless any is exempt |
 
 Each match is logged/relayed/enforced exactly like a term match, using a fixed negative pseudo-id
-(`flood=-1`, `hilight=-2`, `caps=-3`, `mojibake=-4`, `raid=-5`, `group_flood=-7`) in place of a
-real TermStore id, since these aren't user-managed text entries — `spamguardsearch`/
+(`flood=-1`, `hilight=-2`, `caps=-3`, `mojibake=-4`, `raid=-5`, `group_flood=-7`, `clone_scan=-8`,
+`repeat_chars=-9`)
+in place of a real TermStore id, since these aren't user-managed text entries — `spamguardsearch`/
 `spamguardremove` never apply to them; tune via `@config`/`config channel` instead.
-`spamguardstatus`, run **in a channel**, shows that channel's on/off state for all six on a second
+`spamguardstatus`, run **in a channel**, shows that channel's on/off state for all seven on a second
 reply line.
 
 ## Commands
@@ -159,7 +193,12 @@ All five commands are **owner-only**.
 
 Adds or removes one or more terms. A space in a `word`/`realname` term auto-stores it as a phrase.
 `pattern` terms are validated as regex at add time — an invalid one is rejected with a reply, not
-silently stored. Multiple terms may be given in one call; each gets its own result line. Category
+silently stored. Since 2026-08-24, a pattern that looks like it could cause catastrophic regex
+backtracking (a nested-quantifier shape, e.g. `(a+)+`) is also refused, for the same reason: pattern
+terms run synchronously on this plugin's single, unthreaded main loop for every message, so a
+runaway match would hang the whole bot. Best-effort heuristic (catches the common nested-quantifier
+shape, not exhaustive), not a proof every added pattern is safe. Multiple terms may be given in one
+call; each gets its own result line. Category
 names accept unambiguous abbreviation (`p` → `pattern`, `i` → `ident`, `n` → `nick`, `b` →
 `black`). `black add` also immediately kbans any already-present match — see the dedicated
 section above.
@@ -214,7 +253,7 @@ takes no arguments
 Reports match/enforcement counters (since the last restart), kill-switch state, pending
 auto-unbans, and per-category term counts — including a count of any stored patterns that failed
 to compile. Run in a channel, a second reply line also shows that channel's flood/groupflood/
-hilight/caps/mojibake/raid enable state.
+hilight/caps/mojibake/raid/repeatchars/clonescan enable state.
 
 ## Configuration
 
@@ -229,7 +268,7 @@ hilight/caps/mojibake/raid enable state.
 | `plugins.SpamGuard.hostBanRetentionDays` | global | Positive integer | `30` | Days of inactivity before a host-ban record stops being eligible to trigger a reban. Refreshed on every hit. |
 | `plugins.SpamGuard.hostBanPruneIntervalSecs` | global | Positive integer | `3600` | How often expired host-ban records are actually deleted from the file. |
 | `plugins.SpamGuard.joinWindowSecs` | global | Positive integer | `60` | How long after a tracked join a **content** match is still eligible to enforce. Ident/realname matches ignore this. |
-| `plugins.SpamGuard.exemptRegistered` | global | Boolean | `True` | Whether any ircdb-registered user is exempt from enforcement, on top of the always-exempt halfop+/channel-op cases. |
+| `plugins.SpamGuard.exemptRegistered` | global | Boolean | `True` | Whether any ircdb-registered user is exempt from enforcement, on top of the always-exempt voice+/channel-op cases. |
 | `plugins.SpamGuard.logPath` | global | String | `data/spamguard_actions.jsonl` | JSONL log of every match seen, acted on or not. |
 | `plugins.SpamGuard.relayChannel` | network | String | `""` | Channel to relay match notices to. Empty disables relaying (logging still happens). |
 | `plugins.SpamGuard.protection.killSwitch` | global | Boolean | `True` (safe) | While `True`, SpamGuard never takes real action anywhere. Independent of Shild's own kill switch. |
@@ -241,6 +280,13 @@ hilight/caps/mojibake/raid enable state.
 | `plugins.SpamGuard.groupFloodEnabled` | channel | Boolean | `False` | Whether the group-flood (distinct-nick message burst) heuristic is checked in this channel. Not op-settable. |
 | `plugins.SpamGuard.groupFloodMessageLimit` | global | Positive integer | `8` | Distinct nicks messaging the channel within `groupFloodWindowSecs` that counts as a group flood. Mirrors `raidJoinLimit`; no corpus tuning behind it yet. |
 | `plugins.SpamGuard.groupFloodWindowSecs` | global | Positive float | `15.0` | Rolling window (seconds) `groupFloodMessageLimit` is counted over. |
+| `plugins.SpamGuard.repeatCharsEnabled` | channel | Boolean | `False` | Whether the repeat-chars heuristic is checked in this channel. Not op-settable. |
+| `plugins.SpamGuard.repeatCharsMinRun` | global | Positive integer | `10` | Longest run of one repeated character in a message that counts as abuse. No corpus tuning behind it yet. |
+| `plugins.SpamGuard.cloneScanEnabled` | channel | Boolean | `False` | Whether the clone-scan sweep is active in this channel. Not op-settable. |
+| `plugins.SpamGuard.cloneScanMaxClones` | global | Positive integer | `4` | Distinct nicks sharing one host, present right now, that counts as a clone cluster. |
+| `plugins.SpamGuard.cloneScanIntervalSecs` | global | Positive integer | `600` | How often the periodic sweep runs. Read once at plugin load — needs `@reload SpamGuard` to change. |
+| `plugins.SpamGuard.cloneScanRepeatSuppressSecs` | global | Positive integer | `3600` | How long an already-reported cluster is suppressed from the periodic sweep's own reports. `spamguardclonescan` always ignores this. |
+| `plugins.SpamGuard.quitPartEnabled` | channel | Boolean | `False` | Whether a leaving user's QUIT/PART reason is checked against the existing content terms. **Never enforces** — see below. Not op-settable. |
 | `plugins.SpamGuard.hilightEnabled` | channel | Boolean | `False` | Whether the mass-highlight heuristic is checked in this channel. Not op-settable. |
 | `plugins.SpamGuard.hilightNickLimit` | global | Positive integer | `4` | Distinct real channel members named by nick in one message that counts as a mass-highlight. |
 | `plugins.SpamGuard.hilightMinNickLen` | global | Positive integer | `3` | Nicks shorter than this never count toward `hilightNickLimit`. |
@@ -277,8 +323,9 @@ blocking enforcement.
   and enforcement, literally anyone can pick up a banned nick next. Still useful for a known-bad
   literal nick (a bot's fixed default), just don't expect it to survive a determined nick change.
 - `content`, `realname`, `black`, and every heuristic (flood/groupFlood/hilight/caps/mojibake/raid/
-  `host_history`) fall back to a host-based mask: content/black-by-nick/heuristics have no identity
-  component of their own, and realname isn't part of an IRC ban mask at all (masks are strictly
+  repeatChars/cloneScan/`host_history`) fall back to a host-based mask: content/black-by-nick/
+  heuristics have
+  no identity component of their own, and realname isn't part of an IRC ban mask at all (masks are strictly
   `nick!ident@host`).
 
 **The host-based fallback is itself ident-aware (2026-08-22)**: an ident beginning with `~` means

@@ -467,3 +467,126 @@ conf.registerGlobalValue(
         """Rolling window (seconds) groupFloodMessageLimit is counted
         over.""")),
 )
+
+# ---------------------------------------------------------------------
+# Repeat-chars heuristic (2026-08-22): flags a message where one
+# character repeats repeatCharsMinRun or more times in a row
+# ("!!!!!!!!!!", "aaaaaaaaaa") -- adapted from the IDEA in BlackTools'
+# `repetitivechars` Eggdrop/TCL module
+# (github.com/tclscripts/BlackTools-TCL, GPLv3), reimplemented
+# independently, not vendored. Checked in doPrivmsg via
+# _check_heuristics, placed after mojibake (last in the existing chain).
+# ---------------------------------------------------------------------
+
+conf.registerChannelValue(
+    SpamGuard, "repeatCharsEnabled",
+    registry.Boolean(False, _(
+        """Whether the repeat-chars heuristic (one character repeating
+        repeatCharsMinRun or more times in a row within a single
+        message) is checked in this channel. Opt-in, same reasoning as
+        floodEnabled above.""")),
+    opSettable=False,
+)
+conf.registerGlobalValue(
+    SpamGuard, "repeatCharsMinRun",
+    registry.PositiveInteger(10, _(
+        """Length of the longest run of one repeated character in a
+        message that counts as abuse. 8 is still inside normal chat
+        ("loooool", "!!!!!!!!"); 10 steps clear of that while still
+        catching real padding/spam. There is no corpus measurement
+        backing this number yet -- enable per channel with the kill
+        switch on and watch [spamguard] relay lines before trusting
+        it.""")),
+)
+
+# ---------------------------------------------------------------------
+# QUIT/PART reason observation (2026-08-22): checks a leaving user's
+# QUIT/PART reason text against the EXISTING content word/phrase/pattern
+# terms (not a new category) -- adapted from the IDEA in BlackTools'
+# `antibadquitpart` Eggdrop/TCL module
+# (github.com/tclscripts/BlackTools-TCL, GPLv3), reimplemented
+# independently, not vendored. DELIBERATELY OBSERVE-ONLY -- see
+# _handle_leave_match's own docstring in plugin.py for the full
+# reasoning (the user is already gone from irc.state by the time this
+# fires, a KICK would be a guaranteed no-op, a netsplit delivers one
+# QUIT per user with an identical reason so banning here risks a mass
+# ban on a routine network event, and the existing `spamguard black
+# add`/hostBanAutoRebanEnabled machinery already converts a real
+# observation into real enforcement correctly).
+# ---------------------------------------------------------------------
+
+conf.registerChannelValue(
+    SpamGuard, "quitPartEnabled",
+    registry.Boolean(False, _(
+        """Whether a leaving user's QUIT/PART reason text is checked
+        against the existing content word/phrase/pattern terms in this
+        channel. Opt-in, same reasoning as floodEnabled above -- and
+        note this NEVER enforces (no kick, no ban): the user is already
+        gone from the channel by the time this check runs, so a match
+        is only ever logged and relayed. See this feature's own
+        CLAUDE.md section for why.""")),
+    opSettable=False,
+)
+
+# ---------------------------------------------------------------------
+# Clone scan (2026-08-22): periodic/on-demand snapshot of a channel's
+# CURRENT userlist grouped by host -- N or more distinct nicks sharing
+# one host right now is flagged/acted on -- adapted from the IDEA in
+# BlackTools' `CloneScan` module (github.com/tclscripts/BlackTools-TCL,
+# GPLv3), reimplemented independently, not vendored. Different in kind
+# from raid/groupFlood above (both are burst-in-a-time-window detectors
+# that reset after acting): this is a STATELESS snapshot, so it catches
+# slow trickle-in clones and clones that were already sitting in the
+# channel before this feature existed. See plugin.py's _scan_clones for
+# the suppression-window and cluster-exemption design reasoning.
+# ---------------------------------------------------------------------
+
+conf.registerChannelValue(
+    SpamGuard, "cloneScanEnabled",
+    registry.Boolean(False, _(
+        """Whether the clone-scan sweep (cloneScanMaxClones or more
+        distinct nicks sharing one host, checked periodically and via
+        `spamguardclonescan`) is active in this channel. Opt-in, same
+        reasoning as floodEnabled above -- and worth real caution: a
+        legitimately shared host (office/university NAT, a bouncer, one
+        person's multiple clients) can look like a clone cluster. A
+        cluster where ANY member is exempt (voice+, ircdb op capability,
+        or a registered user if exemptRegistered) is skipped entirely,
+        not just that one member -- see plugin.py's _scan_clones.""")),
+    opSettable=False,
+)
+conf.registerGlobalValue(
+    SpamGuard, "cloneScanMaxClones",
+    registry.PositiveInteger(4, _(
+        """Number of DISTINCT nicks sharing one host, present in a
+        channel right now, that counts as a clone cluster. 3
+        simultaneous connections from one host is ordinary (desktop +
+        phone + bouncer, or one Libera user/foo-cloaked account's
+        multiple clients); 4 steps clear of that while keeping the
+        obvious-clone-farm signal. There is no corpus measurement
+        backing this number yet.""")),
+)
+conf.registerGlobalValue(
+    SpamGuard, "cloneScanIntervalSecs",
+    registry.PositiveInteger(600, _(
+        """How often (seconds) the periodic clone-scan sweep runs.
+        Read once at plugin load -- a live @config change needs
+        @reload SpamGuard to take effect, same as dnsbl.staggerMs in
+        Shild.""")),
+)
+conf.registerGlobalValue(
+    SpamGuard, "cloneScanRepeatSuppressSecs",
+    registry.PositiveInteger(3600, _(
+        """How long (seconds) a already-reported clone cluster
+        (network, channel, host) is suppressed from being reported
+        again by the PERIODIC sweep. Exists because enforcement firing
+        is self-limiting (the cluster is gone next scan), but
+        enforcement NOT firing (kill switch on -- the default -- or not
+        opped, or exempt) means _handle_match still logs+relays every
+        pass by design, which would otherwise produce a fresh relay
+        line every single interval, forever, for a cluster sitting
+        there with the kill switch on. Stamped on REPORT, not only on
+        successful enforcement. Per-plugin-instance only (an @reload
+        clears it). The on-demand `spamguardclonescan` command always
+        ignores this window.""")),
+)

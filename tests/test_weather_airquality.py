@@ -52,6 +52,26 @@ def test_pm25_far_above_scale_caps_at_hazardous_500():
     assert category == "hazardous"
 
 
+@pytest.mark.parametrize("pm25", [12.05, 35.45, 55.45, 150.45, 250.45])
+def test_pm25_previously_dead_boundary_values_now_resolve(pm25):
+    """Regression, 2026-08-24: _PM25_BREAKPOINTS' consecutive rows don't
+    touch (12.0 then 12.1, etc.), so these exact values used to match no
+    row at all and silently return None, dropping the whole air-quality
+    fragment from an otherwise valid reading. The fix rounds to 1
+    decimal first (the EPA spec's own methodology), which lands each of
+    these squarely in one of the two adjacent (equally valid) buckets --
+    not asserting which one, since that's inherent float-rounding
+    ambiguity, not a correctness question."""
+    result = pm25_to_aqi(pm25)
+    assert result is not None
+    aqi, category = result
+    assert 0 <= aqi <= 500
+    assert category in (
+        "good", "moderate", "unhealthy for sensitive groups",
+        "unhealthy", "very unhealthy", "hazardous",
+    )
+
+
 def test_no_locations_in_range_is_a_miss_not_an_error():
     assert nearest_location([]) is None
 

@@ -49,7 +49,8 @@ class SpamGuardTestCase(ChannelPluginTestCase):
         # otherwise leak into every later test in the same process. Reset
         # explicitly here; each heuristic test enables only what it needs.
         for name in ("floodEnabled", "groupFloodEnabled", "hilightEnabled", "capsEnabled",
-                     "mojibakeEnabled", "raidEnabled"):
+                     "mojibakeEnabled", "raidEnabled", "repeatCharsEnabled", "quitPartEnabled",
+                     "cloneScanEnabled"):
             getattr(conf.supybot.plugins.SpamGuard, name).get(self.channel).setValue(False)
         # hostBanAutoRebanEnabled (2026-08-22) is global, not channel-
         # scoped -- same cross-test state-leak risk as everything else
@@ -116,6 +117,12 @@ class SpamGuardTestCase(ChannelPluginTestCase):
         self.irc.feedMsg(ircmsgs.privmsg(
             self.channel, text,
             prefix=f"{nick}!{ident}@{host or f'{nick}.example.net'}",
+        ))
+
+    def _nick_change(self, old, new, ident="~x", host=None):
+        self.irc.feedMsg(ircmsgs.IrcMsg(
+            command="NICK", args=(new,),
+            prefix=f"{old}!{ident}@{host or self._DEFAULT_HOST}",
         ))
 
     def _grant_op(self, channel):
@@ -300,6 +307,25 @@ class SpamGuardTestCase(ChannelPluginTestCase):
         self._join(nick, ident, host)
         self.irc.feedMsg(ircmsgs.IrcMsg(
             command="MODE", args=(self.channel, "+o", nick),
+            prefix="ChanServ!ChanServ@services.",
+        ))
+        self.irc.feedMsg(ircmsgs.privmsg(
+            self.channel, "Czura", prefix=f"{nick}!{ident}@{host}",
+        ))
+
+        self.assertEqual([m for m in self._queued() if m.command == "KICK"], [])
+        self.assertEqual(self._log_records()[-1]["outcome"], "exempt")
+
+    def test_matched_but_voiced_only_is_exempt(self):
+        """2026-08-22: exemption widened from halfop+ to voice+ -- a
+        plain +v (no halfop/op) must exempt on its own, not just ride
+        along with a higher status."""
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        nick, ident, host = "voiceduser", "~voice", "203.0.113.22__no_testcap__"
+        self._join(nick, ident, host)
+        self.irc.feedMsg(ircmsgs.IrcMsg(
+            command="MODE", args=(self.channel, "+v", nick),
             prefix="ChanServ!ChanServ@services.",
         ))
         self.irc.feedMsg(ircmsgs.privmsg(
@@ -582,6 +608,115 @@ class SpamGuardTestCase(ChannelPluginTestCase):
 
         self.assertEqual(self._log_records(), [])
 
+    # ---- nick re-check on NICK CHANGE (2026-08-22, idea from BlackTools'
+    # badnick) -- closes the join-clean-then-rename evasion ----
+
+    def test_nick_change_to_a_bad_nick_enforces(self):
+        self._plugin._terms.add("nick", "badbot")
+        self._plugin._rebuild_matchers()
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+
+        self._join("cleanjoin", "~x", self._DEFAULT_HOST)
+        self._nick_change("cleanjoin", "badbot")
+
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        bans = [m for m in self._queued() if m.command == "MODE" and m.args[1] == "+b"]
+        self.assertEqual(len(kicks), 1)
+        self.assertEqual(kicks[0].args[1], "badbot")
+        self.assertEqual(bans[0].args[2], "badbot!*@*")
+        records = self._log_records()
+        self.assertEqual(records[-1]["field"], "nick")
+        self.assertEqual(records[-1]["outcome"], "enforced")
+        self.assertGreater(records[-1]["term_id"], 0, "must reuse the real TermStore id")
+
+    def test_nick_change_to_a_clean_nick_does_nothing(self):
+        self._plugin._terms.add("nick", "badbot")
+        self._plugin._rebuild_matchers()
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+
+        self._join("oldnick", "~x", self._DEFAULT_HOST)
+        self._nick_change("oldnick", "stillfine")
+
+        self.assertEqual(self._log_records(), [])
+
+    def test_voiced_user_changing_to_a_bad_nick_is_still_exempt(self):
+        """2026-08-22 regression guard: Limnoria's IrcState.doNick
+        replaces the user's channel entry (old nick -> new nick) BEFORE
+        this callback ever runs, so a naive implementation checking
+        _is_exempt() against the raw NICK message's msg.nick (the OLD
+        nick) would find no one there and silently lose the voice+
+        exemption this project widened the same day. Must stay green."""
+        self._plugin._terms.add("nick", "badbot")
+        self._plugin._rebuild_matchers()
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+
+        self._join("vipuser", "~vip", self._DEFAULT_HOST)
+        self.irc.feedMsg(ircmsgs.IrcMsg(
+            command="MODE", args=(self.channel, "+v", "vipuser"),
+            prefix="ChanServ!ChanServ@services.",
+        ))
+        self._nick_change("vipuser", "badbot")
+
+        self.assertEqual([m for m in self._queued() if m.command == "KICK"], [])
+        self.assertEqual(self._log_records()[-1]["outcome"], "exempt")
+
+    def test_nick_change_in_a_disabled_channel_is_ignored(self):
+        self._plugin._terms.add("nick", "badbot")
+        self._plugin._rebuild_matchers()
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        self._join("cleanjoin", "~x", self._DEFAULT_HOST)
+        conf.supybot.plugins.SpamGuard.enabled.get(self.channel).setValue(False)
+
+        self._nick_change("cleanjoin", "badbot")
+
+        self.assertEqual([m for m in self._queued() if m.command == "KICK"], [])
+
+    def test_nick_change_respects_killswitch(self):
+        self._plugin._terms.add("nick", "badbot")
+        self._plugin._rebuild_matchers()
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(True)
+        self._grant_op(self.channel)
+        self._join("cleanjoin", "~x", self._DEFAULT_HOST)
+
+        self._nick_change("cleanjoin", "badbot")
+
+        self.assertEqual([m for m in self._queued() if m.command == "KICK"], [])
+        self.assertEqual(self._log_records()[-1]["outcome"], "killswitch")
+
+    def test_join_window_survives_a_nick_change(self):
+        """The tracked join timestamp is re-keyed to the new nick, so a
+        spammer who joins clean, renames, then pastes the seeded content
+        term is still INSIDE the content join window under the new
+        nick."""
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        self._join("cleanjoin", "~ocelo", self._DEFAULT_HOST)
+        self._nick_change("cleanjoin", "primaryocelo", ident="~ocelo")
+
+        self.irc.feedMsg(ircmsgs.privmsg(
+            self.channel, "Hi Guys! It's Madeleine Czura! Just thought I'd leave my number here.",
+            prefix=f"primaryocelo!~ocelo@{self._DEFAULT_HOST}",
+        ))
+
+        records = self._log_records()
+        self.assertEqual(records[-1]["outcome"], "enforced")
+        self.assertEqual(records[-1]["field"], "content")
+
+    def test_our_own_nick_change_is_ignored(self):
+        self._plugin._terms.add("nick", self.irc.nick)
+        self._plugin._rebuild_matchers()
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+
+        self.irc.feedMsg(ircmsgs.IrcMsg(
+            command="NICK", args=("somethingelse",), prefix=self.prefix))
+
+        self.assertEqual(self._log_records(), [])
+
     def test_nick_match_checked_before_ident_one_match_is_enough(self):
         """If a nick AND an ident term would both match the same join,
         only nick is checked/acted on/logged -- one enforcement action
@@ -729,6 +864,18 @@ class SpamGuardTestCase(ChannelPluginTestCase):
         # syntax and errors out before this ever reaches the plugin.
         m = self.getMsg("spamguard pattern add (unclosed")
         self.assertIn("invalid regex", m.args[1])
+        self.assertEqual(self._plugin._terms.by_category("pattern"), [])
+
+    def test_add_catastrophically_backtracking_pattern_is_refused_not_stored(self):
+        # Regression, 2026-08-24: pattern terms used to be validated
+        # only for "does it compile", then run synchronously on this
+        # plugin's single, unthreaded main loop for every message -- a
+        # nested-quantifier pattern like this one can hang the whole
+        # bot against a long enough attacker-controlled message. No
+        # square brackets/spaces here either, same nested-command-syntax
+        # reason as test_add_invalid_pattern_is_rejected_not_stored above.
+        m = self.getMsg("spamguard pattern add (a+)+")
+        self.assertIn("catastrophic", m.args[1])
         self.assertEqual(self._plugin._terms.by_category("pattern"), [])
 
     def test_add_duplicate_term_does_not_create_a_second_id(self):
@@ -990,6 +1137,8 @@ class SpamGuardTestCase(ChannelPluginTestCase):
         self.assertIn("hilight=off", m2.args[1])
         self.assertIn("caps=off", m2.args[1])
         self.assertIn("mojibake=off", m2.args[1])
+        self.assertIn("repeatchars=off", m2.args[1])
+        self.assertIn("clonescan=off", m2.args[1])
         self.assertIn("raid=off", m2.args[1])
 
     # ---- raid (2026-08-16): distinct-nick join-burst detection ----
@@ -1144,6 +1293,159 @@ class SpamGuardTestCase(ChannelPluginTestCase):
         self.assertEqual(len(kicks), 1, "the message right after a trigger must not re-trigger")
         self.assertEqual(kicks[0].args[1], "tipper")
 
+    # ---- repeat_chars (2026-08-22): longest-repeated-character-run detection ----
+
+    def test_repeat_chars_enforces_on_a_long_run(self):
+        conf.supybot.plugins.SpamGuard.repeatCharsEnabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        self._chat("spammer", text="check this out!!!!!!!!!!", host=self._DEFAULT_HOST)
+
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        self.assertEqual(len(kicks), 1)
+        records = self._log_records()
+        self.assertEqual(records[-1]["outcome"], "enforced")
+        self.assertEqual(records[-1]["field"], "repeat_chars")
+        self.assertEqual(records[-1]["term_id"], -9)
+
+    def test_repeat_chars_below_min_run_does_not_enforce(self):
+        conf.supybot.plugins.SpamGuard.repeatCharsEnabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        self._chat("spammer", text="ok!!! that's fine", host=self._DEFAULT_HOST)
+
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        self.assertEqual(kicks, [])
+
+    def test_repeat_chars_disabled_by_default_never_enforces(self):
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        self._chat("spammer", text="!!!!!!!!!!!!!!!!!!!!", host=self._DEFAULT_HOST)
+
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        self.assertEqual(kicks, [])
+
+    def test_content_match_still_takes_priority_over_repeat_chars(self):
+        """A message that hits a real content term is handled via that
+        path (field == "content"), never falling through to
+        repeat_chars, even if the same message would ALSO trip the
+        repeated-character check -- doPrivmsg's own content-match-first
+        early return, before _check_heuristics is ever called."""
+        conf.supybot.plugins.SpamGuard.repeatCharsEnabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        self._join()
+        self.irc.feedMsg(ircmsgs.privmsg(
+            self.channel, "Czura!!!!!!!!!!!!!!!!!!!!",
+            prefix=f"primaryocelo!~ocelo@{self._DEFAULT_HOST}",
+        ))
+        records = self._log_records()
+        self.assertEqual(records[-1]["field"], "content")
+
+    # ---- QUIT/PART reason observation (2026-08-22, idea from BlackTools'
+    # antibadquitpart) -- DELIBERATELY OBSERVE-ONLY, never enforces ----
+
+    def test_quit_reason_match_is_observed_never_enforced(self):
+        conf.supybot.plugins.SpamGuard.quitPartEnabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        self._join("primaryocelo", "~ocelo", self._DEFAULT_HOST)
+
+        self.irc.feedMsg(ircmsgs.IrcMsg(
+            command="QUIT",
+            args=("Hi Guys! It's Madeleine Czura! Just thought I'd leave my number here.",),
+            prefix=f"primaryocelo!~ocelo@{self._DEFAULT_HOST}",
+        ))
+
+        self.assertEqual([m for m in self._queued() if m.command == "KICK"], [])
+        self.assertEqual([m for m in self._queued() if m.command == "MODE"], [])
+        records = self._log_records()
+        self.assertEqual(records[-1]["outcome"], "observed")
+        self.assertEqual(records[-1]["field"], "quit_reason")
+
+    def test_part_reason_match_is_observed_never_enforced(self):
+        conf.supybot.plugins.SpamGuard.quitPartEnabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        self._join("primaryocelo", "~ocelo", self._DEFAULT_HOST)
+
+        self.irc.feedMsg(ircmsgs.IrcMsg(
+            command="PART",
+            args=(self.channel,
+                  "Hi Guys! It's Madeleine Czura! Just thought I'd leave my number here."),
+            prefix=f"primaryocelo!~ocelo@{self._DEFAULT_HOST}",
+        ))
+
+        self.assertEqual([m for m in self._queued() if m.command == "KICK"], [])
+        self.assertEqual([m for m in self._queued() if m.command == "MODE"], [])
+        records = self._log_records()
+        self.assertEqual(records[-1]["outcome"], "observed")
+        self.assertEqual(records[-1]["field"], "part_reason")
+
+    def test_quit_with_no_reason_is_ignored(self):
+        conf.supybot.plugins.SpamGuard.quitPartEnabled.get(self.channel).setValue(True)
+        self._join("someone", "~x", self._DEFAULT_HOST)
+        # A bare QUIT with no reason has NO args at all -- must not raise.
+        self.irc.feedMsg(ircmsgs.IrcMsg(
+            command="QUIT", args=(), prefix=f"someone!~x@{self._DEFAULT_HOST}"))
+        self.assertEqual(self._log_records(), [])
+
+    def test_quit_part_disabled_by_default_logs_nothing(self):
+        self._join("primaryocelo", "~ocelo", self._DEFAULT_HOST)
+        self.irc.feedMsg(ircmsgs.IrcMsg(
+            command="QUIT",
+            args=("Hi Guys! It's Madeleine Czura! Just thought I'd leave my number here.",),
+            prefix=f"primaryocelo!~ocelo@{self._DEFAULT_HOST}",
+        ))
+        self.assertEqual(self._log_records(), [])
+
+    def test_quit_reason_in_a_disabled_channel_is_ignored(self):
+        self._join("primaryocelo", "~ocelo", self._DEFAULT_HOST)
+        conf.supybot.plugins.SpamGuard.quitPartEnabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.SpamGuard.enabled.get(self.channel).setValue(False)
+        self.irc.feedMsg(ircmsgs.IrcMsg(
+            command="QUIT",
+            args=("Hi Guys! It's Madeleine Czura! Just thought I'd leave my number here.",),
+            prefix=f"primaryocelo!~ocelo@{self._DEFAULT_HOST}",
+        ))
+        self.assertEqual(self._log_records(), [])
+
+    def test_multi_channel_part_checks_each_channel_independently(self):
+        """A PART's channel argument (msg.args[0]) can be comma-
+        separated for a multi-channel part. quitPartEnabled is only on
+        for self.channel here, so a part naming self.channel AND an
+        unrelated #other must still produce exactly one record, for
+        self.channel."""
+        conf.supybot.plugins.SpamGuard.quitPartEnabled.get(self.channel).setValue(True)
+        self._join("primaryocelo", "~ocelo", self._DEFAULT_HOST)
+        other = "#other"
+        self.irc.feedMsg(ircmsgs.IrcMsg(
+            command="PART",
+            args=(f"{self.channel},{other}",
+                  "Hi Guys! It's Madeleine Czura! Just thought I'd leave my number here."),
+            prefix=f"primaryocelo!~ocelo@{self._DEFAULT_HOST}",
+        ))
+        records = self._log_records()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[-1]["channel"], self.channel)
+
+    def test_netsplit_style_quit_reason_with_no_matching_term_does_nothing(self):
+        conf.supybot.plugins.SpamGuard.quitPartEnabled.get(self.channel).setValue(True)
+        self._join("regular", "~reg", self._DEFAULT_HOST)
+        self.irc.feedMsg(ircmsgs.IrcMsg(
+            command="QUIT", args=("*.libera.chat *.split",),
+            prefix=f"regular!~reg@{self._DEFAULT_HOST}",
+        ))
+        self.assertEqual(self._log_records(), [])
+
+    def test_our_own_quit_is_ignored(self):
+        self._plugin._terms.add("word", "Czura")
+        self._plugin._rebuild_matchers()
+        conf.supybot.plugins.SpamGuard.quitPartEnabled.get(self.channel).setValue(True)
+        self.irc.feedMsg(ircmsgs.IrcMsg(
+            command="QUIT", args=("Czura",), prefix=self.prefix))
+        self.assertEqual(self._log_records(), [])
+
     # ---- black (2026-08-14): matches nick OR host, acts on future joins
     # AND immediately sweeps anyone already present ----
 
@@ -1280,6 +1582,165 @@ class SpamGuardTestCase(ChannelPluginTestCase):
         self.assertIsNotNone(found)
         self.getMsg(f"spamguardremove {found.id}")
         self.assertIsNone(self._plugin._terms.get(found.id))
+
+    # ---- clone scan (2026-08-22, idea from BlackTools' CloneScan) --
+    # stateless snapshot of who's currently present, grouped by host ----
+
+    _CLONE_HOST = "203.0.113.50__no_testcap__"
+
+    def _seat_clones(self, count, host=None, ident="~c"):
+        host = host or self._CLONE_HOST
+        for i in range(count):
+            self._join(f"clone{i}", ident, host)
+
+    def test_clone_scan_command_kicks_every_member_of_a_cluster(self):
+        """Note: the command's own reply is NOT necessarily the first
+        message off the queue -- the scan's real MODE+KICK get queued
+        DURING the command handler, ahead of its own irc.reply() call at
+        the end (same queue-ordering gotcha already documented for
+        `spamguard black add`'s own test) -- so check _queued() directly
+        rather than assuming getMsg()'s return value is the reply."""
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        limit = conf.supybot.plugins.SpamGuard.cloneScanMaxClones()
+        self._seat_clones(limit)
+
+        self.getMsg(f"spamguardclonescan {self.channel}")
+
+        queued = self._queued()
+        replies = [m for m in queued if m.command == "PRIVMSG" and "cluster" in m.args[1]]
+        self.assertEqual(len(replies), 1)
+        self.assertIn("1 cluster", replies[0].args[1])
+
+        kicks = [m for m in queued if m.command == "KICK"]
+        self.assertEqual(len(kicks), limit)
+        bans = {m.args[2] for m in queued if m.command == "MODE" and m.args[1] == "+b"}
+        self.assertEqual(bans, {f"*!~*@{self._CLONE_HOST}"})
+        records = self._log_records()
+        self.assertEqual(records[-1]["field"], "clone_scan")
+        self.assertEqual(records[-1]["term_id"], -8)
+
+    def test_clone_scan_below_limit_does_nothing(self):
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        limit = conf.supybot.plugins.SpamGuard.cloneScanMaxClones()
+        self._seat_clones(limit - 1)
+
+        self.getMsg(f"spamguardclonescan {self.channel}")
+
+        self.assertEqual([m for m in self._queued() if m.command == "KICK"], [])
+
+    def test_clone_scan_disabled_by_default_never_acts(self):
+        """The periodic sweep itself is gated on cloneScanEnabled --
+        confirmed by calling _scan_clones_all() directly (the toggle
+        this test cares about) rather than the on-demand command, which
+        deliberately does NOT check cloneScanEnabled (an operator asking
+        directly always gets a real answer)."""
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        self._seat_clones(6)
+
+        clusters, enforced = self._plugin._scan_clones_all()
+
+        self.assertEqual((clusters, enforced), (0, 0))
+        self.assertEqual([m for m in self._queued() if m.command == "KICK"], [])
+
+    def test_clone_scan_skips_the_whole_cluster_when_any_member_is_exempt(self):
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        limit = conf.supybot.plugins.SpamGuard.cloneScanMaxClones()
+        self._seat_clones(limit)
+        self.irc.feedMsg(ircmsgs.IrcMsg(
+            command="MODE", args=(self.channel, "+v", "clone0"),
+            prefix="ChanServ!ChanServ@services.",
+        ))
+
+        self.getMsg(f"spamguardclonescan {self.channel}")
+
+        self.assertEqual([m for m in self._queued() if m.command == "KICK"], [])
+        records = self._log_records()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[-1]["outcome"], "exempt")
+        self.assertEqual(records[-1]["field"], "clone_scan")
+
+    def test_clone_scan_respects_killswitch(self):
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(True)
+        self._grant_op(self.channel)
+        limit = conf.supybot.plugins.SpamGuard.cloneScanMaxClones()
+        self._seat_clones(limit)
+
+        self.getMsg(f"spamguardclonescan {self.channel}")
+
+        self.assertEqual([m for m in self._queued() if m.command == "KICK"], [])
+        self.assertEqual(self._log_records()[-1]["outcome"], "killswitch")
+
+    def test_clone_scan_suppresses_a_repeat_within_the_window(self):
+        """killSwitch stays ON (so nothing is ever enforced) -- the
+        point is that the PERIODIC path (_scan_clones directly, matching
+        what the scheduled sweep itself calls) logs the cluster only
+        on the FIRST of the two calls within cloneScanRepeatSuppressSecs
+        -- the first call logs one record per member (limit total), the
+        second call must add none."""
+        self._grant_op(self.channel)
+        limit = conf.supybot.plugins.SpamGuard.cloneScanMaxClones()
+        self._seat_clones(limit)
+
+        self._plugin._scan_clones(self.irc, self.channel)
+        after_first = len(self._log_records())
+        self.assertEqual(after_first, limit)
+
+        self._plugin._scan_clones(self.irc, self.channel)
+        after_second = len(self._log_records())
+        self.assertEqual(after_second, after_first,
+                          "the second periodic pass must be suppressed")
+
+    def test_clone_scan_command_ignores_the_suppression_window(self):
+        """Each real scan pass logs one record per cluster member
+        (killSwitch stays at its default True here, so every member's
+        outcome is "killswitch" -- this test only cares whether the
+        SECOND command invocation produces any records at all, proving
+        it wasn't silently suppressed like a periodic sweep would be)."""
+        self._grant_op(self.channel)
+        limit = conf.supybot.plugins.SpamGuard.cloneScanMaxClones()
+        self._seat_clones(limit)
+
+        self.getMsg(f"spamguardclonescan {self.channel}")
+        after_first = len(self._log_records())
+        self.assertEqual(after_first, limit)
+
+        self.getMsg(f"spamguardclonescan {self.channel}")
+        after_second = len(self._log_records())
+        self.assertEqual(after_second, limit * 2,
+                          "the second on-demand scan must not be suppressed")
+
+    def test_clone_scan_skips_the_bots_own_nick(self):
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        limit = conf.supybot.plugins.SpamGuard.cloneScanMaxClones()
+        self._seat_clones(limit - 1)
+        # The bot's own nick sharing the same host must never count
+        # toward the cluster -- it's simply skipped, not resolvable via
+        # nickToHostmask the way a real hostile clone would be, but the
+        # explicit `nick == irc.nick` guard is what's actually under
+        # test here (see _scan_clones).
+        clusters, _enforced = self._plugin._scan_clones(self.irc, self.channel)
+        self.assertEqual(clusters, [])
+
+    def test_clone_scan_skips_a_disabled_channel(self):
+        """cloneScanEnabled True is not enough on its own -- the
+        periodic sweep (_scan_clones_all) also requires the channel's
+        plain `enabled` to be True, same as every other check in this
+        plugin."""
+        conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)
+        conf.supybot.plugins.SpamGuard.cloneScanEnabled.get(self.channel).setValue(True)
+        self._grant_op(self.channel)
+        limit = conf.supybot.plugins.SpamGuard.cloneScanMaxClones()
+        self._seat_clones(limit)
+        conf.supybot.plugins.SpamGuard.enabled.get(self.channel).setValue(False)
+
+        clusters, enforced = self._plugin._scan_clones_all()
+
+        self.assertEqual((clusters, enforced), (0, 0))
 
     # ---- owner-only gate ----
 

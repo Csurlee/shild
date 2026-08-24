@@ -37,6 +37,14 @@ def load_panel_credentials(path: str) -> Optional[PanelCredentials]:
             data = json.loads(p.read_text())
         except (json.JSONDecodeError, OSError):
             data = {}
+        if not isinstance(data, dict):
+            # A syntactically valid but non-object top level ("[]", a
+            # bare string, a number) used to make data.get(...) below
+            # raise AttributeError instead of failing closed -- found
+            # via code review, 2026-08-24. Same "refuse every request"
+            # requirement as the JSONDecodeError case above; see this
+            # module's own docstring.
+            data = {}
     username = os.environ.get("SHILD_WEBPANEL_USER") or data.get("web_panel_user") or ""
     password_hash = (
         os.environ.get("SHILD_WEBPANEL_PASSWORD_HASH")

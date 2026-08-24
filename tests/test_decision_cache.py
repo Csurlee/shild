@@ -1,3 +1,5 @@
+import threading
+
 from shildml.evidence import HostEvidence
 from shildml.fusion import FusedDecision
 
@@ -167,3 +169,47 @@ def test_in_flight_and_decided_are_independent_states():
     cache.mark_in_flight("undernet", "1.2.3.4", now=100.0)
     assert cache.get("undernet", "1.2.3.4") is not None
     assert cache.is_in_flight("undernet", "1.2.3.4", now=100.0) is True
+
+
+def test_concurrent_get_set_mark_clear_do_not_raise():
+    """Regression for a real gap found via code review, 2026-08-24:
+    DecisionCache had no lock at all, despite being read/written from
+    both the worker thread (_finish()) and the main IRC thread
+    (_handle_event()'s synchronous paths, !shildcheck/!shildaudit) in
+    the live plugin. This mirrors tests/test_context_identity.py's own
+    concurrent-access regression test for the same class of bug."""
+    cache = DecisionCache(max_entries=50)
+    errors: list[Exception] = []
+    stop = threading.Event()
+
+    def writer():
+        i = 0
+        while not stop.is_set():
+            host = f"1.2.3.{i % 100}"
+            cache.mark_in_flight("undernet", host)
+            cache.set("undernet", host, _decision(), None)
+            cache.clear_in_flight("undernet", host)
+            i += 1
+
+    def reader():
+        while not stop.is_set():
+            for i in range(100):
+                host = f"1.2.3.{i}"
+                try:
+                    cache.get("undernet", host)
+                    cache.is_in_flight("undernet", host)
+                    len(cache)
+                except Exception as e:  # noqa: BLE001 -- captured, not raised, in a thread
+                    errors.append(e)
+
+    threads = [threading.Thread(target=writer) for _ in range(2)] + \
+              [threading.Thread(target=reader) for _ in range(2)]
+    for t in threads:
+        t.start()
+    import time
+    time.sleep(0.2)
+    stop.set()
+    for t in threads:
+        t.join()
+
+    assert errors == []

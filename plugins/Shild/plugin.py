@@ -33,6 +33,7 @@ explicitly, see doKick/doMode below).
 """
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -178,6 +179,15 @@ class Shild(callbacks.Plugin):
         self._pending_unbans: dict[str, None] = {}
         self._session: Optional[aiohttp.ClientSession] = None  # created inside the worker loop
         self._stats = {"joins": 0, "messages": 0, "decisions": 0, "degraded": 0, "gated": 0, "enforced": 0}
+        # `self._stats[k] += 1` is a read-modify-write, not atomic, and
+        # is called from both the worker thread (_finish()/
+        # _maybe_enforce(), via on_result) and the main IRC thread
+        # (doJoin/doPrivmsg) -- guards against a lost increment under
+        # concurrent access. Found via code review, 2026-08-24 (see
+        # stats_snapshot()'s docstring below, corrected in the same
+        # change -- it previously and incorrectly claimed no lock was
+        # needed here).
+        self._stats_lock = threading.Lock()
         self._ollama_latencies_ms: list[float] = []  # bounded ring for p50/p99 in !shildstatus
         self._started_at = time.time()
 
@@ -516,7 +526,8 @@ class Shild(callbacks.Plugin):
             return
         if not self._enabled(irc, channel) or not msg.host:
             return
-        self._stats["joins"] += 1
+        with self._stats_lock:
+            self._stats["joins"] += 1
         self._handle_event(irc, msg, event_type="join")
 
     def doPrivmsg(self, irc, msg):
@@ -527,7 +538,8 @@ class Shild(callbacks.Plugin):
             return
         if not self.registryValue("messageAnalysis", channel, irc.network):
             return  # joins still analyzed -- see config.py's messageAnalysis docstring
-        self._stats["messages"] += 1
+        with self._stats_lock:
+            self._stats["messages"] += 1
         self._handle_event(irc, msg, event_type="message")
 
     def doKick(self, irc, msg):
@@ -825,11 +837,12 @@ class Shild(callbacks.Plugin):
         self._decision_cache.clear_in_flight(network, host)
         if self.registryValue("decisionCache.enabled"):
             self._decision_cache.set(network, host, fused, evidence)
-        self._stats["decisions"] += 1
-        if fused.degraded:
-            self._stats["degraded"] += 1
-        if fused.gate_applied:
-            self._stats["gated"] += 1
+        with self._stats_lock:
+            self._stats["decisions"] += 1
+            if fused.degraded:
+                self._stats["degraded"] += 1
+            if fused.gate_applied:
+                self._stats["gated"] += 1
 
         record = build_record(
             network=network, channel=channel, event_type=event_type,
@@ -957,19 +970,24 @@ class Shild(callbacks.Plugin):
             self._enforcement_log.write(record)
         except Exception:
             log.exception("Shild: failed to write enforcement action record")
-        self._stats["enforced"] += 1
+        with self._stats_lock:
+            self._stats["enforced"] += 1
 
     # ---- the only command ----
 
     def stats_snapshot(self) -> dict:
         """A shallow copy of the live event/decision counters -- safe to
         call from off the IRC thread (WebPanel's HTTP thread does; see
-        plugins/WebPanel's overview page). dict() is one C-level copy, so
-        no lock is needed the way ContextStore's deques/dicts require
-        one -- these are simple int counters replaced by reassignment,
-        never mutated in place across threads.
+        plugins/WebPanel's overview page). Each counter is incremented
+        in place (`self._stats[k] += 1`) from both the worker thread and
+        the main IRC thread, so both the increments and this copy go
+        through `self._stats_lock` (corrected 2026-08-24 -- this
+        docstring previously and incorrectly claimed no lock was needed
+        here, on the mistaken assumption that `+=` was a single atomic
+        reassignment rather than a read-modify-write).
         """
-        return dict(self._stats)
+        with self._stats_lock:
+            return dict(self._stats)
 
     def runtime_snapshot(self) -> dict:
         """Everything `!shildstatus` reports, as data rather than
@@ -1108,8 +1126,9 @@ class Shild(callbacks.Plugin):
         # raise, rather than showing stale/meaningless values.
         if irc.getCallback("SpamGuard") is not None:
             sg = conf.supybot.plugins.SpamGuard
-            for name in ("enabled", "floodEnabled", "hilightEnabled", "capsEnabled",
-                         "mojibakeEnabled", "raidEnabled"):
+            for name in ("enabled", "floodEnabled", "groupFloodEnabled", "hilightEnabled",
+                         "capsEnabled", "mojibakeEnabled", "raidEnabled",
+                         "repeatCharsEnabled", "cloneScanEnabled"):
                 value = self._channel_value(getattr(sg, name), channel, network)
                 lines.append(f"SpamGuard.{name}: {self._bool_label(value)}")
             lines.append(
@@ -1205,6 +1224,146 @@ class Shild(callbacks.Plugin):
             return target, "", target
         return None
 
+    def _check_one_target(self, irc, nick, ident, host, *, reply_to, location, tag: str,
+                           post_allow: bool, show_history: bool, channel: str = "",
+                           on_done=None) -> bool:
+        """The whole per-target manual check pipeline !shildcheck has
+        always run -- ignore-list short-circuit, Tier 0 cloak/account
+        fast path, classifier, then (only for a genuinely unresolved
+        host) a worker submission for Tier 1-3 evidence. Extracted
+        2026-08-22 so `shildaudit` can sweep a whole channel through the
+        IDENTICAL path rather than growing a second, drifting copy of
+        it -- !shildcheck itself is now a thin wrapper around this.
+
+        Returns True if this target was submitted to the worker (i.e.
+        it will spend real third-party API budget), False if it
+        resolved synchronously with no network access at all.
+
+        Preserves shildcheck's two stated safety properties unchanged,
+        for the same reasons: never calls anything that writes to
+        shadow_decisions.jsonl (a synthetic sample must not pollute the
+        training corpus) and never enforces (no real kick/ban,
+        regardless of result or kill switch).
+
+        post_allow=False suppresses clean `allow` results entirely,
+        matching the live [shadow] relay's own convention -- the
+        difference between one operator-requested lookup (always
+        answer) and a channel-wide sweep (one line per clean user would
+        flood the reply target). on_done(action), if given, fires
+        exactly once per target, on both the synchronous and the
+        worker-submitted path -- the single funnel point (_send below)
+        both paths share.
+        """
+        network = irc.network
+
+        if show_history:
+            history = self._context.nick_history_for_host(network, host, exclude_nick=nick)
+            if history:
+                irc.reply(f"[{tag}] {host} also seen as: {', '.join(history)}")
+
+        def _send(fused, ev=None):
+            if post_allow or fused.action != "allow":
+                # queueMsg, not irc.reply() -- this can fire from the
+                # worker thread's on_result callback, well after this
+                # method has already returned. queueMsg is documented
+                # thread-safe (see worker.py); it's also what the live
+                # [shadow] relay uses for the exact same reason.
+                self._queue_wrapped(
+                    irc, reply_to,
+                    self._format_decision(tag, nick, ident, host, location, fused),
+                )
+                if ev is not None:
+                    self._queue_wrapped(irc, reply_to, f"[{tag}] evidence: {ev.summary()}")
+            if on_done is not None:
+                on_done(fused.action)
+
+        if self._is_ignored(host):
+            # Reflects reality: a live event for this host would never
+            # reach the classifier/evidence pipeline either (see
+            # _handle_event) -- showing a real BAN/WARN read here would
+            # be misleading about what actually happens for this host.
+            _send(fusion.ignored_bypass(host))
+            return False
+
+        join_rate, cross_chan_count = self._context.observed_context(network, host)
+        ctx = ContextSnapshot(join_rate=join_rate, cross_chan_count=cross_chan_count,
+                               account_present=False, channel_context="", host_context="")
+
+        classifier_result = self._classifier.predict(
+            nick, ident, host, join_rate=ctx.join_rate,
+            account_present=ctx.account_present, cross_chan_count=ctx.cross_chan_count,
+        )
+        thresholds = self._thresholds()
+        classifier_confident = (
+            classifier_result is not None
+            and classifier_result.confidence >= thresholds.classifier_act
+        )
+        evidence_enabled = self.registryValue("evidence.enabled")
+        ollama_enabled = self.registryValue("ollama.enabled")
+
+        tier0_ev = None
+        if evidence_enabled:
+            cloak, trust_tier, is_tor_gateway = evidence_mod.classify_cloak(host)
+            if trust_tier != evidence_mod.TRUST_NONE:
+                tier0_ev = evidence_mod.HostEvidence(
+                    cloak=cloak, trust_tier=trust_tier,
+                    account_present=False, is_tor_exit=is_tor_gateway,
+                )
+
+        if classifier_confident:
+            raw = fusion.decide_raw(classifier_result, None, thresholds)
+            if raw.action == "allow" or not evidence_enabled or tier0_ev is not None:
+                fused = (
+                    fusion.decide(classifier_result, None, thresholds, evidence=tier0_ev,
+                                   evidence_thresholds=self._evidence_thresholds)
+                    if evidence_enabled and raw.action != "allow" else raw
+                )
+                _send(fused, tier0_ev)
+                return False
+            # else: classifier confident on ban/warn, evidence enabled,
+            # Tier 0 inconclusive -- fall through to the worker for
+            # Tier 1+ evidence, same as a live event would.
+        elif tier0_ev is not None:
+            _send(fusion.trusted_bypass(tier0_ev), tier0_ev)
+            return False
+
+        config = ollama_client.OllamaConfig(
+            url=self.registryValue("ollama.url"),
+            model=self.registryValue("ollama.model"),
+            timeout=self.registryValue("ollama.timeout"),
+        )
+
+        def coro_factory():
+            # Always True, regardless of dnsbl.ircblEnabled -- a manual
+            # check carries no live-enforcement risk or latency pressure,
+            # and an operator investigating a host benefits from every
+            # available signal (2026-08-16, see that config value's
+            # docstring).
+            return self._evaluate(
+                classifier_confident, ollama_enabled, "join", nick, ident, host,
+                channel, None, "", ctx, config, evidence_enabled, True,
+            )
+
+        def on_result(outcome):
+            if isinstance(outcome, BaseException):
+                ollama_result = None if (classifier_confident or not ollama_enabled) else \
+                    fusion.OllamaResult(ok=False, degraded_reason=type(outcome).__name__)
+                ev = None
+            else:
+                ollama_result, _latency_ms, ev = outcome
+            fused = (
+                fusion.decide(classifier_result, ollama_result, thresholds,
+                               evidence=ev, evidence_thresholds=self._evidence_thresholds,
+                               ollama_disabled=not ollama_enabled)
+                if evidence_enabled and ev is not None else
+                fusion.decide_raw(classifier_result, ollama_result, thresholds,
+                                   ollama_disabled=not ollama_enabled)
+            )
+            _send(fused, ev)
+
+        self._worker.submit(coro_factory, on_result)
+        return True
+
     def shildcheck(self, irc, msg, args, target):
         """<nick or host/IP>
 
@@ -1238,125 +1397,163 @@ class Shild(callbacks.Plugin):
         irc.reply(f"[shadow-manual] checking {target} ({nick} {ident}@{host} on "
                   f"{network}) ...")
 
-        history = self._context.nick_history_for_host(network, host, exclude_nick=nick)
-        if history:
-            irc.reply(f"[shadow-manual] {host} also seen as: {', '.join(history)}")
-
-        if self._is_ignored(host):
-            # Reflects reality: a live event for this host would never
-            # reach the classifier/evidence pipeline either (see
-            # _handle_event) -- showing a real BAN/WARN read here would
-            # be misleading about what actually happens for this host.
-            self._queue_wrapped(
-                irc, reply_to,
-                self._format_decision("shadow-manual", nick, ident, host, location,
-                                       fusion.ignored_bypass(host)),
-            )
-            return
-
-        join_rate, cross_chan_count = self._context.observed_context(network, host)
-        ctx = ContextSnapshot(join_rate=join_rate, cross_chan_count=cross_chan_count,
-                               account_present=False, channel_context="", host_context="")
-
-        classifier_result = self._classifier.predict(
-            nick, ident, host, join_rate=ctx.join_rate,
-            account_present=ctx.account_present, cross_chan_count=ctx.cross_chan_count,
+        self._check_one_target(
+            irc, nick, ident, host, reply_to=reply_to, location=location,
+            tag="shadow-manual", post_allow=True, show_history=True,
+            channel=channel or "",
         )
-        thresholds = self._thresholds()
-        classifier_confident = (
-            classifier_result is not None
-            and classifier_result.confidence >= thresholds.classifier_act
-        )
-        evidence_enabled = self.registryValue("evidence.enabled")
-        ollama_enabled = self.registryValue("ollama.enabled")
-
-        tier0_ev = None
-        if evidence_enabled:
-            cloak, trust_tier, is_tor_gateway = evidence_mod.classify_cloak(host)
-            if trust_tier != evidence_mod.TRUST_NONE:
-                tier0_ev = evidence_mod.HostEvidence(
-                    cloak=cloak, trust_tier=trust_tier,
-                    account_present=False, is_tor_exit=is_tor_gateway,
-                )
-
-        def _send(fused, ev=None):
-            # queueMsg, not irc.reply() -- this can fire from the worker
-            # thread's on_result callback, well after this command method
-            # has already returned. queueMsg is documented thread-safe
-            # (see worker.py); it's also what the live [shadow] relay
-            # uses for the exact same reason.
-            self._queue_wrapped(
-                irc, reply_to,
-                self._format_decision("shadow-manual", nick, ident, host, location, fused),
-            )
-            # 2026-08-14: unlike the live [shadow] relay (which only ever
-            # posts non-allow decisions, so terseness is fine),
-            # !shildcheck always replies -- including a clean "allow"
-            # after a real Tier 1-3 lookup genuinely ran. fused.reason
-            # only ever embeds evidence text when the gate/escalation
-            # actually modified the decision, so a clean result showed
-            # nothing about what was checked at all. Always show the
-            # gathered evidence explicitly, regardless of outcome, so a
-            # manual investigative check never looks like it did nothing.
-            if ev is not None:
-                self._queue_wrapped(
-                    irc, reply_to, f"[shadow-manual] evidence: {ev.summary()}",
-                )
-
-        if classifier_confident:
-            raw = fusion.decide_raw(classifier_result, None, thresholds)
-            if raw.action == "allow" or not evidence_enabled or tier0_ev is not None:
-                fused = (
-                    fusion.decide(classifier_result, None, thresholds, evidence=tier0_ev,
-                                   evidence_thresholds=self._evidence_thresholds)
-                    if evidence_enabled and raw.action != "allow" else raw
-                )
-                _send(fused, tier0_ev)
-                return
-            # else: classifier confident on ban/warn, evidence enabled,
-            # Tier 0 inconclusive -- fall through to the worker for
-            # Tier 1+ evidence, same as a live event would.
-        elif tier0_ev is not None:
-            _send(fusion.trusted_bypass(tier0_ev), tier0_ev)
-            return
-
-        config = ollama_client.OllamaConfig(
-            url=self.registryValue("ollama.url"),
-            model=self.registryValue("ollama.model"),
-            timeout=self.registryValue("ollama.timeout"),
-        )
-
-        def coro_factory():
-            # Always True, regardless of dnsbl.ircblEnabled -- a manual
-            # check carries no live-enforcement risk or latency pressure,
-            # and an operator investigating a host benefits from every
-            # available signal (2026-08-16, see that config value's
-            # docstring).
-            return self._evaluate(
-                classifier_confident, ollama_enabled, "join", nick, ident, host,
-                channel or "", None, "", ctx, config, evidence_enabled, True,
-            )
-
-        def on_result(outcome):
-            if isinstance(outcome, BaseException):
-                ollama_result = None if (classifier_confident or not ollama_enabled) else \
-                    fusion.OllamaResult(ok=False, degraded_reason=type(outcome).__name__)
-                ev = None
-            else:
-                ollama_result, _latency_ms, ev = outcome
-            fused = (
-                fusion.decide(classifier_result, ollama_result, thresholds,
-                               evidence=ev, evidence_thresholds=self._evidence_thresholds,
-                               ollama_disabled=not ollama_enabled)
-                if evidence_enabled and ev is not None else
-                fusion.decide_raw(classifier_result, ollama_result, thresholds,
-                                   ollama_disabled=not ollama_enabled)
-            )
-            _send(fused, ev)
-
-        self._worker.submit(coro_factory, on_result)
 
     shildcheck = wrap(shildcheck, ["owner", "somethingWithoutSpaces"])
+
+    def shildaudit(self, irc, msg, args, channel):
+        """<#channel>
+
+        Re-runs the full classifier + evidence pipeline (idea from
+        Armour's `chanscan`, reimplemented, nothing vendored) against
+        every user CURRENTLY present in <#channel> -- the people who
+        joined before analysis existed, or before it was tuned, and
+        were therefore never evaluated. Same per-target path as
+        !shildcheck (_check_one_target), with the same two guarantees:
+        never writes to shadow_decisions.jsonl, and never enforces,
+        regardless of result or kill switch.
+
+        SPENDS REAL THIRD-PARTY API BUDGET (AbuseIPDB/Scamalytics/IPQS)
+        -- one lookup per user whose host isn't already answered by a
+        trusted cloak, a services account, the ignore list, or a recent
+        cached decision. Replies with the exact number of lookups it is
+        about to spend BEFORE spending any of them, and REFUSES outright
+        above auditMaxUsers (default 25) rather than truncating. Only
+        non-allow results are posted, one line each; a clean sweep
+        replies with a summary and nothing else.
+
+        Deliberately does NOT require Shild.enabled for <#channel> --
+        the most useful case is auditing a channel analysis was never
+        turned on for.
+        """
+        chan_state = irc.state.channels.get(channel)
+        if chan_state is None:
+            irc.error(f"Not currently in {channel} (or {channel} isn't a valid channel).")
+            return
+
+        network = irc.network
+        reply_to = msg.channel or msg.nick
+        location = f"{network}/{channel}"
+
+        # Phase 1 (this IRC thread, zero network access): resolve every
+        # present user, dedupe by host (two nicks behind one host cost
+        # one lookup), and partition into what's already resolved for
+        # free vs what genuinely needs a real lookup.
+        by_host: dict = {}
+        raw_present = 0
+        for nick in list(chan_state.users):
+            if nick == irc.nick:
+                continue
+            try:
+                hostmask = irc.state.nickToHostmask(nick)
+            except KeyError:
+                continue
+            if not hostmask or not ircutils.isUserHostmask(hostmask):
+                continue
+            _n, ident, host = ircutils.splitHostmask(hostmask)
+            if not host:
+                continue
+            raw_present += 1
+            if host in by_host:
+                continue
+            by_host[host] = (nick, ident)
+
+        evidence_enabled = self.registryValue("evidence.enabled")
+        decision_cache_enabled = self.registryValue("decisionCache.enabled")
+
+        free_targets = []    # (nick, ident, host) -- ignored/Tier0-conclusive,
+                              # _check_one_target resolves these with zero
+                              # network access on its own, no need to duplicate
+                              # that logic here.
+        cached_targets = []  # (nick, ident, host, fused, ev) -- a decision-
+                              # cache hit. Deliberately bypasses
+                              # _check_one_target entirely and replies
+                              # straight from the cached tuple -- unlike
+                              # !shildcheck, which never consults the cache
+                              # (a manual check should genuinely re-check),
+                              # a bulk sweep benefits from it as the single
+                              # largest budget saver for a channel with
+                              # recent traffic. Never written back to the
+                              # cache either way (_check_one_target never
+                              # calls _finish()).
+        needs_lookup = []    # (nick, ident, host) -- genuinely dispatched,
+                              # may submit to the worker.
+        for host, (nick, ident) in by_host.items():
+            if self._is_ignored(host):
+                free_targets.append((nick, ident, host))
+                continue
+            if evidence_enabled:
+                _cloak, trust_tier, _is_tor = evidence_mod.classify_cloak(host)
+                if trust_tier != evidence_mod.TRUST_NONE:
+                    free_targets.append((nick, ident, host))
+                    continue
+            if decision_cache_enabled:
+                cached = self._decision_cache.get(network, host)
+                if cached is not None:
+                    cached_fused, cached_ev = cached
+                    cached_targets.append((nick, ident, host, cached_fused, cached_ev))
+                    continue
+            needs_lookup.append((nick, ident, host))
+
+        max_users = self.registryValue("auditMaxUsers")
+        n_needs = len(needs_lookup)
+        irc.reply(
+            f"[shadow-audit] {channel}: {raw_present} present ({len(by_host)} distinct hosts), "
+            f"{len(free_targets) + len(cached_targets)} resolved locally "
+            f"(cloak/account/cached/ignored), {n_needs} need network lookups"
+            + (" -- proceeding" if n_needs <= max_users else
+               f" -- refusing, above plugins.Shild.auditMaxUsers ({max_users}); "
+               f"raise it deliberately if you mean it")
+        )
+        if n_needs > max_users:
+            return
+
+        # Phase 1 output: the free results, spending nothing.
+        for nick, ident, host, fused, ev in cached_targets:
+            if fused.action != "allow":
+                self._queue_wrapped(
+                    irc, reply_to,
+                    self._format_decision("shadow-audit", nick, ident, host, location, fused),
+                )
+                if ev is not None:
+                    self._queue_wrapped(irc, reply_to, f"[shadow-audit] evidence: {ev.summary()}")
+        for nick, ident, host in free_targets:
+            self._check_one_target(
+                irc, nick, ident, host, reply_to=reply_to, location=location,
+                tag="shadow-audit", post_allow=False, show_history=False, channel=channel,
+            )
+
+        if not needs_lookup:
+            return
+
+        # Phase 2: every real lookup goes through the single worker
+        # thread, so this counter needs no lock.
+        remaining = [len(needs_lookup)]
+        flagged = [0]
+
+        def on_done(action):
+            if action != "allow":
+                flagged[0] += 1
+            remaining[0] -= 1
+            if remaining[0] == 0:
+                self._queue_wrapped(
+                    irc, reply_to,
+                    f"[shadow-audit] {channel}: done -- {flagged[0]} flagged "
+                    f"of {len(needs_lookup)} checked",
+                )
+
+        for nick, ident, host in needs_lookup:
+            self._check_one_target(
+                irc, nick, ident, host, reply_to=reply_to, location=location,
+                tag="shadow-audit", post_allow=False, show_history=False,
+                channel=channel, on_done=on_done,
+            )
+
+    shildaudit = wrap(shildaudit, ["owner", "channel"])
 
     # ---- ignore list (2026-08-10) ----
 

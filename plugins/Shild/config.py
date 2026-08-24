@@ -176,6 +176,24 @@ conf.registerGlobalValue(
         shildml.schema.load_training_rows.""")),
 )
 
+conf.registerGlobalValue(
+    Shild, "auditMaxUsers",
+    registry.PositiveInteger(25, _(
+        """Maximum number of users needing a real third-party lookup
+        (i.e. NOT already resolved by a trusted cloak/account, the
+        ignore list, or a cached recent decision) that `shildaudit`
+        will act on in one invocation. Above this, shildaudit REFUSES
+        outright rather than truncating -- raise it deliberately via
+        @config if you mean it. Deliberately well under the reputation
+        worker's own queue capacity (see worker.py's maxQueue): that
+        queue is shared with the LIVE join path and drops the OLDEST
+        queued job when full, so a large audit sweep could silently
+        discard real join evaluations queued behind it. Counts only
+        genuinely-eligible users, not raw channel headcount -- a busy
+        channel full of trusted cloaks can cost nothing regardless of
+        size.""")),
+)
+
 conf.registerGroup(Shild, "decisionCache")
 conf.registerGlobalValue(
     Shild.decisionCache, "enabled",

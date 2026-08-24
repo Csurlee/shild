@@ -944,6 +944,136 @@ class ShildTestCase(ChannelPluginTestCase):
         self.assertIsNone(self.irc.takeMsg())
         self.assertFalse(Path(self._data_path).exists())
 
+    # ---- shildaudit (2026-08-22, idea from Armour's chanscan) --
+    # channel-wide sweep of !shildcheck's own per-target pipeline ----
+
+    def _drain(self):
+        """Drains and returns every remaining queued message, in order.
+        getMsg() already consumes the FIRST one (its own return value)
+        -- callers that need everything queued by a command should
+        capture getMsg()'s return separately and pass it as `first` to
+        prepend it, since a naive takeMsg()-after-getMsg() loop would
+        otherwise silently skip it (the exact gotcha that broke this
+        test file's first draft of these shildaudit tests)."""
+        rest = []
+        while True:
+            m = self.irc.takeMsg()
+            if m is None:
+                break
+            rest.append(m)
+        return rest
+
+    def test_shildaudit_unknown_channel_errors(self):
+        m = self.getMsg("shildaudit #not-a-channel-the-bot-is-in")
+        self.assertIsNotNone(m)
+        self.assertIn("Error", m.args[1])
+
+    def test_shildaudit_requires_owner_capability(self):
+        self._assert_denied_owner_capability(f"shildaudit {self.channel}")
+        self.assertFalse(Path(self._data_path).exists())
+
+    def test_shildaudit_all_trusted_cloaks_present_spends_no_lookups(self):
+        """Tier 0 cloak trust resolves synchronously with zero network
+        access -- a channel full of trusted cloaks costs nothing
+        regardless of headcount. Uses evidence.enabled=True + a
+        confident classifier explicitly, so this genuinely exercises the
+        Tier0 free path, not just "evidence disabled" (a different,
+        less interesting reason to be free)."""
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(True)
+        self.irc.feedMsg(self._make_join("alice", "~a", "user/alice", self.channel))
+        self.irc.feedMsg(self._make_join("bob", "~b", "user/bob", self.channel))
+        self.irc.feedMsg(self._make_join("carol", "~c", "user/carol", self.channel))
+
+        first = self.getMsg(f"shildaudit {self.channel}")
+
+        self.assertIn("3 present (3 distinct hosts)", first.args[1])
+        self.assertIn("0 need network lookups", first.args[1])
+        self.assertIn("proceeding", first.args[1])
+
+    def test_shildaudit_refuses_above_max_users(self):
+        """Three genuinely unresolved bare-IP hosts (evidence enabled,
+        a deliberately non-confident classifier via margin=0.0, no
+        cloak) with auditMaxUsers lowered to 2 -- must refuse outright,
+        never dispatching to the worker (refusal happens strictly before
+        any dispatch, so this stays fully offline/hermetic)."""
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(True)
+        conf.supybot.plugins.Shild.auditMaxUsers.setValue(2)
+        _write_dummy_model(self._model_path, bias_toward="ban", margin=0.0)
+        self.irc.getCallback("Shild")._classifier.reload_if_needed()
+        self.irc.feedMsg(self._make_join("u1", "~u", "203.0.113.61", self.channel))
+        self.irc.feedMsg(self._make_join("u2", "~u", "203.0.113.62", self.channel))
+        self.irc.feedMsg(self._make_join("u3", "~u", "203.0.113.63", self.channel))
+
+        first = self.getMsg(f"shildaudit {self.channel}")
+
+        self.assertIn("3 need network lookups", first.args[1])
+        self.assertIn("refusing", first.args[1])
+        self.assertIn("auditMaxUsers", first.args[1])
+        # Nothing further queued -- the preview line is the only reply.
+        self.assertEqual(self._drain(), [])
+
+    def test_shildaudit_never_writes_to_shadow_data(self):
+        conf.supybot.plugins.Shild.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        self.irc.feedMsg(self._make_join("alice", "~a", "user/alice", self.channel))
+
+        self.getMsg(f"shildaudit {self.channel}")
+        self._drain()
+
+        self.assertFalse(Path(self._data_path).exists(),
+                          "shildaudit must never write a shadow decision record")
+
+    def test_shildaudit_never_enforces_even_with_op_and_kill_switch_off(self):
+        # bias_toward="ban" from setUp's dummy model, evidence disabled
+        # by default here -> classifier-confident BAN, resolved free.
+        conf.supybot.plugins.Shild.protection.killSwitch.setValue(False)
+        self._grant_op(self.channel)
+        self.irc.feedMsg(self._make_join("baduser", "~b", "203.0.113.64", self.channel))
+
+        self.getMsg(f"shildaudit {self.channel}")
+        queued = self._drain()
+
+        self.assertEqual([m for m in queued if m.command in ("KICK", "MODE")], [])
+
+    def test_shildaudit_skips_the_bots_own_nick(self):
+        # Only the bot itself is in the channel -- nothing to report.
+        first = self.getMsg(f"shildaudit {self.channel}")
+        self.assertIn("0 present (0 distinct hosts)", first.args[1])
+
+    def test_shildaudit_dedupes_two_nicks_behind_one_host(self):
+        self.irc.feedMsg(self._make_join("alice1", "~a", "user/alice", self.channel))
+        self.irc.feedMsg(self._make_join("alice2", "~a", "user/alice", self.channel))
+
+        first = self.getMsg(f"shildaudit {self.channel}")
+
+        self.assertIn("2 present (1 distinct hosts)", first.args[1])
+
+    def test_shildaudit_ignored_host_costs_no_lookup(self):
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(True)
+        _write_dummy_model(self._model_path, bias_toward="ban", margin=0.0)
+        self.irc.getCallback("Shild")._classifier.reload_if_needed()
+        conf.supybot.plugins.Shild.ignoreList.setValue(["203.0.113.65"])
+        self.irc.feedMsg(self._make_join("ignoredhost", "~i", "203.0.113.65", self.channel))
+
+        first = self.getMsg(f"shildaudit {self.channel}")
+
+        self.assertIn("0 need network lookups", first.args[1])
+
+    def test_shildaudit_tag_is_shadow_audit_not_shadow_manual(self):
+        self.irc.feedMsg(self._make_join("alice", "~a", "user/alice", self.channel))
+
+        first = self.getMsg(f"shildaudit {self.channel}")
+        queued = [first] + self._drain()
+
+        found = False
+        for m in queued:
+            if m.command != "PRIVMSG":
+                continue
+            self.assertNotIn("[shadow-manual]", m.args[1])
+            if "[shadow-audit]" in m.args[1]:
+                found = True
+        self.assertTrue(found, "expected at least one [shadow-audit]-tagged line")
+
     def test_shildignore_requires_owner_capability(self):
         self._assert_denied_owner_capability("shildignore 203.0.113.90")
         self.assertEqual(list(conf.supybot.plugins.Shild.ignoreList()), [])
@@ -1267,10 +1397,13 @@ class ShildConfigTestCase(ChannelPluginTestCase):
         conf.supybot.plugins.SpamGuard.hostBansPath.setValue(self._sg_host_bans_path)
         conf.supybot.plugins.SpamGuard.enabled.get(self.channel).setValue(True)
         conf.supybot.plugins.SpamGuard.floodEnabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.SpamGuard.groupFloodEnabled.get(self.channel).setValue(False)
         conf.supybot.plugins.SpamGuard.hilightEnabled.get(self.channel).setValue(False)
         conf.supybot.plugins.SpamGuard.capsEnabled.get(self.channel).setValue(False)
         conf.supybot.plugins.SpamGuard.mojibakeEnabled.get(self.channel).setValue(False)
         conf.supybot.plugins.SpamGuard.raidEnabled.get(self.channel).setValue(False)
+        conf.supybot.plugins.SpamGuard.repeatCharsEnabled.get(self.channel).setValue(False)
+        conf.supybot.plugins.SpamGuard.cloneScanEnabled.get(self.channel).setValue(False)
         conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(True)
         conf.supybot.plugins.SpamGuard.hostBanAutoRebanEnabled.setValue(False)
 
@@ -1328,10 +1461,13 @@ class ShildConfigTestCase(ChannelPluginTestCase):
         self.assertIn("Shild.ollama.enabled: enabled", lines)
         self.assertIn("SpamGuard.enabled: enabled", lines)
         self.assertIn("SpamGuard.floodEnabled: enabled", lines)
+        self.assertIn("SpamGuard.groupFloodEnabled: disabled", lines)
         self.assertIn("SpamGuard.hilightEnabled: disabled", lines)
         self.assertIn("SpamGuard.capsEnabled: disabled", lines)
         self.assertIn("SpamGuard.mojibakeEnabled: disabled", lines)
         self.assertIn("SpamGuard.raidEnabled: disabled", lines)
+        self.assertIn("SpamGuard.repeatCharsEnabled: disabled", lines)
+        self.assertIn("SpamGuard.cloneScanEnabled: disabled", lines)
         self.assertIn("SpamGuard.protection.killSwitch: enabled", lines)
         self.assertIn("SpamGuard.hostBanAutoRebanEnabled: disabled", lines)
         self.assertIn("UndernetX.enforcement.preferXCommands: enabled", lines)

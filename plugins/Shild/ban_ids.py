@@ -17,6 +17,7 @@ not a per-entry store.
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 
@@ -24,6 +25,15 @@ class BanIdStore:
     def __init__(self, path):
         self.path = Path(path)
         self._next_id = self._load()
+        # next_id() is called from _maybe_enforce(), which runs on both
+        # the worker thread (via on_result) and the main IRC thread
+        # (Tier-0-conclusive/ignored-host synchronous paths) -- without
+        # this, "assigned = self._next_id; self._next_id += 1" is a
+        # genuine read-modify-write race that could hand out the same id
+        # to two different real bans, which this module's own docstring
+        # already says is not harmless. Found missing via code review,
+        # 2026-08-24.
+        self._lock = threading.Lock()
 
     def _load(self) -> int:
         if self.path.exists():
@@ -48,7 +58,8 @@ class BanIdStore:
         fails after this is called (a small gap in the sequence is
         harmless; a REUSED id printed on two different real bans would
         not be)."""
-        assigned = self._next_id
-        self._next_id += 1
-        self._save()
-        return assigned
+        with self._lock:
+            assigned = self._next_id
+            self._next_id += 1
+            self._save()
+            return assigned

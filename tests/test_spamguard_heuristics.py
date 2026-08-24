@@ -1,6 +1,7 @@
 from plugins.SpamGuard.heuristics import (
     caps_percentage,
     highlighted_nick_count,
+    longest_char_run,
     prune_join_events,
     prune_window,
 )
@@ -119,3 +120,42 @@ def test_caps_percentage_no_letters_is_zero():
 
 def test_caps_percentage_empty_string_is_zero():
     assert caps_percentage("") == 0.0
+
+
+# ---- longest_char_run ----
+
+def test_longest_char_run_empty_string_is_zero():
+    assert longest_char_run("") == 0
+
+
+def test_longest_char_run_no_repeats_is_one():
+    assert longest_char_run("abcdef") == 1
+
+
+def test_longest_char_run_all_same_character():
+    assert longest_char_run("aaaaaaaa") == 8
+
+
+def test_longest_char_run_at_the_start():
+    assert longest_char_run("!!!!!hello") == 5
+
+
+def test_longest_char_run_at_the_end():
+    assert longest_char_run("hello!!!!!") == 5
+
+
+def test_longest_char_run_in_the_middle_wins_over_shorter_ones():
+    assert longest_char_run("aa bbbbb cc") == 5
+
+
+def test_longest_char_run_case_sensitive_alternating_case_is_one():
+    # "AaAaAa" is a mixed-case stutter, not a repeated-character run.
+    assert longest_char_run("AaAaAa") == 1
+
+
+def test_longest_char_run_whitespace_counts_like_any_other_character():
+    assert longest_char_run("hi          bye") == 10
+
+
+def test_longest_char_run_unicode_codepoints_count():
+    assert longest_char_run("\U0001F600\U0001F600\U0001F600ok") == 3

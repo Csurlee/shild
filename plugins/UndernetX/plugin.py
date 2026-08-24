@@ -79,6 +79,16 @@ class UndernetX(callbacks.Plugin):
         # firing after this instance has already been reload'd/unloaded
         # would run against a dead instance for no reason).
         self._scheduled_probe_events = set()
+        # shild-py addition (2026-08-23): scheduled automatic login-retry
+        # timers -- see _schedule_login_retry's own docstring below for
+        # why these exist. Tracked the same way as
+        # _scheduled_probe_events, for the same reason: die()/a reload
+        # must cancel any still-pending one so it can't fire later
+        # against a dead instance. A set of (event_name, network) tuples,
+        # not just event_name -- 2026-08-24 fix, see
+        # _cancel_login_retries's own docstring for why the network is
+        # tracked alongside each event.
+        self._login_retry_events = set()
         # shild-py addition (2026-08-14): re-identify immediately if this
         # __init__ is running because of a MID-SESSION "@reload
         # UndernetX", not a fresh cold start. A reload recreates this
@@ -96,14 +106,108 @@ class UndernetX(callbacks.Plugin):
         # as before this existed.
         if irc.state.supported.get("NETWORK", "") == "UnderNet":
             if self.registryValue("auth.username") and self.registryValue("auth.password"):
+                self._cancel_login_retries(irc.network)
                 self._login(irc)
+                self._schedule_login_retry(irc, 1)
 
-    def _login(self, irc):
-        self.reset()
+    def _login(self, irc, *, preserve_pending_joins: bool = False) -> None:
+        # shild-py note (2026-08-23): reset() wipes self.waitingJoins, not
+        # just self.identified. That's correct for every ORIGINAL call
+        # site here (do376's first-ever attempt, the manual "login"/
+        # "xsetpass" commands, the reload-relogin path above -- all of
+        # them start from a genuinely fresh state with nothing queued
+        # yet). But _schedule_login_retry's own retries call this AFTER
+        # outFilter may have already queued real pending JOINs into
+        # waitingJoins (auth.noJoinsUntilAuthed holds them there until
+        # identified) -- calling reset() there would silently discard
+        # those channel joins forever, even once a later retry succeeds.
+        # preserve_pending_joins=True skips the wipe for exactly that
+        # case.
+        if preserve_pending_joins:
+            self.identified = False
+        else:
+            self.reset()
         username = self.registryValue("auth.username")
         password = self.registryValue("auth.password")
         xserv = self.registryValue("auth.xservice")
         irc.sendMsg(ircmsgs.privmsg(xserv, "login {} {}".format(username, password)))
+
+    def _schedule_login_retry(self, irc, attempt: int) -> None:
+        """Real incident, 2026-08-23: a PING timeout on Undernet triggered
+        a reconnect, but the prior session hadn't actually died
+        server-side yet -- the new connection collided on the bot's own
+        nick (433) and then X rejected the login with "AUTHENTICATION
+        FAILED as ... (Maximum concurrent logins exceeded)" since the old
+        ghost session was still holding that account's login slot too.
+        do376/the reload-relogin path only ever attempt login ONCE, so
+        self.identified stayed False for the rest of that connection's
+        lifetime with no retry -- and since auth.noJoinsUntilAuthed is
+        deliberately True once real credentials exist (see its own
+        docstring in config.py), that meant the bot sat connected to
+        Undernet in ZERO channels for ~80 minutes until a human noticed
+        and restarted the whole process.
+
+        This makes that self-heal: retry every auth.retryIntervalSecs, up
+        to auth.maxLoginRetries times, which comfortably outlasts how
+        long a stale ghost session takes to time out on its own.
+        Deliberately generic -- fires on ANY still-not-identified state
+        at the time it checks, not just this one failure mode (a
+        transient X-service hiccup or a dropped NOTICE self-heals the
+        same way, for free) -- rather than string-matching "Maximum
+        concurrent logins" specifically.
+        """
+        network = irc.network
+        interval = self.registryValue("auth.retryIntervalSecs")
+        max_retries = self.registryValue("auth.maxLoginRetries")
+        event_name = (
+            f"undernetx-login-retry-{id(self)}-{network}-{time.time()}-{attempt}"
+        )
+
+        def _fire():
+            self._login_retry_events.discard((event_name, network))
+            if self.identified:
+                return
+            live_irc = world.getIrc(network)
+            if live_irc is None:
+                return
+            if attempt > max_retries:
+                log.error(
+                    "UndernetX: still not identified to X on %s after "
+                    "%d retries -- giving up automatic retry. Check the "
+                    "last NOTICE from X in the log and run 'undernetx "
+                    "login' by hand once the cause is clear.",
+                    network, max_retries,
+                )
+                return
+            log.info(
+                "UndernetX: still not identified to X on %s, retrying "
+                "login (attempt %d/%d).", network, attempt, max_retries,
+            )
+            self._login(live_irc, preserve_pending_joins=True)
+            self._schedule_login_retry(live_irc, attempt + 1)
+
+        schedule.addEvent(_fire, time.time() + interval, name=event_name)
+        self._login_retry_events.add((event_name, network))
+
+    def _cancel_login_retries(self, network: str) -> None:
+        """Cancels any still-pending automatic login-retry timers for
+        `network` before starting a fresh chain (2026-08-24 fix, found
+        via code review). The SAME plugin instance persists across a
+        reconnect -- only @reload recreates it -- so without this, a
+        do376 firing again after a reconnect (e.g. a second ping-
+        timeout/ghost-session collision within one still-active retry
+        window) left the PREVIOUS connection's chain running alongside
+        the new one, doubling the effective login-attempt rate and
+        muddying the attempt-count diagnostics right when they matter
+        most for debugging."""
+        for event_name, net in list(self._login_retry_events):
+            if net != network:
+                continue
+            try:
+                schedule.removeEvent(event_name)
+            except KeyError:
+                pass
+            self._login_retry_events.discard((event_name, net))
 
     def _is_login_success_notice(self, text: str) -> bool:
         # Real X reply text that means "you are genuinely identified" --
@@ -204,7 +308,9 @@ class UndernetX(callbacks.Plugin):
             else:
                 log.warning("username and password not set, this plugin will not work")
                 return
+            self._cancel_login_retries(irc.network)
             self._login(irc)
+            self._schedule_login_retry(irc, 1)
 
     do422 = do377 = do376
 
@@ -890,6 +996,16 @@ class UndernetX(callbacks.Plugin):
             except KeyError:
                 pass
         self._scheduled_probe_events.clear()
+        # 2026-08-23: cancel any still-pending automatic login-retry
+        # timers too -- see _schedule_login_retry. Each entry is now an
+        # (event_name, network) tuple (2026-08-24, see
+        # _cancel_login_retries), so unpack before removing.
+        for event_name, _net in list(self._login_retry_events):
+            try:
+                schedule.removeEvent(event_name)
+            except KeyError:
+                pass
+        self._login_retry_events.clear()
         self.__parent.die()
 
 

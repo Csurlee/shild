@@ -100,6 +100,38 @@ conf.registerGlobalValue(
 # is the original vendored oddluck/limnoria-plugins UndernetX config,
 # left otherwise untouched; see plugin.py for the matching split.
 
+# 2026-08-23 addition: do376/the reload-relogin path in plugin.py only
+# ever attempted login ONCE. A real incident the same day (a ping-timeout
+# reconnect racing a not-yet-dead prior session -- see
+# _schedule_login_retry's own docstring in plugin.py for the full story)
+# left the bot permanently un-identified for the rest of that connection,
+# and since auth.noJoinsUntilAuthed is True once real credentials exist,
+# that meant zero Undernet channels joined until a human noticed and
+# restarted the whole process. These two values bound the automatic retry
+# that now covers this.
+conf.registerGlobalValue(
+    UndernetX.auth,
+    "retryIntervalSecs",
+    registry.PositiveInteger(60, _(
+        """Seconds between automatic X login retries while still not
+        identified after do376's (or a mid-session reload's) initial
+        login attempt. 60s is comfortably shorter than how long a stale
+        ghost session typically takes to time out on Undernet's own
+        servers, so a retry or two is usually enough to self-heal a
+        "Maximum concurrent logins exceeded" collision without a
+        restart.""")),
+)
+conf.registerGlobalValue(
+    UndernetX.auth,
+    "maxLoginRetries",
+    registry.NonNegativeInteger(10, _(
+        """How many automatic retries (at retryIntervalSecs apart) before
+        giving up and just logging an error for a human to notice. 10
+        retries at the 60s default is ~10 minutes -- generous enough to
+        outlast a stale ghost session's own timeout, bounded enough that
+        a genuinely wrong password doesn't retry forever.""")),
+)
+
 conf.registerGroup(UndernetX, "commands")
 conf.registerGlobalValue(
     UndernetX.commands,

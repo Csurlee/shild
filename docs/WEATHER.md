@@ -127,6 +127,7 @@ this only affects how soon the next lookup for a given place re-hits Nominatim.
 | `plugins.Weather.nominatimRatePerMin` | global | Positive integer | `60` | Refill rate for the Nominatim limiter. Bucket capacity is always forced to `1.0` in code regardless of this value — Nominatim allows no burst above 1 request/second. |
 | `plugins.Weather.owmRatePerMin` | global | Positive integer | `50` | Self-imposed headroom under OWM's free-tier 60/minute limit. |
 | `plugins.Weather.openaqRatePerMin` | global | Positive integer | `50` | Self-imposed headroom under OpenAQ's free-tier 60/minute limit. |
+| `plugins.Weather.perCallerRatePerMin` | global | Positive integer | `6` | Requests/minute allowed per caller (registered account, or nick+network if unregistered) across `weather`/`w`/`aqi` combined — protects the shared provider budget above from any ONE caller monopolizing it, since each distinct place name bypasses the cache. Added 2026-08-24 (bug-hunt review). |
 | `plugins.Weather.airQualityRadiusMeters` | global | Positive integer | `25000` | Search radius for the nearest OpenAQ station that actually measures PM2.5 — not just the nearest station overall, several of which (confirmed live) measure only NO2/O3/etc. Up to 3 candidates are tried, nearest-capable-first. |
 | `plugins.Weather.maxLineBytes` | global | Positive integer | `430` | UTF-8 byte budget for the `weather`/`w` line before segments are dropped (air fragment first, then forecast days from the last back). |
 

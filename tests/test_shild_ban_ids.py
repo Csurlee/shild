@@ -2,6 +2,7 @@
 no plugin test harness needed.
 """
 import json
+import threading
 
 from plugins.Shild.ban_ids import BanIdStore
 
@@ -44,3 +45,28 @@ def test_saved_file_shape(tmp_path):
     store.next_id()
     raw = json.loads(path.read_text())
     assert raw == {"next_id": 2}
+
+
+def test_concurrent_next_id_never_duplicates(tmp_path):
+    """Regression for a real race found via code review, 2026-08-24:
+    next_id() used to do an unguarded read-modify-write, called from
+    both the worker thread and the main IRC thread in the live plugin
+    -- a real ban could get the same id as another real ban. 8 threads
+    x 200 calls each; every id handed out must be unique."""
+    store = BanIdStore(tmp_path / "ban_ids.json")
+    ids: list[int] = []
+    lock = threading.Lock()
+
+    def worker():
+        for _ in range(200):
+            got = store.next_id()
+            with lock:
+                ids.append(got)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(ids) == len(set(ids)) == 1600

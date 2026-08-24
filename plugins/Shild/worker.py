@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
-from supybot import world
+from supybot import log, world
 
 
 @dataclass
@@ -122,7 +122,17 @@ class Worker:
                     result = await job.coro_factory()
                 except Exception as e:  # noqa: BLE001 -- the worker loop must never die
                     result = e
-                job.on_result(result)
+                try:
+                    job.on_result(result)
+                except Exception:  # noqa: BLE001 -- same "must never die" rule as above:
+                    # on_result is plugin.py's _finish()/_maybe_enforce() -- the
+                    # shadow-log write, relay, and real enforcement all live there.
+                    # Without this, an exception raised anywhere in that chain was
+                    # silently swallowed by asyncio's default "Task exception was
+                    # never retrieved" handling instead of logged -- a ban decision
+                    # could silently never reach enforcement with zero trace in
+                    # runtime/stdout.log. Found via code review, 2026-08-24.
+                    log.exception("Shild: on_result callback raised")
 
         while True:
             job = await self._queue.get()

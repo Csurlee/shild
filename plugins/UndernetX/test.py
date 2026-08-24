@@ -128,6 +128,32 @@ class UndernetXTestCase(ChannelPluginTestCase):
         UndernetXClass(self.irc)
         self.assertIsNone(self.irc.takeMsg())
 
+    # ---- login-retry chain de-duplication (2026-08-24 regression) ----
+    #
+    # Found via code review: the SAME plugin instance persists across a
+    # reconnect (only @reload recreates it, via __init__ above -- a
+    # reconnect instead fires do376 again on the existing instance).
+    # do376 used to start a brand-new retry chain every time it fired,
+    # without cancelling any chain still pending from a PREVIOUS
+    # connection on the same network -- two reconnects within one
+    # ~10-minute retry window would run two concurrent chains, doubling
+    # the effective login-attempt rate.
+
+    def test_second_do376_cancels_the_stale_retry_chain_not_accumulates(self):
+        conf.supybot.plugins.UndernetX.auth.username.setValue("myuser")
+        conf.supybot.plugins.UndernetX.auth.password.setValue("mypass")
+
+        self._plugin.do376(self.irc, None)
+        self.irc.takeMsg()  # the first login PRIVMSG
+        first_chain = set(self._plugin._login_retry_events)
+        self.assertEqual(len(first_chain), 1)
+
+        self._plugin.do376(self.irc, None)
+        self.irc.takeMsg()  # the second login PRIVMSG
+        second_chain = set(self._plugin._login_retry_events)
+        self.assertEqual(len(second_chain), 1)
+        self.assertNotEqual(first_chain, second_chain)
+
     # ---- network gate ----
 
     def test_xban_errors_off_undernet(self):

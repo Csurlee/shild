@@ -169,6 +169,27 @@ class FormatEventTest(unittest.TestCase):
         line = github.format_event(_pr_event(action="closed", number=7, merged=True))
         self.assertIn("carol's PR #7 merged", line)
 
+    def test_issue_title_with_embedded_newline_is_sanitized(self):
+        # Regression, 2026-08-24: push commit messages already stripped
+        # to the first line; issue/PR titles didn't -- an untreated
+        # embedded newline used to make the whole announcement silently
+        # vanish (plugin.py's broad except-Exception around formatting)
+        # instead of just the newline being stripped.
+        line = github.format_event(
+            _issue_event(number=42, title="Something broke\nfake extra content"))
+        self.assertIn("bob opened issue #42", line)
+        self.assertIn("Something broke", line)
+        self.assertNotIn("fake extra content", line)
+        self.assertNotIn("\n", line)
+
+    def test_pr_title_with_embedded_newline_is_sanitized(self):
+        line = github.format_event(
+            _pr_event(action="opened", number=7, title="Add feature\nfake extra content"))
+        self.assertIn("carol opened PR #7", line)
+        self.assertIn("Add feature", line)
+        self.assertNotIn("fake extra content", line)
+        self.assertNotIn("\n", line)
+
 
 class SeenStateStoreTest(unittest.TestCase):
     def test_unknown_repo_is_none(self):

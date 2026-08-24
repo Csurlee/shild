@@ -239,10 +239,19 @@ class GeocodeStore:
         return overflow
 
     def prune(self, now: float, hit_ttl: float, miss_ttl: float, max_entries: int = None) -> int:
-        """Explicit time-based prune (used by !weathercacheclear's
-        maintenance path or a periodic sweep) -- removes any record past
-        its TTL (hits and misses use different TTLs) in addition to the
+        """Explicit time-based prune -- removes any record past its TTL
+        (hits and misses use different TTLs) in addition to the
         size-based eviction _prune_locked already does on every put().
+
+        NOT currently called by any live code path (2026-08-24 note,
+        found via code review -- this docstring previously and
+        incorrectly claimed it was "used by !weathercacheclear's
+        maintenance path or a periodic sweep"; weathercacheclear only
+        calls clear() below, a full wipe, and no periodic sweep exists
+        in plugin.py). Pure, tested logic, kept available for a future
+        periodic sweep if one is ever added -- harmless as dead code
+        since _prune_locked's size-based eviction already bounds growth
+        on its own.
         """
         with self._lock:
             if max_entries is not None:

@@ -158,18 +158,37 @@ def _format_push(actor: str, repo: str, payload: dict, max_commits_shown: int) -
     return msg + compare_url
 
 
+def _first_line(text: str) -> str:
+    """Strips embedded \\r/\\n (and anything after the first line) from
+    third-party text before it's formatted into an announcement -- same
+    treatment push commit messages already get just above
+    (`.splitlines()[0]`). GitHub's API doesn't reject an embedded
+    newline in an issue/PR title the way its web UI does, so an
+    untreated title could contain one. Confirmed this can't cause
+    IRC-protocol injection (ircmsgs.privmsg's own argument validator
+    rejects \\r/\\n/NUL at message-construction time) -- but plugin.py's
+    broad except-Exception around event formatting means an unguarded
+    title used to silently drop the WHOLE announcement instead of just
+    the newline, letting anyone who can open an issue/PR on a watched
+    public repo suppress its own notification. Found via code review,
+    2026-08-24.
+    """
+    return text.splitlines()[0] if text else text
+
+
 def _format_issue(actor: str, repo: str, payload: dict) -> str:
     issue = payload.get("issue", {})
+    title = _first_line(issue.get("title", ""))
     return (
         f"[{repo}] {actor} opened issue #{issue.get('number')}: "
-        f"{issue.get('title', '')} — {issue.get('html_url', '')}"
+        f"{title} — {issue.get('html_url', '')}"
     )
 
 
 def _format_pull_request(actor: str, repo: str, payload: dict) -> str:
     pr = payload.get("pull_request", {})
     number = pr.get("number", payload.get("number"))
-    title = pr.get("title", "")
+    title = _first_line(pr.get("title", ""))
     url = pr.get("html_url", "")
     if payload.get("action") == "closed" and pr.get("merged"):
         return f"[{repo}] {actor}'s PR #{number} merged: {title} — {url}"

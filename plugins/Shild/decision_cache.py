@@ -56,6 +56,7 @@ its config from the registry (decisionCache.enabled/ttlSecs).
 """
 from __future__ import annotations
 
+import threading
 import time
 from collections import OrderedDict
 from typing import Optional, Tuple
@@ -92,26 +93,36 @@ class DecisionCache:
         # stuck entry (see IN_FLIGHT_STALE_AFTER_SECS above) can expire
         # on its own even if clear_in_flight() is never called for it.
         self._in_flight: dict = {}
+        # Read/written from both the worker thread (_finish(), via
+        # on_result) and the main IRC thread (_handle_event()'s
+        # synchronous paths, and !shildcheck/!shildaudit's own reads) --
+        # same "worker thread + main thread both touch this" reasoning
+        # ContextStore/BudgetManager already document for their own
+        # locks. Found missing here via code review, 2026-08-24.
+        self._lock = threading.Lock()
 
     def is_in_flight(self, network: str, host: str, *, now: Optional[float] = None) -> bool:
         if not host:
             return False
         key = (network, host)
-        marked_at = self._in_flight.get(key)
-        if marked_at is None:
-            return False
-        now = now if now is not None else time.time()
-        if now - marked_at > self.IN_FLIGHT_STALE_AFTER_SECS:
-            del self._in_flight[key]
-            return False
-        return True
+        with self._lock:
+            marked_at = self._in_flight.get(key)
+            if marked_at is None:
+                return False
+            now = now if now is not None else time.time()
+            if now - marked_at > self.IN_FLIGHT_STALE_AFTER_SECS:
+                del self._in_flight[key]
+                return False
+            return True
 
     def mark_in_flight(self, network: str, host: str, *, now: Optional[float] = None) -> None:
         if host:
-            self._in_flight[(network, host)] = now if now is not None else time.time()
+            with self._lock:
+                self._in_flight[(network, host)] = now if now is not None else time.time()
 
     def clear_in_flight(self, network: str, host: str) -> None:
-        self._in_flight.pop((network, host), None)
+        with self._lock:
+            self._in_flight.pop((network, host), None)
 
     def get(self, network: str, host: str) -> Optional[CacheValue]:
         """Returns (fused, evidence) if a decision for this host was
@@ -125,24 +136,27 @@ class DecisionCache:
         if not host:
             return None
         key = (network, host)
-        entry = self._store.get(key)
-        if entry is None:
-            return None
-        decided_at, value = entry
-        if time.time() - decided_at > self.ttl_secs:
-            del self._store[key]
-            return None
-        return value
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                return None
+            decided_at, value = entry
+            if time.time() - decided_at > self.ttl_secs:
+                del self._store[key]
+                return None
+            return value
 
     def set(self, network: str, host: str, fused: FusedDecision,
             evidence: Optional[HostEvidence]) -> None:
         if not host:
             return
         key = (network, host)
-        self._store[key] = (time.time(), (fused, evidence))
-        self._store.move_to_end(key)
-        while len(self._store) > self.max_entries:
-            self._store.popitem(last=False)
+        with self._lock:
+            self._store[key] = (time.time(), (fused, evidence))
+            self._store.move_to_end(key)
+            while len(self._store) > self.max_entries:
+                self._store.popitem(last=False)
 
     def __len__(self) -> int:
-        return len(self._store)
+        with self._lock:
+            return len(self._store)

@@ -161,6 +161,44 @@ plugin is **AGPLv3**, a meaningfully heavier copyleft than anything else this pr
 genuinely different legal question for a bot that talks to IRC users over the network. Nothing
 from that plugin's code was copied.
 
+### `shildaudit <#channel>`
+
+```
+<#channel>
+```
+
+Re-runs the full classifier + evidence pipeline (idea adapted from Armour's `chanscan`, reimplemented
+independently, nothing vendored — Armour has no license file at all) against **every user currently
+present** in `<#channel>` — the people who joined before analysis existed, or before it was tuned,
+and were therefore never evaluated. Same per-target path as `shildcheck` (both share
+`_check_one_target`), with the same two guarantees: never writes to `shadow_decisions.jsonl`, and
+never enforces, regardless of result or kill switch. **Deliberately does not require
+`Shild.enabled`** for the target channel — auditing a channel analysis was never turned on for is
+exactly the useful case.
+
+**Spends real third-party API budget** (AbuseIPDB/Scamalytics/IPQS) — one lookup per user whose host
+isn't already answered by a trusted cloak/services account, the ignore list, or a recent cached
+decision (the decision cache is consulted here, unlike `shildcheck`, which deliberately never does —
+a manual single check should genuinely re-check; a bulk sweep benefits from the cache as its single
+largest budget saver). Replies with the exact number of lookups it's about to spend **before**
+spending any of them, and **refuses outright** (never truncates) above `auditMaxUsers` (default 25)
+— raise it deliberately via `@config` if you mean it. Only non-`allow` results are posted, one line
+each; a clean sweep replies with a summary and nothing else.
+
+```
+<owner> shildaudit #windrop
+<Shild> [shadow-audit] #windrop: 43 present (41 distinct hosts), 31 resolved locally
+        (cloak/account/cached/ignored), 10 need network lookups -- proceeding
+<Shild> [shadow-audit] WARN somehost (~x@203.0.113.7) in undernet/#windrop via clas.+evi. (58%): ...
+<Shild> [shadow-audit] #windrop: done -- 1 flagged of 10 checked
+```
+
+**Real, worth knowing before running this on a busy channel**: the reputation worker's queue is
+shared with the *live* join path and drops the *oldest* queued job when full — a large sweep could
+silently discard real join evaluations queued behind it. `auditMaxUsers`'s default is deliberately
+well under the worker's own queue capacity for this reason; run this during a quiet moment, not
+mid-raid, and check the worker's dropped-count in `shildstatus` afterward if in doubt.
+
 ### `shildignore <nick or host/IP>`
 
 ```
@@ -213,6 +251,7 @@ Lists every host on the ignore list.
 | `plugins.Shild.budgetPath` | global | String | `budget.json` | Path to persisted daily/lifetime lookup-budget counters. |
 | `plugins.Shild.banIdsPath` | global | String | `shild_ban_ids.json` | Path to the persisted counter assigning each real ban its permanent `[ID: N]`. |
 | `plugins.Shild.ignoreList` | global | Space-separated list | `[]` | Hosts Shild never evaluates. Managed via `shildignore`/`shildunignore`, not meant to be hand-edited. |
+| `plugins.Shild.auditMaxUsers` | global | Positive integer | `25` | Max users needing a real lookup that `shildaudit` will act on in one call — refuses outright above this rather than truncating. Deliberately well under the reputation worker's own queue capacity. |
 | `plugins.Shild.decisionCache.enabled` | global | Boolean | `True` | Whether a host's most recent decision is reused for a repeat join/message. See "Decision cache" below. |
 | `plugins.Shild.decisionCache.ttlSecs` | global | Positive float | `7200.0` (2h, raised from 30 min 2026-08-16) | How long a cached decision is reused before a repeat gets a genuinely fresh evaluation. |
 

@@ -15,6 +15,7 @@ from pathlib import Path
 
 import supybot.conf as conf
 import supybot.ircdb as ircdb
+import supybot.ircutils as ircutils
 from supybot.test import ChannelPluginTestCase, PluginTestCase
 
 from .client import ClientConfig, WeatherResult
@@ -75,6 +76,12 @@ class WeatherTestCase(ChannelPluginTestCase):
         conf.supybot.plugins.Weather.geocodeCachePath.setValue(self._geocode_path)
         conf.supybot.plugins.Weather.secretsPath.setValue(self._secrets_path)
         conf.supybot.plugins.Weather.enabled.get(self.channel).setValue(True)
+        # perCallerRatePerMin is a GLOBAL registry value, not covered by
+        # PluginTestCase's automatic per-test config-dict restore --
+        # reset explicitly so a test that lowers it doesn't leak into a
+        # later one (same repeatedly-documented cross-test-leak
+        # discipline this project's other plugins already follow).
+        conf.supybot.plugins.Weather.perCallerRatePerMin.setValue(6)
         super().setUp()
 
         u = ircdb.users.newUser()
@@ -111,6 +118,34 @@ class WeatherTestCase(ChannelPluginTestCase):
         self.assertIn("saved", str(m).lower())
         self._stub.calls.clear()
         self.getMsg("weather")
+        self.assertEqual(self._stub.calls, [("lookup", "stuttgart")])
+
+    # ---- per-caller rate limiting (2026-08-24, found via code review) ----
+
+    def test_caller_exceeding_rate_limit_is_refused_and_no_lookup_happens(self):
+        conf.supybot.plugins.Weather.perCallerRatePerMin.setValue(2)
+        self.getMsg("weather stuttgart")
+        self.getMsg("weather stuttgart")
+        self._stub.calls.clear()
+        m = self.getMsg("weather stuttgart")
+        self.assertIn("too often", str(m))
+        self.assertEqual(self._stub.calls, [])
+
+    def test_caller_under_the_limit_is_unaffected(self):
+        conf.supybot.plugins.Weather.perCallerRatePerMin.setValue(2)
+        self.getMsg("weather stuttgart")
+        self._stub.calls.clear()
+        m = self.getMsg("weather stuttgart")
+        self.assertNotIn("too often", str(m))
+        self.assertEqual(self._stub.calls, [("lookup", "stuttgart")])
+
+    def test_distinct_callers_do_not_share_a_rate_limit_bucket(self):
+        conf.supybot.plugins.Weather.perCallerRatePerMin.setValue(1)
+        self.getMsg("weather stuttgart")
+        self._stub.calls.clear()
+        other_prefix = ircutils.joinHostmask("otherpeer", "other", "example.org")
+        m = self.getMsg("weather stuttgart", frm=other_prefix)
+        self.assertNotIn("too often", str(m))
         self.assertEqual(self._stub.calls, [("lookup", "stuttgart")])
 
     def test_setweather_then_unsetweather_round_trip(self):

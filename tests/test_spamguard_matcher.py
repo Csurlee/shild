@@ -1,7 +1,7 @@
 """Pure unit tests for plugins/SpamGuard/matcher.py -- no supybot import,
 no plugin test harness needed.
 """
-from plugins.SpamGuard.matcher import compile_term, first_match
+from plugins.SpamGuard.matcher import compile_term, first_match, looks_catastrophically_backtracking
 
 REAL_SPAM_LINE = "Hi Guys! It's Madeleine Czura! Just thought I'd leave my number here in case you're lonely ;) ."
 
@@ -59,6 +59,36 @@ def test_word_with_regex_metacharacters_is_treated_literally():
 def test_empty_text_produces_no_matcher():
     assert compile_term("") is None
     assert compile_term("", is_pattern=True) is None
+
+
+# ---- looks_catastrophically_backtracking (2026-08-24, ReDoS guard) ----
+
+def test_flags_simple_nested_quantifier():
+    assert looks_catastrophically_backtracking("(a+)+") is True
+
+
+def test_flags_nested_quantifier_with_a_suffix():
+    assert looks_catastrophically_backtracking("(a+)+b") is True
+
+
+def test_flags_nested_quantifier_with_multiple_chars_in_group():
+    assert looks_catastrophically_backtracking("(a+b*)+") is True
+
+
+def test_does_not_flag_ordinary_word_alternation():
+    assert looks_catastrophically_backtracking("free|viagra|click here") is False
+
+
+def test_does_not_flag_anchored_simple_pattern():
+    assert looks_catastrophically_backtracking(r"^It's [A-Z][a-z]+ [A-Z][a-z]+!$") is False
+
+
+def test_does_not_flag_a_single_quantified_group_alone():
+    assert looks_catastrophically_backtracking("(abc)+") is False
+
+
+def test_does_not_flag_plain_literal_text():
+    assert looks_catastrophically_backtracking("Czura") is False
 
 
 def test_first_match_empty_list_is_none():

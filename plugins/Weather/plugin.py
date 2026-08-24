@@ -15,16 +15,24 @@ else.
 """
 from __future__ import annotations
 
+import threading
 import time
+from collections import OrderedDict
 
 from supybot import callbacks, ircdb, log
 from supybot.commands import optional, wrap
 
 from . import store
+from .cache import TokenBucket
 from .client import ClientConfig, WeatherClient
 from .render import format_weather_line, render_aqi_line
 from .secrets import load_weather_secrets
 from .store import GeocodeStore, LocationStore, SavedLocation
+
+# LRU bound for _per_caller_buckets below, same default Shild's own
+# max_tracked_nicks uses, same reasoning: long-uptime growth otherwise
+# accumulates one entry per distinct caller identity forever.
+_MAX_TRACKED_CALLERS = 5000
 
 
 class Weather(callbacks.Plugin):
@@ -49,6 +57,12 @@ class Weather(callbacks.Plugin):
             openaq_rate_per_min=self.registryValue("openaqRatePerMin"),
             cache_maxsize=self.registryValue("cacheMaxEntries"),
         )
+        # Per-caller rate limiting (2026-08-24, found via code review):
+        # `threaded = True` means concurrent command dispatch here is
+        # real, not hypothetical -- every access goes through
+        # _per_caller_lock. See _check_rate_limit's own docstring below.
+        self._per_caller_buckets: "OrderedDict[str, TokenBucket]" = OrderedDict()
+        self._per_caller_lock = threading.Lock()
 
     # ---- internal helpers ----
 
@@ -66,6 +80,32 @@ class Weather(callbacks.Plugin):
     def _location_key(self, irc, msg):
         account = self._account_for(msg)
         return store.location_key(account, irc.network, msg.nick)
+
+    def _check_rate_limit(self, irc, msg) -> bool:
+        """True (and consumes one token) if this caller has budget for
+        one more lookup right now; False if they've exceeded
+        perCallerRatePerMin. Every "weather"/"w"/"aqi" call goes through
+        here BEFORE any real network/cache work, so a single caller
+        (registered account, or nick+network if unregistered -- same
+        identity `_location_key` already uses) can't burn through the
+        shared OWM/OpenAQ/Nominatim budget alone by querying many
+        distinct place names (each one bypasses the geocode/weather
+        cache, since caching is keyed by resolved place, not caller).
+        Distinct from client.py's per-provider TokenBuckets, which
+        protect the shared upstream budget as a whole; this protects
+        that shared budget from any ONE caller monopolizing it. Found
+        via code review, 2026-08-24.
+        """
+        key = self._location_key(irc, msg)
+        with self._per_caller_lock:
+            bucket = self._per_caller_buckets.get(key)
+            if bucket is None:
+                bucket = TokenBucket(rate_per_min=self.registryValue("perCallerRatePerMin"))
+                self._per_caller_buckets[key] = bucket
+            self._per_caller_buckets.move_to_end(key)
+            while len(self._per_caller_buckets) > _MAX_TRACKED_CALLERS:
+                self._per_caller_buckets.popitem(last=False)
+            return bucket.try_acquire()
 
     def _client_config(self, days: int = None) -> ClientConfig:
         secrets = load_weather_secrets(self.registryValue("secretsPath"))
@@ -148,6 +188,10 @@ class Weather(callbacks.Plugin):
         channel = msg.channel
         if not self._enabled(channel):
             return
+        if not self._check_rate_limit(irc, msg):
+            irc.reply("weather: you're doing that too often -- try again in a moment.",
+                      prefixNick=False)
+            return
         cfg = self._client_config()
         no_key = self._no_key_reply(cfg)
         if no_key:
@@ -200,6 +244,10 @@ class Weather(callbacks.Plugin):
         """
         channel = msg.channel
         if not self._enabled(channel):
+            return
+        if not self._check_rate_limit(irc, msg):
+            irc.reply("weather: you're doing that too often -- try again in a moment.",
+                      prefixNick=False)
             return
         cfg = self._client_config()
         if not cfg.openaq_key:

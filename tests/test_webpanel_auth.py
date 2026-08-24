@@ -44,6 +44,27 @@ def test_verify_rejects_truncated_hash():
     assert not verify_password("right", truncated)
 
 
+def test_verify_rejects_empty_derived_key_without_raising():
+    """Regression, 2026-08-24: a well-formed hash string with an empty
+    dk_b64 field (dklen=0) used to make pbkdf2_hmac itself raise
+    ValueError, uncaught -- breaking this function's own "never raises"
+    contract instead of failing closed like every other corrupt-hash
+    case."""
+    h = hash_password("right", iterations=100)
+    algorithm, iterations_s, salt_b64, _dk_b64 = h.split("$")
+    degenerate = f"{algorithm}${iterations_s}${salt_b64}$"
+    assert verify_password("right", degenerate) is False
+
+
+def test_verify_rejects_zero_iterations_without_raising():
+    """Same class of regression as the empty-dk_b64 case above, for
+    iterations<=0 (also raises ValueError from pbkdf2_hmac itself)."""
+    h = hash_password("right", iterations=100)
+    algorithm, _iterations_s, salt_b64, dk_b64 = h.split("$")
+    degenerate = f"{algorithm}$0${salt_b64}${dk_b64}"
+    assert verify_password("right", degenerate) is False
+
+
 def test_verify_rejects_non_base64_fields():
     assert not verify_password("x", "pbkdf2_sha256$100$not b64!$also not b64!")
 

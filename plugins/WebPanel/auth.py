@@ -57,10 +57,16 @@ def verify_password(password: str, stored_hash: str) -> bool:
         iterations = int(iterations_s)
         salt = base64.b64decode(salt_b64, validate=True)
         expected = base64.b64decode(dk_b64, validate=True)
+        # Moved inside the try (2026-08-24 fix, found via code review):
+        # pbkdf2_hmac itself raises ValueError for a degenerate-but-
+        # well-formed stored hash (dklen=0 from an empty dk_b64, or
+        # iterations<=0) -- previously outside the try, this broke the
+        # "never raises" contract above and propagated uncaught through
+        # http.py's dispatch instead of the intended fail-closed 401.
+        actual = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt, iterations, dklen=len(expected))
     except (ValueError, binascii.Error):
         return False
-    actual = hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), salt, iterations, dklen=len(expected))
     return hmac.compare_digest(actual, expected)
 
 

@@ -44,6 +44,24 @@ def test_identity_cache_is_lru_bounded():
     assert ctx.identity_for_nick("libera", "nick4") == ("~i4", "1.1.1.4")
 
 
+def test_host_join_tracking_is_lru_bounded():
+    """Regression for a real gap found via code review, 2026-08-24:
+    _host_joins/_host_channels had no eviction at all (unlike
+    _nick_identity right above), so every distinct host ever seen
+    accumulated a permanent entry over the stated 72h+ uptime target."""
+    ctx = ContextStore(max_tracked_hosts=3)
+    for i in range(5):
+        ctx.snapshot("libera", "#windrop", "somenick", "~ident", f"1.1.1.{i}")
+    # Oldest two hosts evicted -- their join_rate/cross_chan_count reads
+    # back as if never seen (0.0, 0), same as any genuinely-unseen host.
+    assert ctx.observed_context("libera", "1.1.1.0") == (0.0, 0)
+    assert ctx.observed_context("libera", "1.1.1.1") == (0.0, 0)
+    # Most recent three retained -- 1.1.1.4 was just joined once, so its
+    # join_rate reads back as 1 (the join snapshot() itself just recorded).
+    join_rate, _ = ctx.observed_context("libera", "1.1.1.4")
+    assert join_rate == 1.0
+
+
 def test_identity_survives_being_kicked_from_state_perspective():
     """The whole point of this cache: it must still answer for a nick
     even after Limnoria's own IrcState would already have forgotten them

@@ -86,10 +86,19 @@ TERMINATOR_MARKERS = (
     "end of access",
 )
 
-# A bare 1-3 digit number anywhere in the line -- the access level column,
-# per general X ACCESS reply documentation. UNVERIFIED against a real
-# successful reply; see module docstring.
-_ACCESS_LEVEL_RE = re.compile(r"\b(\d{1,3})\b")
+# The access level, anchored to the "ACCESS" label -- per the one
+# confirmed-live successful reply ("USER: WinDropChan ACCESS: 100 L",
+# see module docstring). 2026-08-24 fix (found via code review): this
+# used to be a bare `\b(\d{1,3})\b`, matching the FIRST 1-3 digit number
+# ANYWHERE in the line -- an earlier, unrelated stray number in some
+# unverified reply shape (a user id, a numeric channel like this
+# deployment's own #127.0.0.1/#EQ) could have satisfied that before the
+# real access level did, misclassifying USABLE when it shouldn't. This
+# anchored version is strictly MORE conservative (requires more
+# structure to match) than the old one, so it can only turn a
+# wrongly-USABLE case into UNKNOWN/UNUSABLE, never the reverse --
+# consistent with this module's fail-closed design.
+_ACCESS_LEVEL_RE = re.compile(r"\bACCESS\s*:?\s*(\d{1,3})\b", re.IGNORECASE)
 
 
 def looks_like_denial(text: str) -> bool:

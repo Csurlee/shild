@@ -28,8 +28,9 @@ Four independent matchers, all sharing the same enforcement gate chain
 (_handle_match): message content (words/phrases/patterns, checked on
 PRIVMSG within joinWindowSecs of a tracked join), ident (checked at JOIN
 itself -- ident is always present, standard IRC, no capability needed),
-nick (also checked at JOIN, added 2026-08-13), and realname (also
-checked at JOIN, but ONLY when the server negotiated the IRCv3
+nick (also checked at JOIN, added 2026-08-13, and re-checked on a NICK
+CHANGE, added 2026-08-22 -- see doNick's own docstring), and realname
+(also checked at JOIN, but ONLY when the server negotiated the IRCv3
 "extended-join" capability -- see doJoin's docstring for the caveat).
 ident/nick/realname matches skip the join-window check entirely since
 the match IS the join event; content matches still require it. At JOIN,
@@ -46,6 +47,23 @@ matches, kick+banning them right then (subject to the same exemption/
 kill-switch/op gates as any other match -- an already-present halfop or
 registered user is still exempt). This is the one command in this plugin
 that acts on state beyond "the event just received."
+
+"clone_scan" (2026-08-22, see _scan_clones/_scan_clones_all) is also
+state-beyond-the-current-event, same family as "black": a periodic AND
+on-demand (`spamguardclonescan`) STATELESS snapshot of a channel's
+current userlist grouped by host -- cloneScanMaxClones or more distinct
+nicks sharing one host right now is acted on, catching slow trickle-in
+clones and clones already present before this feature existed, which
+raid/groupFlood's own burst-in-a-time-window detection structurally
+cannot see. Adapted from the IDEA in BlackTools' `CloneScan` module,
+reimplemented independently, nothing vendored (GPLv3). Every member of a
+qualifying cluster is acted on (not just one "tipping" member, unlike
+raid/groupFlood) since a clone cluster has no innocent members by
+construction -- but a cluster where ANY member is exempt is skipped
+entirely, since the ban mask is host-scoped and would otherwise also
+lock out the exempt member. Suppresses a repeat report of the same
+still-present cluster within cloneScanRepeatSuppressSecs (the periodic
+sweep only -- `spamguardclonescan` always ignores it).
 
 Four more, non-term, threshold-based message heuristics were added
 2026-08-14 (see _check_heuristics, heuristics.py, mojibake.py): flood,
@@ -82,6 +100,24 @@ against only the ONE message that tips the count over the limit -- never
 the whole burst -- for the same reason raid only acts on the
 tipping-point joiner.
 
+An eighth heuristic, "repeat_chars" (2026-08-22, see _check_heuristics),
+flags a message where one character repeats repeatCharsMinRun or more
+times in a row ("!!!!!!!!!!", "aaaaaaaaaa") -- adapted from the IDEA in
+BlackTools' `repetitivechars` Eggdrop/TCL module
+(github.com/tclscripts/BlackTools-TCL, GPLv3), reimplemented
+independently, nothing vendored.
+
+A new trigger point (2026-08-22, see doQuit/doPart/_handle_leave_match),
+NOT a new category: a leaving user's QUIT/PART reason text is checked
+against the EXISTING content word/phrase/pattern terms -- adapted from
+the IDEA in BlackTools' `antibadquitpart` module, same no-vendoring
+treatment. Deliberately, permanently OBSERVE-ONLY: the user is already
+gone from irc.state by the time either callback fires, so a match is
+logged and relayed (outcome "observed") and NEVER enforced -- see
+_handle_leave_match's own docstring for the full reasoning (a guaranteed
+no-op kick, the ban/kick coupling in _enforce(), and the netsplit
+mass-QUIT hazard).
+
 Every matched message is logged to data/spamguard_actions.jsonl and
 relayed (if configured) REGARDLESS of whether it was acted on, tagged
 with why (killswitch / not-opped / outside-window / exempt / enforced)
@@ -105,7 +141,7 @@ from pathlib import Path
 from typing import Optional
 
 from supybot import callbacks, conf, ircdb, ircmsgs, ircutils, log, schedule, world
-from supybot.commands import wrap
+from supybot.commands import wrap, additional
 from supybot.commands import any as anyArgs
 
 from shildml.schema import write_jsonl_line
@@ -133,7 +169,8 @@ _CATEGORIES = ("word", "ident", "nick", "realname", "pattern", "black")
 # satisfying every place that reads term.id/term.text (the kick reason,
 # the JSONL log, spamguardstatus).
 _HEURISTIC_IDS = {"flood": -1, "hilight": -2, "caps": -3, "mojibake": -4, "raid": -5,
-                   "host_history": -6, "group_flood": -7}
+                   "host_history": -6, "group_flood": -7, "clone_scan": -8,
+                   "repeat_chars": -9}
 
 
 def _heuristic_term(category: str, text: str) -> termstore.Term:
@@ -179,6 +216,12 @@ class SpamGuard(callbacks.Plugin):
         # _prune_recent_group_messages and only populated at all while
         # groupFloodEnabled is on somewhere.
         self._recent_group_messages: dict[tuple[str, str], list[tuple[float, str]]] = {}
+        # (network, channel, host) -> last time this clone cluster was
+        # reported, for the clone-scan heuristic (2026-08-22). Stamped
+        # on REPORT (not just successful enforcement) -- see
+        # _scan_clones's own docstring for why. The on-demand
+        # spamguardclonescan command always ignores this.
+        self._clone_scan_seen: dict[tuple[str, str, str], float] = {}
         self._stats = {"messages": 0, "matches": 0, "enforced": 0}
         self._pending_unbans: dict[str, None] = {}
 
@@ -212,6 +255,18 @@ class SpamGuard(callbacks.Plugin):
             pass
         schedule.addPeriodicEvent(
             self._pin_network_values, 60, self._pin_event_name, now=False)
+
+        self._clone_scan_event_name = f"spamguard-clonescan-{id(self)}"
+        try:
+            schedule.removeEvent(self._clone_scan_event_name)
+        except KeyError:
+            pass
+        schedule.addPeriodicEvent(
+            self._scan_clones_all,
+            self.registryValue("cloneScanIntervalSecs"),
+            self._clone_scan_event_name,
+            now=False,  # a sweep firing inside every test's setUp() would be a mess
+        )
 
     def _pin_network_values(self) -> None:
         """2026-08-22: relayChannel (registerNetworkValue) is only
@@ -277,6 +332,10 @@ class SpamGuard(callbacks.Plugin):
             pass
         try:
             schedule.removeEvent(self._pin_event_name)
+        except KeyError:
+            pass
+        try:
+            schedule.removeEvent(self._clone_scan_event_name)
         except KeyError:
             pass
         self.__parent.die()
@@ -385,13 +444,21 @@ class SpamGuard(callbacks.Plugin):
             self._recent_group_messages.pop(key, None)
 
     def _is_exempt(self, irc, channel: str, msg) -> bool:
-        """Halfop+ in-channel, holding this channel's own ircdb 'op'
-        capability, or (if exemptRegistered) any recognized registered
-        user -- same exemption set Limnoria's own bundled BadWords plugin
-        uses for its first two, plus the registered-user check from the
-        2026-08-04 Misc hardening pass for the third."""
+        """Voice+ in-channel (voiced, halfop, or op -- irclib.py's
+        IrcChannelState.isVoicePlus), holding this channel's own ircdb
+        'op' capability, or (if exemptRegistered) any recognized
+        registered user -- the first two started as the exemption set
+        Limnoria's own bundled BadWords plugin uses (originally
+        halfop+ only), widened to voice+ 2026-08-22 per explicit user
+        request: a channel op vouching for someone with +v is a real,
+        deliberate trust signal, same in kind as the halfop+ case, just
+        one rung lower. This only ever exempts real ENFORCEMENT --
+        _handle_match still logs/relays every match regardless (outcome
+        "exempt"), same "log unconditionally, act conditionally"
+        discipline as everywhere else in this plugin, so a voiced
+        user's matches stay fully observable for tuning."""
         chan_state = irc.state.channels.get(channel)
-        if chan_state is not None and chan_state.isHalfopPlus(msg.nick):
+        if chan_state is not None and chan_state.isVoicePlus(msg.nick):
             return True
         cap = ircdb.makeChannelCapability(channel, "op")
         if ircdb.checkCapability(msg.prefix, cap):
@@ -517,6 +584,133 @@ class SpamGuard(callbacks.Plugin):
                 return
             self._prune_recent_joins(now)
 
+    def doNick(self, irc, msg):
+        """Re-checks the nick terms on a NICK CHANGE, not just at JOIN
+        (idea from BlackTools' `badnick`, reimplemented -- nothing
+        vendored, GPLv3). Closes the obvious evasion: join under a
+        clean nick, change to the real one once nobody is watching the
+        join.
+
+        msg.nick is the OLD nick, msg.args[0] is the NEW one.
+        Critically, Limnoria updates IrcState BEFORE dispatching to
+        callbacks (irclib.py's feedMsg: state.addMsg() runs before the
+        callback loop), so IrcState.doNick's own
+        `chan.replaceUser(oldNick, newNick)` has ALREADY happened by
+        the time this runs -- which is why this builds a SYNTHETIC
+        message carrying the NEW nick rather than passing `msg`
+        straight through. _is_exempt() calls
+        chan_state.isVoicePlus(msg.nick); with the raw message that
+        would look up the OLD nick, which no longer exists in the
+        channel's user list, and a voiced user would silently lose
+        their voice+ exemption (2026-08-22).
+        """
+        if msg.nick == irc.nick:
+            return
+        old_nick, new_nick = msg.nick, msg.args[0]
+        ident, host = msg.user, msg.host
+        network = irc.network
+
+        channels = msg.tagged("channels") or [
+            c for c, st in irc.state.channels.items() if new_nick in st.users
+        ]
+
+        # Carry the tracked join timestamp across the rename, so a
+        # spammer who joins clean, renames, then pastes a template is
+        # still INSIDE the content join window. Deliberately does NOT
+        # re-key _recent_messages -- that would change the flood
+        # heuristic's own behavior, which is a separate decision.
+        for key in [k for k in self._joins if k[0] == network and k[2] == old_nick]:
+            self._joins[(key[0], key[1], new_nick)] = self._joins.pop(key)
+
+        term = matcher.first_match(self._nick_matchers, new_nick) if new_nick else None
+        if term is None:
+            return
+
+        synth = ircmsgs.IrcMsg(command="NICK", args=(new_nick,),
+                                prefix=f"{new_nick}!{ident}@{host}")
+        for channel in channels:
+            if not self._enabled(irc, channel):
+                continue
+            self._handle_match(irc, synth, channel, new_nick, ident, host, term,
+                                field="nick", require_join_window=False)
+
+    def _handle_leave_match(self, irc, msg, channel, nick, ident, host, term, *,
+                             field: str, event: str) -> None:
+        """The ONE matcher path in this plugin that deliberately does
+        NOT funnel through _handle_match. By the time a QUIT/PART
+        reaches a callback, Limnoria has already removed the user from
+        irc.state (IrcState updates before the callback loop runs) --
+        they are gone. A KICK against them is a guaranteed no-op, and
+        _enforce()'s ban and kick are one coupled unit -- splitting
+        that unit for a signal this cheap to fake (a quit/part reason
+        costs an actor nothing to set) would be real blast radius on
+        the plugin's most safety-critical code for marginal benefit.
+        A netsplit also delivers one QUIT per affected user with an
+        identical reason ("*.net *.split"-shaped) -- observing turns
+        that into a burst of log lines; banning on match would risk a
+        mass-ban on a routine network event.
+
+        So this logs and relays with outcome "observed" and stops.
+        Turning a real observation into real enforcement is the
+        operator's call: `spamguard black add <host>` sweeps everyone
+        already present AND blocks the next join with the correct
+        mask at the correct moment, and hostBanAutoRebanEnabled covers
+        a repeat offender. Nothing is lost by not banning at quit/part
+        time -- this path is structurally incapable of enforcing, and
+        that's the point, which is why it's its own method rather than
+        a flag on _handle_match.
+        """
+        self._stats["matches"] += 1
+        self._log(network=irc.network, channel=channel, nick=nick, ident=ident,
+                   host=host, term=term, field=field, outcome="observed")
+        self._relay(
+            irc,
+            f"[spamguard] matched {field} '{term.text}' [id:{term.id}] in a "
+            f"{event} reason from {nick} ({ident}@{host}) in {irc.network}/{channel} "
+            f"-- already gone, observed only",
+        )
+
+    def _check_leave_reason(self, irc, msg, channels, reason, *, field: str, event: str) -> None:
+        if not reason:
+            return
+        text = ircutils.stripFormatting(reason)
+        term = matcher.first_match(self._content_matchers, text)
+        if term is None:
+            return
+        nick, ident, host = msg.nick, msg.user, msg.host
+        for channel in channels:
+            if not self._enabled(irc, channel):
+                continue
+            if not self.registryValue("quitPartEnabled", channel, irc.network):
+                continue
+            self._handle_leave_match(irc, msg, channel, nick, ident, host, term,
+                                      field=field, event=event)
+
+    def doQuit(self, irc, msg):
+        """QUIT's reason is msg.args[0] -- but args may be entirely
+        empty (a bare QUIT with no reason has NO args at all), so this
+        must be guarded rather than indexed unconditionally. Observe-
+        only -- see _handle_leave_match's own docstring."""
+        if msg.nick == irc.nick:
+            return
+        reason = msg.args[0] if msg.args else ""
+        channels = msg.tagged("channels") or ()
+        self._check_leave_reason(irc, msg, channels, reason,
+                                  field="quit_reason", event="quit")
+
+    def doPart(self, irc, msg):
+        """PART's msg.args[0] is the channel(s) -- possibly comma-
+        separated for a multi-channel part (ircmsgs.parts() joins with
+        ',', and IrcState.doPart splits on it the same way). The
+        reason, if given at all, is msg.args[1]. Observe-only -- see
+        _handle_leave_match's own docstring."""
+        if msg.nick == irc.nick:
+            return
+        reason = msg.args[1] if len(msg.args) > 1 else ""
+        channels = msg.args[0].split(",") if msg.args else ()
+        self._check_leave_reason(irc, msg, channels, reason,
+                                  field="part_reason", event="part")
+
     def doPrivmsg(self, irc, msg):
         channel = msg.channel
         if channel is None or msg.nick == irc.nick or ircmsgs.isCtcp(msg):
@@ -542,21 +736,25 @@ class SpamGuard(callbacks.Plugin):
         -- see heuristics.py/mojibake.py's own module docstrings): flood,
         mass nick-highlight, excessive caps, and mojibake/garbled
         encoding, plus group_flood (2026-08-22, message-side counterpart
-        to raid -- see heuristics.py's prune_join_events docstring).
-        Each is a per-channel opt-in (default off, see config.py's
-        module comment on this block) -- unlike content/ident/nick/
-        realname, which are implicitly off until a term is added, these
-        have no natural "off" state otherwise, since a threshold always
-        applies once code exists to check it. First hit wins, same
-        convention as doJoin's nick/ident/realname chain -- checked in
-        this order: flood, group_flood, hilight, caps, mojibake.
-        group_flood is checked right after flood since it's flood's
-        grouped sibling -- same window mechanics, but counting distinct
-        nicks across the whole channel instead of one nick's own rate.
-        None require the join window (require_join_window=False) --
-        these are general per-message conduct signals, not specifically
-        the "just joined and pasted a template" pattern content matching
-        targets.
+        to raid -- see heuristics.py's prune_join_events docstring) and
+        repeat_chars (2026-08-22, adapted from BlackTools' TCL
+        `repetitivechars`, see heuristics.py's longest_char_run
+        docstring). Each is a per-channel opt-in (default off, see
+        config.py's module comment on this block) -- unlike content/
+        ident/nick/realname, which are implicitly off until a term is
+        added, these have no natural "off" state otherwise, since a
+        threshold always applies once code exists to check it. First hit
+        wins, same convention as doJoin's nick/ident/realname chain --
+        checked in this order: flood, group_flood, hilight, caps,
+        mojibake, repeat_chars. group_flood is checked right after flood
+        since it's flood's grouped sibling -- same window mechanics, but
+        counting distinct nicks across the whole channel instead of one
+        nick's own rate. repeat_chars is checked last, the lowest-risk
+        position to add a ninth check without disturbing the existing
+        order. None require the join window (require_join_window=False)
+        -- these are general per-message conduct signals, not
+        specifically the "just joined and pasted a template" pattern
+        content matching targets.
         """
         network = irc.network
         now = time.time()
@@ -636,6 +834,16 @@ class SpamGuard(callbacks.Plugin):
                 term = _heuristic_term("mojibake", f"mojibake score {score}")
                 self._handle_match(irc, msg, channel, nick, ident, host, term,
                                     field="mojibake", require_join_window=False)
+                return
+
+        if self.registryValue("repeatCharsEnabled", channel, network):
+            run = heuristics.longest_char_run(text)
+            threshold = self.registryValue("repeatCharsMinRun")
+            if run >= threshold:
+                term = _heuristic_term(
+                    "repeat_chars", f"{run}-character repeated run ({len(text)} chars)")
+                self._handle_match(irc, msg, channel, nick, ident, host, term,
+                                    field="repeat_chars", require_join_window=False)
                 return
 
     # ---- shared gate chain (content/ident/nick/realname all funnel through here) ----
@@ -785,6 +993,141 @@ class SpamGuard(callbacks.Plugin):
                         hits += 1
         return hits
 
+    def _scan_clones_all(self, *, force: bool = False) -> tuple[int, int]:
+        """Every connected network, every channel where BOTH `enabled`
+        and `cloneScanEnabled` are on. Returns (clusters_found,
+        enforcements) summed across every channel scanned."""
+        clusters = enforced = 0
+        for irc in world.ircs:
+            network = irc.network
+            for channel in list(irc.state.channels):
+                if not self.registryValue("enabled", channel, network):
+                    continue
+                if not self.registryValue("cloneScanEnabled", channel, network):
+                    continue
+                c, e = self._scan_clones(irc, channel, force=force)
+                clusters += len(c)
+                enforced += e
+        return clusters, enforced
+
+    def _scan_clones(self, irc, channel: str, *, force: bool = False):
+        """Groups every currently-present user in `channel` by host and
+        acts on any host with cloneScanMaxClones or more distinct
+        nicks. This is a STATELESS snapshot (unlike raid/groupFlood,
+        which are burst-in-a-time-window detectors) -- it catches slow
+        trickle-in clones and clones that were already sitting in the
+        channel before this feature existed.
+
+        Returns (clusters, enforced_count) where clusters is a list of
+        (host, [(nick, ident), ...]) for the command's own reply.
+
+        Two things happen before a cluster is acted on, in order:
+
+        1. Suppression (skipped when force=True, i.e. the on-demand
+           spamguardclonescan command): if this (network, channel, host)
+           cluster was already REPORTED within cloneScanRepeatSuppressSecs,
+           skip it this pass. Enforcement firing is self-limiting (the
+           cluster is gone next scan) -- the real failure mode is
+           enforcement NOT firing (kill switch on, the default; or not
+           opped; or exempt), in which case _handle_match still
+           logs+relays every pass by design ("log unconditionally, act
+           conditionally"), which would otherwise produce a fresh relay
+           line every single interval, forever, during exactly the
+           observe-with-killswitch-on phase that convention exists to
+           keep readable. Stamped on REPORT, not only on successful
+           enforcement.
+        2. Cluster-level exemption: the ban mask this feature produces
+           is per-HOST, but exemptRegistered/voice+/op capability are
+           evaluated per-NICK inside _handle_match. In a shared-host
+           cluster where one member is voiced, kicking the unvoiced
+           members and banning the host would also lock out the voiced
+           one on their next reconnect -- a failure mode no existing
+           heuristic has, since every one of them acts on exactly one
+           user. If ANY member is exempt, the whole cluster is skipped
+           after producing exactly one outcome="exempt" record (for the
+           first exempt member found, nick-sorted) -- the cluster stays
+           fully observable for tuning, and nothing here bypasses the
+           normal exemption/killSwitch/op gate chain.
+
+        Otherwise, EVERY member is acted on (not just a "tipping" one,
+        unlike raid/groupFlood) -- a clone cluster has no innocent
+        members by construction, unlike a join/message burst which
+        could be genuine regulars reconnecting after a netsplit. The
+        host-scoped mask already bans the whole cluster from rejoining
+        after the first call; the remaining calls exist to actually
+        remove the others from the channel now.
+        """
+        now = time.time()
+        network = irc.network
+        chan_state = irc.state.channels.get(channel)
+        if chan_state is None:
+            return [], 0
+
+        by_host: dict[str, list[tuple[str, str]]] = {}
+        for nick in list(chan_state.users):
+            if nick == irc.nick:
+                continue
+            try:
+                hostmask = irc.state.nickToHostmask(nick)
+            except KeyError:
+                continue
+            if not hostmask or not ircutils.isUserHostmask(hostmask):
+                continue
+            _n, ident, host = ircutils.splitHostmask(hostmask)
+            if not host:
+                continue
+            by_host.setdefault(host, []).append((nick, ident))
+
+        limit = self.registryValue("cloneScanMaxClones")
+        suppress = self.registryValue("cloneScanRepeatSuppressSecs")
+        clusters = []
+        enforced = 0
+        for host in sorted(by_host):
+            members = sorted(by_host[host])
+            if len(members) < limit:
+                continue
+            clusters.append((host, members))
+
+            if not force:
+                last = self._clone_scan_seen.get((network, channel, host), 0.0)
+                if now - last < suppress:
+                    continue
+            self._clone_scan_seen[(network, channel, host)] = now
+
+            term = _heuristic_term(
+                "clone_scan", f"{len(members)} nicks sharing host {host}")
+
+            exempt_member = None
+            for nick, ident in members:
+                synth = ircmsgs.IrcMsg(command="JOIN", args=(channel,),
+                                        prefix=f"{nick}!{ident}@{host}")
+                if self._is_exempt(irc, channel, synth):
+                    exempt_member = (nick, ident, synth)
+                    break
+
+            if exempt_member is not None:
+                nick, ident, synth = exempt_member
+                self._handle_match(irc, synth, channel, nick, ident, host, term,
+                                    field="clone_scan", require_join_window=False)
+                continue
+
+            before = self._stats["enforced"]
+            for nick, ident in members:
+                synth = ircmsgs.IrcMsg(command="JOIN", args=(channel,),
+                                        prefix=f"{nick}!{ident}@{host}")
+                self._handle_match(irc, synth, channel, nick, ident, host, term,
+                                    field="clone_scan", require_join_window=False)
+            if self._stats["enforced"] > before:
+                enforced += 1
+
+        # Prune stale suppression entries for this channel while we're here.
+        stale = [k for k, ts in self._clone_scan_seen.items()
+                 if k[0] == network and k[1] == channel and now - ts > suppress]
+        for k in stale:
+            self._clone_scan_seen.pop(k, None)
+
+        return clusters, enforced
+
     # ---- enforcement ----
 
     def _enforce(self, irc, network, channel, nick, ident, host, term, field: str,
@@ -890,7 +1233,8 @@ class SpamGuard(callbacks.Plugin):
 
         Reports SpamGuard's match/enforcement counters and kill-switch
         state. Run in a channel to also see that channel's per-heuristic
-        (flood/groupflood/hilight/caps/mojibake/raid) enable state.
+        (flood/groupflood/hilight/caps/mojibake/raid/repeatchars/
+        clonescan) enable state.
         """
         counts = {cat: len(self._terms.by_category(cat)) for cat in termstore.CATEGORIES}
         irc.reply(
@@ -916,7 +1260,9 @@ class SpamGuard(callbacks.Plugin):
                 f"SpamGuard heuristics in {msg.channel}: flood={on('floodEnabled')} "
                 f"groupflood={on('groupFloodEnabled')} "
                 f"hilight={on('hilightEnabled')} caps={on('capsEnabled')} "
-                f"mojibake={on('mojibakeEnabled')} raid={on('raidEnabled')}"
+                f"mojibake={on('mojibakeEnabled')} raid={on('raidEnabled')} "
+                f"repeatchars={on('repeatCharsEnabled')} "
+                f"clonescan={on('cloneScanEnabled')}"
             )
     spamguardstatus = wrap(spamguardstatus, ["owner"])
 
@@ -1009,6 +1355,54 @@ class SpamGuard(callbacks.Plugin):
             irc.error(f"No host-ban record for {host!r}.")
     spamguardhostbansremove = wrap(spamguardhostbansremove, ["owner", "something"])
 
+    def spamguardclonescan(self, irc, msg, args, channel):
+        """[<channel>]
+
+        Snapshots a channel's CURRENT userlist, groups by host, and
+        acts on any host with cloneScanMaxClones or more distinct nicks
+        present right now -- the slow-trickle/already-seated case raid
+        and groupFlood structurally cannot see (idea from BlackTools'
+        CloneScan module, reimplemented, nothing vendored). Runs the
+        same gate chain as any other match (exemption / killSwitch / op
+        / X fallback), so nothing here can act where a live match
+        couldn't. Ignores the repeat-suppression window -- an operator
+        explicitly asking for a scan always wants a full answer. With
+        no argument in a channel, scans that channel; in a PM with no
+        argument, scans every enabled channel on every connected
+        network.
+        """
+        if channel is None:
+            if msg.channel:
+                targets = [(irc, msg.channel)]
+            else:
+                targets = [
+                    (i, c) for i in world.ircs for c in list(i.state.channels)
+                    if self.registryValue("enabled", c, i.network)
+                ]
+        else:
+            if not ircutils.isChannel(channel):
+                irc.error(f"{channel!r} doesn't look like a channel.")
+                return
+            targets = [(irc, channel)]
+
+        total_clusters = 0
+        total_enforced = 0
+        lines = []
+        for target_irc, target_channel in targets:
+            clusters, enforced = self._scan_clones(target_irc, target_channel, force=True)
+            total_clusters += len(clusters)
+            total_enforced += enforced
+            for host, members in clusters:
+                shown = ", ".join(nick for nick, _ident in members[:5])
+                suffix = "" if len(members) <= 5 else f" (+{len(members) - 5} more)"
+                lines.append(f"{host} ({len(members)}: {shown}{suffix})")
+
+        reply = f"clone scan: {total_clusters} cluster(s), {total_enforced} enforced"
+        if lines:
+            reply += " | " + " | ".join(lines)
+        irc.reply(reply)
+    spamguardclonescan = wrap(spamguardclonescan, ["owner", additional("channel")])
+
     def spamguard(self, irc, msg, args, category, action, terms):
         """<word|ident|nick|realname|pattern|black> <add|remove> <term> [...]
 
@@ -1040,10 +1434,23 @@ class SpamGuard(callbacks.Plugin):
                 store_category = "phrase" if " " in term_text else "word"
 
             if action == "add":
-                if store_category == "pattern" and matcher.compile_term(
-                        term_text, is_pattern=True) is None:
-                    results.append(f"{term_text!r}: invalid regex, skipped")
-                    continue
+                if store_category == "pattern":
+                    if matcher.compile_term(term_text, is_pattern=True) is None:
+                        results.append(f"{term_text!r}: invalid regex, skipped")
+                        continue
+                    # 2026-08-24 fix (found via code review): pattern
+                    # terms run synchronously on this plugin's single,
+                    # unthreaded main loop (threaded=False) for every
+                    # message -- a catastrophic-backtracking pattern
+                    # would hang the whole bot. Best-effort heuristic,
+                    # not exhaustive -- see matcher.py's own comment.
+                    if matcher.looks_catastrophically_backtracking(term_text):
+                        results.append(
+                            f"{term_text!r}: looks like it could cause "
+                            "catastrophic regex backtracking (nested "
+                            "quantifier), refusing to add"
+                        )
+                        continue
                 existing = self._terms.find_by_text(store_category, term_text)
                 if existing is not None:
                     results.append(f"{term_text!r}: already present [id:{existing.id}]")
