@@ -590,3 +590,23 @@ conf.registerGlobalValue(
         clears it). The on-demand `spamguardclonescan` command always
         ignores this window.""")),
 )
+conf.registerGlobalValue(
+    SpamGuard, "relayRepeatSuppressSecs",
+    registry.NonNegativeInteger(300, _(
+        """How long (seconds) an identical not-acted-on match -- same
+        (network, channel, host, field, outcome), e.g. the SAME host
+        repeatedly tripping the flood heuristic while exempt -- is
+        suppressed from generating a fresh ##relay notice. JSONL logging
+        (data/spamguard_actions.jsonl) is NEVER affected by this, only
+        the live relay line; every distinct (host, field, outcome)
+        combination still relays immediately on first occurrence
+        regardless of this setting. Added 2026-09-02 after a real,
+        tolerated, registered-account bot flooding a channel it was
+        allowed to flood in produced a fresh "exempt -- not acted on"
+        relay line every ~8-40s for as long as it kept talking -- same
+        noise class cloneScanRepeatSuppressSecs already guards against
+        for the periodic clone-scan, just never applied to the live
+        match path until now. 0 disables suppression entirely (relay
+        every single match, the pre-2026-09-02 behavior). Per-plugin-
+        instance only -- an @reload clears the tracked state.""")),
+)

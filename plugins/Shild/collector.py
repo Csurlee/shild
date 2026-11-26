@@ -29,6 +29,7 @@ OBSERVED_MODERATION_SCHEMA_VERSION = 1
 ENFORCEMENT_SCHEMA_VERSION = 2  # 2026-08-16: added "via" (native op-based
 # MODE+KICK vs. X-routed BAN+KICK -- see build_enforcement_record's `via`
 # param and plugins/Shild/plugin.py's `_x_fallback`/`_maybe_enforce`)
+SILENCE_SCHEMA_VERSION = 1
 
 
 def build_record(
@@ -163,6 +164,43 @@ def build_enforcement_record(
         "duration_secs": duration_secs,
         "unban_at": unban_at,
         "via": via,
+        "fused_decision": {
+            "action": fused.action, "confidence": fused.confidence,
+            "source": fused.source, "reason": fused.reason,
+        },
+    }
+
+
+def build_silence_record(
+    *, network: str, channel: str, nick: str, ident: str, host: str,
+    mask: str, mode_char: str, reason: str, duration_secs: int, expires_at: float,
+    fused: fusion.FusedDecision,
+) -> dict:
+    """A real warn-tier silence Shild itself took (2026-09-04, see
+    plugin.py's `_maybe_silence`) -- deliberately a SEPARATE log
+    (`silenceLogPath`) from `enforcement_actions.jsonl` rather than a new
+    `via`-style variant of build_enforcement_record above: a silence is
+    never a kick+ban (no target ever removed from the channel), and
+    conflating the two would make "how many real kicks has Shild done"
+    a query that has to filter this file by field instead of just
+    counting its lines. `mode_char` is "q" (quiet) or "b" (ban, no
+    kick -- the ircu fallback, see silence.quietCapable). No `id` field
+    (unlike build_enforcement_record) -- silences aren't assigned a
+    BanIdStore number; the kick message an id would appear in doesn't
+    exist here.
+    """
+    return {
+        "schema_version": SILENCE_SCHEMA_VERSION,
+        "source": "limnoria-shild-silence",
+        "ts": time.time(),
+        "network": network,
+        "channel": channel,
+        "target": {"nick": nick, "ident": ident, "host": host},
+        "mask": mask,
+        "mode_char": mode_char,
+        "reason": reason,
+        "duration_secs": duration_secs,
+        "expires_at": expires_at,
         "fused_decision": {
             "action": fused.action, "confidence": fused.confidence,
             "source": fused.source, "reason": fused.reason,

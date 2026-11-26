@@ -12,9 +12,14 @@ BOTH hold: the bot currently has op in that channel (checked live via
 `enforcement.is_opped()`, never cached) AND the global
 `protection.killSwitch` is off (it defaults to True -- a fresh deploy is
 always safe even if the bot already has op somewhere at startup). `warn`
-verdicts take no enforcement action, same as before this phase.
+verdicts take no kick/ban action, same as before this phase -- but
+(2026-09-04) CAN take a real, deliberately LESSER action of their own,
+independently gated by `protection.warnSilenceEnabled` (default False):
+a channel quiet (+q, where the network's ircd supports it) or a plain
+ban with no kick (the fallback where it doesn't) -- see `_maybe_silence`
+and plugins/Shild/silence.py.
 `plugins/Shild/enforcement.py` is the ONLY module allowed to construct a
-real KICK/MODE(+b)/UNBAN message -- verify with:
+real KICK/MODE(+b/+q)/UNBAN message -- verify with:
 
     grep -rEn "ircmsgs\\.(kick|ban|mode)\\(" plugins/Shild/
 
@@ -52,10 +57,12 @@ from . import proxyscan
 from .ban_ids import BanIdStore
 from .budget import BudgetManager, ProviderLimits
 from .classifier import ClassifierWrapper
-from .collector import Collector, build_enforcement_record, build_moderation_record, build_record
+from .collector import (Collector, build_enforcement_record, build_moderation_record,
+                        build_record, build_silence_record)
 from .context import ContextSnapshot, ContextStore
 from .decision_cache import DecisionCache
 from .reputation import ReputationConfig, ReputationGatherer, load_secrets
+from .silence import SilenceRecord, SilenceStore, generate_code
 from .worker import Worker
 
 # IRC-display-only abbreviations for the phrases evidence.HostEvidence.summary()
@@ -171,14 +178,17 @@ class Shild(callbacks.Plugin):
         self._collector = Collector(self.registryValue("shadowDataPath"))
         self._moderation_log = Collector(self.registryValue("moderationLogPath"))
         self._enforcement_log = Collector(self.registryValue("enforcementLogPath"))
+        self._silence_log = Collector(self.registryValue("silenceLogPath"))
         self._ban_ids = BanIdStore(self.registryValue("banIdsPath"))
         # Names of scheduled auto-unban events this instance created, so
         # die() can clean them up rather than leaking a callback bound to
         # a dead plugin instance across a reload (same pattern as
         # _reload_event_name below, just plural/dynamic).
         self._pending_unbans: dict[str, None] = {}
+        self._silences = SilenceStore(self.registryValue("silence.storePath"))
         self._session: Optional[aiohttp.ClientSession] = None  # created inside the worker loop
-        self._stats = {"joins": 0, "messages": 0, "decisions": 0, "degraded": 0, "gated": 0, "enforced": 0}
+        self._stats = {"joins": 0, "messages": 0, "decisions": 0, "degraded": 0, "gated": 0,
+                        "enforced": 0, "silenced": 0, "silence_verified": 0}
         # `self._stats[k] += 1` is a read-modify-write, not atomic, and
         # is called from both the worker thread (_finish()/
         # _maybe_enforce(), via on_result) and the main IRC thread
@@ -306,6 +316,23 @@ class Shild(callbacks.Plugin):
         schedule.addPeriodicEvent(
             self._pin_network_values, 60, self._pin_event_name, now=False)
 
+        # 2026-09-04: warn-tier silence auto-lift (see _maybe_silence/
+        # _sweep_expired_silences below) -- a periodic sweep, not a
+        # one-shot schedule.addEvent per silence, so a bot restart mid-
+        # window doesn't need to re-derive/reschedule anything: the
+        # sweep just re-discovers whatever's still in SilenceStore and
+        # keeps checking every silence.checkIntervalSecs regardless.
+        self._silence_sweep_event_name = f"shildSilenceSweep-{id(self)}"
+        try:
+            schedule.removeEvent(self._silence_sweep_event_name)
+        except KeyError:
+            pass
+        schedule.addPeriodicEvent(
+            self._sweep_expired_silences,
+            self.registryValue("silence.checkIntervalSecs"),
+            self._silence_sweep_event_name, now=False,
+        )
+
     def _pin_network_values(self) -> None:
         """2026-08-22: relayChannel (registerNetworkValue) is only
         persisted through a clean shutdown's registry write-back if it was
@@ -343,6 +370,31 @@ class Shild(callbacks.Plugin):
             if current:
                 self.setRegistryValue("relayChannel", current, network=network)
 
+    def _sweep_expired_silences(self) -> None:
+        """Periodic (silence.checkIntervalSecs) -- lifts any warn-tier
+        silence whose expires_at has passed without a successful
+        `verify`. Looks up each record's OWN network via world.getIrc
+        rather than assuming a single `irc` (this runs on a scheduler
+        timer, not from an event handler, so there's no `irc` argument at
+        all). A network that's currently disconnected, or a channel where
+        the bot doesn't currently hold op (the server would reject the
+        MODE), keeps its record in SilenceStore so a later sweep tries
+        again, rather than leaking a mode nobody will ever lift.
+        """
+        for record in self._silences.prune_expired(now=time.time()):
+            live_irc = world.getIrc(record.network)
+            if live_irc is None or not enforcement.is_opped(live_irc, record.channel):
+                # Put it back -- prune_expired already removed it, but we
+                # couldn't actually lift the real mode this pass.
+                self._silences.add(record)
+                continue
+            try:
+                enforcement.lift_silence(live_irc, record.channel, record.mask,
+                                          record.mode_char)
+            except Exception:
+                log.exception("Shild: failed to auto-lift silence %s in %s/%s",
+                              record.mask, record.network, record.channel)
+
     def die(self):
         try:
             schedule.removeEvent(self._reload_event_name)
@@ -354,6 +406,10 @@ class Shild(callbacks.Plugin):
             pass
         try:
             schedule.removeEvent(self._pin_event_name)
+        except KeyError:
+            pass
+        try:
+            schedule.removeEvent(self._silence_sweep_event_name)
         except KeyError:
             pass
         for event_name in list(self._pending_unbans):
@@ -564,7 +620,7 @@ class Shild(callbacks.Plugin):
         if channel is None or not self._enabled(irc, channel):
             return
         if msg.nick == irc.nick:
-            return  # can't currently happen -- we have no kick capability
+            return  # our own real kick (_maybe_enforce) -- never double-counted as "observed"
         network = irc.network
         reason = msg.args[2] if len(msg.args) > 2 else ""
         for target_nick in msg.args[1].split(','):
@@ -597,7 +653,8 @@ class Shild(callbacks.Plugin):
         if channel is None or not self._enabled(irc, channel):
             return
         if msg.nick == irc.nick:
-            return  # can't currently happen -- we have no mode capability
+            return  # our own real ban/quiet (_maybe_enforce/_maybe_silence) -- never
+                     # double-counted as "observed" moderation by someone else
         network = irc.network
         for mode, value in ircutils.separateModes(msg.args[1:]):
             if mode not in ('+b', '+q') or not value:
@@ -874,6 +931,7 @@ class Shild(callbacks.Plugin):
             )
 
         self._maybe_enforce(irc, network, channel, nick, ident, host, fused, evidence)
+        self._maybe_silence(irc, network, channel, nick, ident, host, fused, evidence)
 
     def _x_fallback(self, irc, channel):
         """The live UndernetX plugin instance iff X-routed enforcement
@@ -984,6 +1042,82 @@ class Shild(callbacks.Plugin):
         with self._stats_lock:
             self._stats["enforced"] += 1
 
+    def _maybe_silence(self, irc, network, channel, nick, ident, host, fused, evidence) -> None:
+        """2026-09-04: turns a `warn` verdict into a real but LESSER
+        action -- a channel quiet, or a plain ban with no kick where the
+        network's ircd has no quiet mode (see silence.quietCapable) --
+        gated by protection.warnSilenceEnabled (independent of
+        killSwitch/`ban` enforcement above) AND real op (no X-fallback
+        here yet -- see warnSilenceEnabled's own config docstring). Runs
+        AFTER _maybe_enforce, and is mutually exclusive with it in
+        practice (a decision is either `ban` or `warn`, never both), but
+        that's incidental, not load-bearing -- this only ever looks at
+        fused.action itself.
+
+        A repeat `warn` for a host that already has an active, untracked
+        -expiry silence in THIS (network, channel) is a no-op here (still
+        logged/relayed by the caller as always) -- avoids resetting the
+        verify code/duration on every repeat warn from a still-connected,
+        already-silenced client, which would make `verify`ing a moving
+        target.
+        """
+        if fused.action != "warn" or fused.degraded:
+            return
+        if not self.registryValue("protection.warnSilenceEnabled"):
+            return
+        if not enforcement.is_opped(irc, channel):
+            return
+        if self._silences.get(network, channel, host) is not None:
+            return
+
+        quiet_capable = self.registryValue("silence.quietCapable", network=network)
+        mode_char = "q" if quiet_capable else "b"
+
+        try:
+            mask = enforcement.enforce_silence(irc, channel, host, mode_char)
+        except Exception:
+            log.exception("Shild: failed to enforce warn-tier silence")
+            return
+
+        now = time.time()
+        duration = self.registryValue("silence.durationSecs")
+        code = generate_code()
+        cause = _short_ban_cause(evidence)
+        score = _short_ban_score(evidence, fused.confidence)
+        reason = f"SHILD: {host} {cause} (score: {score})"
+        action_word = "quieted" if mode_char == "q" else "banned (not kicked)"
+
+        expires_at = now + duration
+        self._silences.add(SilenceRecord(
+            network=network, channel=channel, host=host, nick=nick, mask=mask,
+            mode_char=mode_char, code=code, reason=reason,
+            silenced_at=now, expires_at=expires_at,
+        ))
+
+        try:
+            self._silence_log.write(build_silence_record(
+                network=network, channel=channel, nick=nick, ident=ident, host=host,
+                mask=mask, mode_char=mode_char, reason=reason, duration_secs=duration,
+                expires_at=expires_at, fused=fused,
+            ))
+        except Exception:
+            log.exception("Shild: failed to write silence action record")
+
+        try:
+            irc.queueMsg(ircmsgs.notice(
+                nick,
+                f"You've been temporarily {action_word} in {channel} on {network} "
+                f"due to suspicious connection patterns ({cause}). If you believe "
+                f"this is a mistake, reply here with: verify {code} "
+                f"-- this lifts the restriction immediately. It also clears on its "
+                f"own in {duration // 3600}h regardless.",
+            ))
+        except Exception:
+            log.exception("Shild: failed to NOTICE silenced user %s", nick)
+
+        with self._stats_lock:
+            self._stats["silenced"] += 1
+
     # ---- the only command ----
 
     def stats_snapshot(self) -> dict:
@@ -1028,6 +1162,8 @@ class Shild(callbacks.Plugin):
             "kill_switch": self.registryValue("protection.killSwitch"),
             "pending_unbans": len(self._pending_unbans),
             "ignore_list_size": len(self.registryValue("ignoreList")),
+            "warn_silence_enabled": self.registryValue("protection.warnSilenceEnabled"),
+            "active_silences": len(self._silences),
         }
 
     def context_store(self) -> ContextStore:
@@ -1082,8 +1218,14 @@ class Shild(callbacks.Plugin):
             f"enforced={stats['enforced']} pending_unbans={snap['pending_unbans']} "
             f"ignored_hosts={snap['ignore_list_size']}",
         ]
+        silence = [
+            f"warn-silence: {'armed' if snap['warn_silence_enabled'] else 'disarmed'} "
+            f"silenced={stats['silenced']} verified={stats['silence_verified']} "
+            f"active={snap['active_silences']}",
+        ]
         irc.reply(" | ".join(general))
         irc.reply(" | ".join(protection))
+        irc.reply(" | ".join(silence))
 
     shildstatus = wrap(shildstatus, ["owner"])
 
@@ -1125,6 +1267,10 @@ class Shild(callbacks.Plugin):
             f"{self._bool_label(self.registryValue('messageAnalysis', channel, network))}",
             f"Shild.protection.killSwitch: "
             f"{self._bool_label(self.registryValue('protection.killSwitch'))}",
+            f"Shild.protection.warnSilenceEnabled: "
+            f"{self._bool_label(self.registryValue('protection.warnSilenceEnabled'))}",
+            f"Shild.silence.quietCapable: "
+            f"{self._bool_label(self.registryValue('silence.quietCapable', network=network))}",
             f"Shild.ollama.enabled: {self._bool_label(self.registryValue('ollama.enabled'))}",
         ]
 
@@ -1171,6 +1317,45 @@ class Shild(callbacks.Plugin):
         for line in lines:
             irc.reply(line)
     shildconfig = wrap(shildconfig, ["owner", "private", "channel"])
+
+    def verify(self, irc, msg, args, code):
+        """<code>
+
+        Redeems a warn-tier silence verification code (2026-09-04) --
+        sent via NOTICE to a user Shild just quieted/banned-without-kick
+        (see `_maybe_silence`, protection.warnSilenceEnabled). A correct
+        code from the SAME host that was silenced lifts the restriction
+        immediately. Deliberately NO capability requirement (anyone might
+        legitimately have received a code) but private-message only,
+        matching the NOTICE it answers -- never usable in-channel, where
+        it would just leak that a code exists to onlookers.
+        """
+        record = self._silences.get_by_code(code.strip())
+        if record is None or record.host.lower() != msg.host.lower():
+            irc.reply("No matching, unexpired silence found for your current host.")
+            return
+
+        live_irc = world.getIrc(record.network)
+        if live_irc is None:
+            irc.reply(f"{record.network} isn't currently connected; try again shortly.")
+            return
+        if not enforcement.is_opped(live_irc, record.channel):
+            irc.reply(f"I don't currently have op in {record.channel}, so I can't lift "
+                      "the restriction yet; try again later.")
+            return
+        try:
+            enforcement.lift_silence(live_irc, record.channel, record.mask, record.mode_char)
+        except Exception:
+            log.exception("Shild: failed to lift silence on verify")
+            irc.reply("Verification accepted, but lifting the restriction failed -- "
+                      "an operator has been notified via the logs.")
+            return
+
+        self._silences.remove(record.key())
+        with self._stats_lock:
+            self._stats["silence_verified"] += 1
+        irc.reply(f"Verified -- restriction lifted in {record.channel} on {record.network}.")
+    verify = wrap(verify, ["private", "something"])
 
     def shildreport(self, irc, msg, args, date):
         """[<YYYY-MM-DD>]

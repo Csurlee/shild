@@ -232,6 +232,19 @@ conf.registerGlobalValue(
 )
 
 conf.registerGlobalValue(
+    Shild, "silenceLogPath",
+    registry.String("data/silence_actions.jsonl", _(
+        """Path to the JSONL log of real warn-tier silence actions Shild
+        itself took (quiet or no-kick ban) -- see
+        plugins/Shild/collector.py's build_silence_record and
+        protection.warnSilenceEnabled above. Deliberately a SEPARATE file
+        from enforcementLogPath -- a silence never removes anyone from
+        the channel, and conflating the two would make "how many real
+        kicks has Shild done" a filtered query instead of just a line
+        count.""")),
+)
+
+conf.registerGlobalValue(
     Shild, "moderationLogPath",
     registry.String("data/observed_moderation.jsonl", _(
         """Path to the observed-moderation JSONL log: kicks/bans taken by
@@ -768,6 +781,28 @@ conf.registerGlobalValue(
         default of 60 minutes.""")),
 )
 conf.registerGlobalValue(
+    Shild.protection, "warnSilenceEnabled",
+    registry.Boolean(False, _(
+        """2026-09-04: separate arm switch for turning a `warn` verdict
+        into a REAL but LESSER enforcement action -- a channel quiet (on
+        a network whose ircd supports the +q "quiet" list mode, e.g.
+        Libera's solanum) or a plain ban with NO kick (the fallback where
+        it doesn't, e.g. Undernet's ircu -- see silence.quietCapable),
+        rather than the full kick+ban `ban` verdicts get once
+        killSwitch above is off. Independent of killSwitch on purpose --
+        an operator may want real bans armed without warn-tier silencing,
+        or vice versa; both still separately require real op in the
+        channel (enforcement.is_opped()) -- there is no X-routed fallback
+        for this yet, since UndernetX's own X-routed machinery
+        (plugins/UndernetX/xprobe.py) only covers ban/kick, not arbitrary
+        channel modes. Motivated by a real complaint: a registered/
+        SpamGuard-exempt user flooding a channel it was allowed to be in,
+        where a `warn`-tier read previously had no real lever at all.
+        Ships False -- same "real enforcement never arms itself"
+        convention as killSwitch/xFallbackEnabled elsewhere in this
+        deployment. See plugins/Shild/silence.py for the full design.""")),
+)
+conf.registerGlobalValue(
     Shild, "banIdsPath",
     registry.String("shild_ban_ids.json", _(
         """Path to the persisted, ever-incrementing counter that assigns
@@ -777,4 +812,61 @@ conf.registerGlobalValue(
         -- do NOT prefix with "runtime/" (see budgetPath's own docstring
         for the double-"runtime/" bug this exact mistake caused
         there).""")),
+)
+
+# ---------------------------------------------------------------------
+# 2026-09-04: warn-tier silence (see protection.warnSilenceEnabled above
+# and plugins/Shild/silence.py). Global/network values, same as
+# protection.* above -- there is no channel-op-settable value in this
+# group at all, so a channel op can never arm real enforcement or
+# repoint which ircds are treated as quiet-capable.
+# ---------------------------------------------------------------------
+
+conf.registerGroup(Shild, "silence")
+conf.registerNetworkValue(
+    Shild.silence, "quietCapable",
+    registry.Boolean(False, _(
+        """Whether THIS network's ircd supports the +q "quiet" channel
+        list mode (silences an already-present user without removing
+        them) -- Libera's solanum/charybdis-family ircd does; Undernet's
+        ircu does NOT. When False for a network (the default -- an
+        unconfigured network is assumed NOT quiet-capable, fail-safe),
+        warn-tier silencing (protection.warnSilenceEnabled) falls back to
+        a plain +b ban with NO kick instead -- this does NOT immediately
+        silence an already-present talking user on that network (a ban
+        only blocks a FUTURE (re)join), a known, accepted asymmetry
+        versus +q, not a bug; it still stops the SAME connection from
+        simply reconnecting past the warning. Not live-verified against
+        either network's real ircd as of 2026-09-04 -- same "confirm
+        before really relying on it" caveat as UndernetX's own
+        xprobe.py. Set True per network via `@config network <network>
+        plugins.Shild.silence.quietCapable True` once confirmed.""")),
+)
+conf.registerGlobalValue(
+    Shild.silence, "durationSecs",
+    registry.PositiveInteger(86400, _(
+        """How long (seconds) a real warn-tier silence (quiet or
+        no-kick ban, see protection.warnSilenceEnabled) lasts before
+        being automatically lifted if the user never verifies. Default
+        24h -- longer than protection.banDurationSecs (1h) since this is
+        a deliberately milder action with its own, faster way out (a
+        correct `verify <code>` PM lifts it immediately -- see
+        plugin.py's `verify` command).""")),
+)
+conf.registerGlobalValue(
+    Shild.silence, "storePath",
+    registry.String("shild_silences.json", _(
+        """Path to the persisted state for currently-active warn-tier
+        silences (host, mask, mode used, verify code, expiry) -- see
+        plugins/Shild/silence.py. Resolved relative to the bot's own
+        working directory (runtime/), same convention as banIdsPath --
+        do NOT prefix with "runtime/".""")),
+)
+conf.registerGlobalValue(
+    Shild.silence, "checkIntervalSecs",
+    registry.PositiveInteger(300, _(
+        """How often (seconds) the periodic sweep checks for expired
+        warn-tier silences to actually lift -- a cheap in-memory scan of
+        however many are currently tracked, same shape as SpamGuard's
+        own hostBanPruneIntervalSecs.""")),
 )

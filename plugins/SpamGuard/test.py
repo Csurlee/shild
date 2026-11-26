@@ -1008,6 +1008,67 @@ class SpamGuardTestCase(ChannelPluginTestCase):
         kicks = [m for m in self._queued() if m.command == "KICK"]
         self.assertEqual(len(kicks), 1)
 
+    # ---- relayRepeatSuppressSecs (2026-09-02) ----
+
+    def test_relay_repeat_suppressed_for_identical_exempt_flood_match(self):
+        """A real, tolerated, registered bot flooding a channel it's
+        allowed to flood in was producing a fresh "exempt -- not acted
+        on" relay line every single time flood re-triggered (every
+        floodMessageLimit messages, since floodEnabled resets its own
+        tracked window on trigger -- see _check_heuristics). This pins
+        the fix: JSONL logging stays unconditional (both triggers are
+        still logged), but the identical (network, channel, host, field,
+        outcome) relay line is suppressed within relayRepeatSuppressSecs."""
+        conf.supybot.plugins.SpamGuard.floodEnabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.SpamGuard.relayChannel.get(":" + self.irc.network).setValue("#relay")
+        conf.supybot.plugins.SpamGuard.relayRepeatSuppressSecs.setValue(300)
+        nick, ident, host = "aop", "~olmec", "203.0.113.30__no_testcap__"
+        prefix = f"{nick}!{ident}@{host}"
+        u = ircdb.users.newUser()
+        u.name = "a-known-bot"
+        u.addHostmask(prefix)
+        ircdb.users.setUser(u)
+
+        limit = conf.supybot.plugins.SpamGuard.floodMessageLimit()
+        for _burst in range(2):
+            for i in range(limit):
+                self.irc.feedMsg(ircmsgs.privmsg(
+                    self.channel, f"burst message {i}", prefix=prefix,
+                ))
+
+        exempt_records = [r for r in self._log_records() if r["outcome"] == "exempt"]
+        self.assertEqual(len(exempt_records), 2, "both flood triggers must still be LOGGED")
+
+        relayed = [m for m in self._queued()
+                   if m.command == "PRIVMSG" and m.args[0] == "#relay"
+                   and "exempt" in m.args[1]]
+        self.assertEqual(len(relayed), 1, "the second identical exempt match must be suppressed")
+
+    def test_relay_repeat_suppress_disabled_relays_every_time(self):
+        """relayRepeatSuppressSecs=0 is the escape hatch back to the
+        pre-2026-09-02 behavior: relay every match, no throttling."""
+        conf.supybot.plugins.SpamGuard.floodEnabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.SpamGuard.relayChannel.get(":" + self.irc.network).setValue("#relay")
+        conf.supybot.plugins.SpamGuard.relayRepeatSuppressSecs.setValue(0)
+        nick, ident, host = "aop", "~olmec", "203.0.113.31__no_testcap__"
+        prefix = f"{nick}!{ident}@{host}"
+        u = ircdb.users.newUser()
+        u.name = "a-known-bot-2"
+        u.addHostmask(prefix)
+        ircdb.users.setUser(u)
+
+        limit = conf.supybot.plugins.SpamGuard.floodMessageLimit()
+        for _burst in range(2):
+            for i in range(limit):
+                self.irc.feedMsg(ircmsgs.privmsg(
+                    self.channel, f"burst message {i}", prefix=prefix,
+                ))
+
+        relayed = [m for m in self._queued()
+                   if m.command == "PRIVMSG" and m.args[0] == "#relay"
+                   and "exempt" in m.args[1]]
+        self.assertEqual(len(relayed), 2)
+
     def test_hilight_enforces_on_mass_nick_highlight(self):
         conf.supybot.plugins.SpamGuard.hilightEnabled.get(self.channel).setValue(True)
         conf.supybot.plugins.SpamGuard.protection.killSwitch.setValue(False)

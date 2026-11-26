@@ -1,5 +1,5 @@
 """The only module in this project allowed to construct a real KICK, BAN,
-or UNBAN message. Every other module -- including plugin.py's entire
+MODE, or UNBAN message. Every other module -- including plugin.py's entire
 decision pipeline (classifier, Ollama, evidence gate) -- only ever
 computes a *decision*; this module is where that decision, if it clears
 `is_opped()` and the kill switch, becomes a real IRC action.
@@ -7,7 +7,20 @@ computes a *decision*; this module is where that decision, if it clears
 Kept deliberately small and separate so the one place the project's
 long-standing "zero moderation capability" invariant is lifted stays easy
 to audit in isolation: `grep -rEn "ircmsgs\\.(kick|ban|mode)\\(" plugins/Shild/`
-is expected to return exactly the lines in this file, nowhere else.
+is expected to return exactly the lines in this file, nowhere else. Note
+this is why enforce_silence/lift_silence below use `ircmsgs.mode(...)`
+(singular) rather than `ircmsgs.modes(...)` (plural) -- the plural form's
+call site (`ircmsgs.modes(`) would silently NOT match that grep pattern,
+which only anticipates `mode(`, undermining the one thing this invariant
+exists to make auditable.
+
+2026-09-04: gained `enforce_silence`/`lift_silence` for `warn`-tier
+decisions (see plugin.py's `_maybe_silence`) -- a real but deliberately
+LESSER action than `enforce_ban`'s kick+ban: a channel quiet (+q, where
+the network's ircd supports it) or a plain ban with NO kick (the
+fallback where it doesn't), never a removal. See plugins/Shild/silence.py
+for the full design and plugin.py's `protection.warnSilenceEnabled` for
+the arm switch.
 
 This module never decides *whether* to act -- that gating (op status,
 the global kill switch, which fused actions warrant enforcement) lives in
@@ -72,3 +85,26 @@ def unban(irc, channel: str, mask: str) -> None:
     callback (plugin.py) once `protection.banDurationSecs` has elapsed.
     """
     irc.queueMsg(ircmsgs.unban(channel, mask))
+
+
+def enforce_silence(irc, channel: str, host: str, mode_char: str) -> str:
+    """Queues a real MODE +<mode_char> against host's ban mask in
+    channel -- deliberately NEVER a kick, unlike enforce_ban above.
+    `mode_char` is "q" (quiet -- silences an already-present user without
+    removing them, on an ircd that supports the list mode, e.g. Libera's
+    solanum) or "b" (a plain ban -- does NOT silence an already-present
+    user, only blocks a future (re)join, on an ircd with no quiet mode,
+    e.g. Undernet's ircu) -- the caller (plugin.py's `_maybe_silence`)
+    decides which based on `silence.quietCapable` for that network.
+    Returns the mask used, so the caller can schedule the matching
+    auto-lift and match a `verify` command against it.
+    """
+    mask = ban_mask(host)
+    irc.queueMsg(ircmsgs.mode(channel, (f"+{mode_char}", mask)))
+    return mask
+
+
+def lift_silence(irc, channel: str, mask: str, mode_char: str) -> None:
+    """Removes a previously-set silence mode. Called by the scheduled
+    auto-lift callback, or a successful `verify` (plugin.py)."""
+    irc.queueMsg(ircmsgs.mode(channel, (f"-{mode_char}", mask)))

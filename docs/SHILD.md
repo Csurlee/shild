@@ -235,6 +235,22 @@ takes no arguments
 
 Lists every host on the ignore list.
 
+### `verify <code>`
+
+```
+<code>
+```
+
+Redeems a warn-tier silence verification code (2026-09-04) — a real `warn` verdict, when
+`protection.warnSilenceEnabled` is armed, quiets (`+q`, where the network's ircd supports it) or
+bans without kicking (the fallback where it doesn't — see `silence.quietCapable`) the joining host,
+and NOTICEs them a one-time code. `verify <code>`, sent as a **private message** (never usable
+in-channel — it would just leak that a code exists to onlookers), lifts the restriction immediately
+if the code matches AND the sender's current host matches the silenced one. No capability
+requirement — anyone might legitimately have received a code. If nobody ever verifies, the
+restriction still auto-lifts after `silence.durationSecs` (default 24h) regardless — see
+"Warn-tier silence" below.
+
 ## Configuration
 
 ### Top level
@@ -245,7 +261,8 @@ Lists every host on the ignore list.
 | `plugins.Shild.messageAnalysis` | channel | Boolean | `False` | Whether channel *messages* are analyzed, on top of joins (which are always analyzed once `enabled` is on). Off by default — message volume is what floods the Ollama worker queue. |
 | `plugins.Shild.relayChannel` | network | String | `""` | Channel to relay "would have acted" shadow decisions to. Must never be the monitored channel itself. |
 | `plugins.Shild.shadowDataPath` | global | String | `data/shadow_decisions.jsonl` | Path to the shadow-mode decision JSONL log. |
-| `plugins.Shild.enforcementLogPath` | global | String | `data/enforcement_actions.jsonl` | Path to the JSONL log of real enforcement actions Shild itself took. |
+| `plugins.Shild.enforcementLogPath` | global | String | `data/enforcement_actions.jsonl` | Path to the JSONL log of real kick+ban actions Shild itself took. |
+| `plugins.Shild.silenceLogPath` | global | String | `data/silence_actions.jsonl` | Path to the JSONL log of real warn-tier silence actions (quiet/no-kick ban) Shild itself took — see "Warn-tier silence" below. |
 | `plugins.Shild.moderationLogPath` | global | String | `data/observed_moderation.jsonl` | Path to the observed-moderation log: kicks/bans taken by **others** in enabled channels. |
 | `plugins.Shild.secretsPath` | global | String | `secrets.json` | Path to the gitignored API-key file (AbuseIPDB/IPQS/Scamalytics). `SHILD_*` env vars take precedence. |
 | `plugins.Shild.budgetPath` | global | String | `budget.json` | Path to persisted daily/lifetime lookup-budget counters. |
@@ -467,15 +484,39 @@ lookup just finds nothing, same as before this feature existed.
 |---|---|---|---|
 | `plugins.Shild.protection.killSwitch` | Boolean | `True` (safe) | Global override: while `True`, Shild never takes a real enforcement action anywhere, regardless of op status. Shadow logging/relay is unaffected either way. |
 | `plugins.Shild.protection.banDurationSecs` | Positive integer | `3600` (60 min) | How long a real ban lasts before automatic unban. |
+| `plugins.Shild.protection.warnSilenceEnabled` | Boolean | `False` (safe) | 2026-09-04: separate arm switch turning a `warn` verdict into a real but LESSER action (quiet, or a ban with no kick) — see "Warn-tier silence" below. Independent of `killSwitch` above. |
+
+### Warn-tier silence (`silence.*`)
+
+Added 2026-09-04, motivated by a real complaint: a registered/SpamGuard-exempt user (`aop`)
+flooding a channel it was allowed to be in, where a `warn`-tier read had no real lever at all.
+Armed via `protection.warnSilenceEnabled` (default `False`) AND real op in the channel — there is
+no X-routed fallback for this yet (UndernetX's own X machinery only covers ban/kick, not arbitrary
+modes). Never a kick, always reversible: a channel quiet (`+q`) on a network whose ircd supports
+the quiet list mode, or a plain `+b` ban with **no kick** as the fallback where it doesn't (e.g.
+Undernet's ircu) — the ban-only fallback does **not** immediately silence an already-present
+talking user (a ban only blocks a future (re)join), a known, accepted asymmetry versus `+q`, not a
+bug. A silenced user is NOTICEd a one-time code and told to `verify <code>` (see above) — no web
+CAPTCHA (deliberately ruled out for this project already, see `CLAUDE.md`'s 2026-08-22
+BlackTools/Armour section). If nobody ever verifies, the restriction auto-lifts on its own after
+`silence.durationSecs`. Lifting needs op too: without it, `verify` says so and the periodic sweep
+keeps the record and retries later.
+
+| Value | Scope | Type | Default | Description |
+|---|---|---|---|---|
+| `plugins.Shild.silence.quietCapable` | network | Boolean | `False` | Whether this network's ircd supports the `+q` quiet list mode. `False` (the fail-safe default) falls back to a no-kick ban instead. Not yet live-verified on either of this project's own networks — confirm before relying on it. |
+| `plugins.Shild.silence.durationSecs` | global | Positive integer | `86400` (24h) | How long a real silence lasts before automatic lift if never verified. |
+| `plugins.Shild.silence.storePath` | global | String | `shild_silences.json` | Path to the persisted state for currently-active silences (host, mask, mode, verify code, expiry). |
+| `plugins.Shild.silence.checkIntervalSecs` | global | Positive integer | `300` | How often the periodic sweep checks for expired silences to lift. |
 
 ## When changes take effect
 
 | Live (re-read per event) | Needs `@reload Shild` | Needs a full restart |
 |---|---|---|
 | `thresholds.*` (incl. `classifierBanSecondaryFloor`) | `evidence.abuseipdbThreshold` / `ipqsThreshold` / `scamalyticsThreshold` / `requireHardEvidenceForBan` / `scamalyticsExtreme` / `abuseipdbExtreme` / `ipqsExtreme` / `enableSecondaryBanEscalation` | Never for config values — but the `shildml/fusion.py` + `shildml/evidence.py` code behind the two new `evidence.*Extreme`/`enableSecondaryBanEscalation`-gated escalation sub-rules (2026-08-14) needs a full restart to load at all, same as any other `shildml/` change |
-| `protection.*` | `dnsbl.timeout`, `dnsbl.staggerMs`, `dnsbl.cacheTtl`, `ipapi.*`, `abuseipdb.*`, `ipqs.*`, `scamalytics.*`, `proxyscan.*`, `geoip.*`, `blocklist.*` | |
+| `protection.*` (incl. `warnSilenceEnabled`), `silence.quietCapable`, `silence.durationSecs` | `dnsbl.timeout`, `dnsbl.staggerMs`, `dnsbl.cacheTtl`, `ipapi.*`, `abuseipdb.*`, `ipqs.*`, `scamalytics.*`, `proxyscan.*`, `geoip.*`, `blocklist.*` | |
 | `ollama.*` | `classifier.*`, `worker.*` | |
-| `evidence.enabled`, `dnsbl.ircblEnabled` | all `*Path` values, `report.checkIntervalSecs` | |
+| `evidence.enabled`, `dnsbl.ircblEnabled` | all `*Path` values (incl. `silence.storePath`), `report.checkIntervalSecs`, `silence.checkIntervalSecs` | |
 | `enabled`, `messageAnalysis`, `relayChannel`, `ignoreList`, `report.dir`, `report.announce`, `decisionCache.enabled` | `decisionCache.ttlSecs` | |
 
 A code change to `shildml/` itself (the pure ML package) always needs a full bot restart — `@reload
@@ -488,6 +529,8 @@ history behind that rule.
 |---|---|
 | `data/shadow_decisions.jsonl` | Every decision, unconditional (`fused_raw` + `fused` + `gate` + full `evidence`). |
 | `data/enforcement_actions.jsonl` | Real kick+ban actions Shild itself took. Each record's `via` field (2026-08-16) is `"native"` (real op, MODE+KICK) or `"x"` (routed through UndernetX — see `docs/UNDERNETX.md`). |
+| `data/silence_actions.jsonl` | Real warn-tier silence actions (quiet or no-kick ban, 2026-09-04) Shild itself took — see "Warn-tier silence" above. |
+| `shild_silences.json` | Persisted state for currently-active warn-tier silences (host, mask, mode, verify code, expiry) — see "Warn-tier silence" above. |
 | `data/observed_moderation.jsonl` | Kicks/bans observed from **other** ops/bots — free ground truth. |
 | `secrets.json` | `abuseipdb_key`, `ipqs_key`, `scamalytics_username`/`_key` (+ optional `_username2`/`_key2`). |
 | `budget.json` | Persisted daily/lifetime lookup-quota counters. |

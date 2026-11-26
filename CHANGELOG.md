@@ -1,3 +1,10 @@
+## 1.14
+
+- Warn-tier silence (`protection.warnSilenceEnabled`, off by default): a `warn` verdict can quiet a
+  user, or ban without kicking, with a `verify <code>` way out and automatic expiry. A silence is
+  only lifted while the bot holds op.
+- SpamGuard: repeated "not acted on" relay lines are throttled (`relayRepeatSuppressSecs`).
+
 ## 1.13
 
 Initial public release.

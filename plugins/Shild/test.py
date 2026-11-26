@@ -57,7 +57,9 @@ class ShildTestCase(ChannelPluginTestCase):
         self._data_path = str(Path(self._tmpdir) / "shadow.jsonl")
         self._moderation_path = str(Path(self._tmpdir) / "observed_moderation.jsonl")
         self._enforcement_path = str(Path(self._tmpdir) / "enforcement.jsonl")
+        self._silence_log_path = str(Path(self._tmpdir) / "silence_actions.jsonl")
         self._ban_ids_path = str(Path(self._tmpdir) / "ban_ids.json")
+        self._silence_store_path = str(Path(self._tmpdir) / "silences.json")
         self._report_dir = Path(self._tmpdir) / "daily_analysis"
         _write_dummy_model(self._model_path, bias_toward="ban")
 
@@ -66,6 +68,13 @@ class ShildTestCase(ChannelPluginTestCase):
         conf.supybot.plugins.Shild.moderationLogPath.setValue(self._moderation_path)
         conf.supybot.plugins.Shild.enforcementLogPath.setValue(self._enforcement_path)
         conf.supybot.plugins.Shild.banIdsPath.setValue(self._ban_ids_path)
+        conf.supybot.plugins.Shild.silence.storePath.setValue(self._silence_store_path)
+        # warnSilenceEnabled/quietCapable (2026-09-04) are globals/network
+        # values a handful of tests below set directly -- same cross-test
+        # state-leak discipline as ignoreList/decisionCache/relayChannel
+        # above: reset here so one test's tweak never leaks into another.
+        conf.supybot.plugins.Shild.protection.warnSilenceEnabled.setValue(False)
+        conf.supybot.plugins.Shild.silence.quietCapable.get(":test").setValue(False)
         conf.supybot.plugins.Shild.report.dir.setValue(str(self._report_dir))
         conf.supybot.plugins.Shild.thresholds.classifierAct.setValue(0.5)
         # ignoreList is a global value individual tests below set directly
@@ -491,6 +500,222 @@ class ShildTestCase(ChannelPluginTestCase):
         kicks = [m for m in self._queued() if m.command == "KICK"]
         self.assertEqual(kicks, [], "warn verdicts must never trigger real enforcement")
         self.assertFalse(Path(self._enforcement_path).exists())
+
+    # ---- warn-tier silence (2026-09-04) ----
+
+    def test_warn_silence_disarmed_by_default_takes_no_action(self):
+        _write_dummy_model(self._model_path, bias_toward="warn")
+        self.irc.getCallback("Shild")._classifier.reload_if_needed()
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+        # warnSilenceEnabled left at its default (False) deliberately.
+        self._grant_op(self.channel)
+
+        self.irc.feedMsg(self._make_join("noaction", "~n", "203.0.113.20", self.channel))
+
+        modes = [m for m in self._queued() if m.command == "MODE"]
+        self.assertEqual(modes, [], "warn-tier silence must ship disarmed")
+
+    def test_warn_silence_quiets_when_armed_opped_and_quiet_capable(self):
+        _write_dummy_model(self._model_path, bias_toward="warn")
+        self.irc.getCallback("Shild")._classifier.reload_if_needed()
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+        conf.supybot.plugins.Shild.protection.warnSilenceEnabled.setValue(True)
+        conf.supybot.plugins.Shild.silence.quietCapable.get(":test").setValue(True)
+        self._grant_op(self.channel)
+
+        self.irc.feedMsg(self._make_join("aop", "~olmec", "203.0.113.21", self.channel))
+
+        modes = [m for m in self._queued() if m.command == "MODE"]
+        self.assertEqual(len(modes), 1, "expected exactly one real MODE")
+        self.assertEqual(modes[0].args[1], "+q")
+        self.assertEqual(modes[0].args[2], "*!*@203.0.113.21")
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        self.assertEqual(kicks, [], "silence must NEVER kick")
+
+        notices = [m for m in self._queued() if m.command == "NOTICE" and m.args[0] == "aop"]
+        self.assertEqual(len(notices), 1)
+        self.assertIn("verify ", notices[0].args[1])
+
+        record = self.irc.getCallback("Shild")._silences.get("test", self.channel, "203.0.113.21")
+        self.assertIsNotNone(record)
+        self.assertEqual(record.mode_char, "q")
+
+    def test_warn_silence_falls_back_to_ban_without_kick_when_not_quiet_capable(self):
+        _write_dummy_model(self._model_path, bias_toward="warn")
+        self.irc.getCallback("Shild")._classifier.reload_if_needed()
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+        conf.supybot.plugins.Shild.protection.warnSilenceEnabled.setValue(True)
+        # quietCapable left at its default (False) -- e.g. Undernet's ircu.
+        self._grant_op(self.channel)
+
+        self.irc.feedMsg(self._make_join("nomute", "~n", "203.0.113.22", self.channel))
+
+        modes = [m for m in self._queued() if m.command == "MODE"]
+        self.assertEqual(len(modes), 1)
+        self.assertEqual(modes[0].args[1], "+b")
+        kicks = [m for m in self._queued() if m.command == "KICK"]
+        self.assertEqual(kicks, [], "the ircu fallback must still never kick")
+
+    def test_warn_silence_not_opped_does_nothing(self):
+        _write_dummy_model(self._model_path, bias_toward="warn")
+        self.irc.getCallback("Shild")._classifier.reload_if_needed()
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+        conf.supybot.plugins.Shild.protection.warnSilenceEnabled.setValue(True)
+        # Deliberately NOT granting op.
+
+        self.irc.feedMsg(self._make_join("unmoderated", "~u", "203.0.113.23", self.channel))
+
+        self.assertEqual([m for m in self._queued() if m.command == "MODE"], [])
+
+    def test_warn_silence_does_not_reset_on_repeat_warn(self):
+        _write_dummy_model(self._model_path, bias_toward="warn")
+        self.irc.getCallback("Shild")._classifier.reload_if_needed()
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+        conf.supybot.plugins.Shild.protection.warnSilenceEnabled.setValue(True)
+        conf.supybot.plugins.Shild.silence.quietCapable.get(":test").setValue(True)
+        conf.supybot.plugins.Shild.decisionCache.enabled.setValue(False)
+        self._grant_op(self.channel)
+
+        self.irc.feedMsg(self._make_join("repeat", "~r", "203.0.113.24", self.channel))
+        self.irc.feedMsg(self._make_join("repeat", "~r", "203.0.113.24", self.channel))
+
+        modes = [m for m in self._queued() if m.command == "MODE"]
+        self.assertEqual(len(modes), 1, "a repeat warn for an already-silenced host must not "
+                                         "re-fire or reset the verify code")
+
+    def test_verify_correct_code_lifts_the_silence(self):
+        _write_dummy_model(self._model_path, bias_toward="warn")
+        self.irc.getCallback("Shild")._classifier.reload_if_needed()
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+        conf.supybot.plugins.Shild.protection.warnSilenceEnabled.setValue(True)
+        conf.supybot.plugins.Shild.silence.quietCapable.get(":test").setValue(True)
+        self._grant_op(self.channel)
+
+        self.irc.feedMsg(self._make_join("aop", "~olmec", "203.0.113.25", self.channel))
+        cb = self.irc.getCallback("Shild")
+        record = cb._silences.get("test", self.channel, "203.0.113.25")
+        self.assertIsNotNone(record)
+
+        sent = self._pm_verify(record.code, "aop!~olmec@203.0.113.25")
+        self.assertIn("Verified", self._replies(sent))
+
+        unmutes = [m for m in sent if m.command == "MODE" and m.args[1] == "-q"]
+        self.assertEqual(len(unmutes), 1)
+        self.assertIsNone(cb._silences.get("test", self.channel, "203.0.113.25"))
+
+    def _pm_verify(self, code, frm):
+        """Sends `verify <code>` by PM and returns everything the bot queued
+        in response. Clears the queue first: _queued() only peeks, so the
+        earlier silence's own MODE/NOTICE would otherwise still be there.
+        """
+        from supybot import ircmsgs
+        self.irc.queue.reset()
+        self.irc.feedMsg(ircmsgs.privmsg(self.irc.nick, f"verify {code}", prefix=frm))
+        return self._queued()
+
+    def _replies(self, queued):
+        return " ".join(m.args[1] for m in queued if m.command in ("PRIVMSG", "NOTICE"))
+
+    def _silence_then_deop(self, host):
+        _write_dummy_model(self._model_path, bias_toward="warn")
+        self.irc.getCallback("Shild")._classifier.reload_if_needed()
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+        conf.supybot.plugins.Shild.protection.warnSilenceEnabled.setValue(True)
+        conf.supybot.plugins.Shild.silence.quietCapable.get(":test").setValue(True)
+        self._grant_op(self.channel)
+
+        self.irc.feedMsg(self._make_join("aop", "~olmec", host, self.channel))
+        cb = self.irc.getCallback("Shild")
+        record = cb._silences.get("test", self.channel, host)
+        self.assertIsNotNone(record)
+        self.irc.queue.reset()
+        self.irc.state.channels[self.channel].ops.discard(self.irc.nick)
+        return cb, record
+
+    def test_verify_without_op_keeps_the_record(self):
+        cb, record = self._silence_then_deop("203.0.113.29")
+
+        sent = self._pm_verify(record.code, "aop!~olmec@203.0.113.29")
+        self.assertIn("don't currently have op", self._replies(sent))
+        self.assertEqual([m for m in sent if m.command == "MODE"], [])
+        self.assertIsNotNone(cb._silences.get("test", self.channel, "203.0.113.29"))
+
+    def test_expiry_sweep_waits_for_op_before_lifting(self):
+        cb, record = self._silence_then_deop("203.0.113.30")
+        record.expires_at = 0.0
+
+        cb._sweep_expired_silences()
+        self.assertEqual([m for m in self._queued() if m.command == "MODE"], [])
+        self.assertIsNotNone(cb._silences.get("test", self.channel, "203.0.113.30"))
+
+        self._grant_op(self.channel)
+        self.irc.queue.reset()
+        cb._sweep_expired_silences()
+        unmutes = [m for m in self._queued() if m.command == "MODE" and m.args[1] == "-q"]
+        self.assertEqual(len(unmutes), 1)
+        self.assertIsNone(cb._silences.get("test", self.channel, "203.0.113.30"))
+
+    def test_verify_wrong_code_does_not_lift_anything(self):
+        _write_dummy_model(self._model_path, bias_toward="warn")
+        self.irc.getCallback("Shild")._classifier.reload_if_needed()
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+        conf.supybot.plugins.Shild.protection.warnSilenceEnabled.setValue(True)
+        conf.supybot.plugins.Shild.silence.quietCapable.get(":test").setValue(True)
+        self._grant_op(self.channel)
+
+        self.irc.feedMsg(self._make_join("aop", "~olmec", "203.0.113.26", self.channel))
+        cb = self.irc.getCallback("Shild")
+        self.assertIsNotNone(cb._silences.get("test", self.channel, "203.0.113.26"))
+
+        sent = self._pm_verify("WRONG1", "aop!~olmec@203.0.113.26")
+        self.assertIn("No matching", self._replies(sent))
+        self.assertIsNotNone(cb._silences.get("test", self.channel, "203.0.113.26"))
+
+    def test_verify_correct_code_wrong_host_does_not_lift(self):
+        _write_dummy_model(self._model_path, bias_toward="warn")
+        self.irc.getCallback("Shild")._classifier.reload_if_needed()
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+        conf.supybot.plugins.Shild.protection.warnSilenceEnabled.setValue(True)
+        conf.supybot.plugins.Shild.silence.quietCapable.get(":test").setValue(True)
+        self._grant_op(self.channel)
+
+        self.irc.feedMsg(self._make_join("aop", "~olmec", "203.0.113.27", self.channel))
+        cb = self.irc.getCallback("Shild")
+        record = cb._silences.get("test", self.channel, "203.0.113.27")
+        self.assertIsNotNone(record)
+
+        # Same code, but from a DIFFERENT host -- must not be accepted.
+        sent = self._pm_verify(record.code, "impostor!~i@203.0.113.99")
+        self.assertIn("No matching", self._replies(sent))
+        self.assertIsNotNone(cb._silences.get("test", self.channel, "203.0.113.27"))
+
+    def test_verify_must_be_sent_privately(self):
+        _write_dummy_model(self._model_path, bias_toward="warn")
+        self.irc.getCallback("Shild")._classifier.reload_if_needed()
+        conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)
+        conf.supybot.plugins.Shild.evidence.enabled.setValue(False)
+        conf.supybot.plugins.Shild.protection.warnSilenceEnabled.setValue(True)
+        conf.supybot.plugins.Shild.silence.quietCapable.get(":test").setValue(True)
+        self._grant_op(self.channel)
+
+        self.irc.feedMsg(self._make_join("aop", "~olmec", "203.0.113.28", self.channel))
+        cb = self.irc.getCallback("Shild")
+        record = cb._silences.get("test", self.channel, "203.0.113.28")
+        self.assertIsNotNone(record)
+
+        self.irc.queue.reset()
+        m = self.getMsg(f"verify {record.code}", frm="aop!~olmec@203.0.113.28")
+        self.assertIn("Error", m.args[1])
+        self.assertIsNotNone(cb._silences.get("test", self.channel, "203.0.113.28"))
 
     # ---- decision cache (2026-08-16): repeat joins from the same host ----
 
@@ -1286,6 +1511,10 @@ class ShildXFallbackTestCase(ChannelPluginTestCase):
         conf.supybot.plugins.Shild.classifier.modelPath.setValue(self._model_path)
         conf.supybot.plugins.Shild.shadowDataPath.setValue(self._data_path)
         conf.supybot.plugins.Shild.enforcementLogPath.setValue(self._enforcement_path)
+        conf.supybot.plugins.Shild.silenceLogPath.setValue(
+            str(Path(self._tmpdir) / "silence_actions.jsonl"))
+        conf.supybot.plugins.Shild.silence.storePath.setValue(
+            str(Path(self._tmpdir) / "silences.json"))
         conf.supybot.plugins.Shild.banIdsPath.setValue(self._ban_ids_path)
         conf.supybot.plugins.Shild.thresholds.classifierAct.setValue(0.5)
         conf.supybot.plugins.Shild.enabled.get(self.channel).setValue(True)

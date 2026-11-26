@@ -95,6 +95,17 @@ CATALOG: dict[str, list] = {
         Ask("protection.killSwitch", tier="plugin", kind="bool", default=True,
             question="Keep the enforcement kill switch ON (safe, shadow-mode only, no real kicks/bans)?"),
         Skip("protection.banDurationSecs", "internal tuning, change later via @config if needed"),
+        Ask("protection.warnSilenceEnabled", tier="advanced", kind="bool", default=False,
+            question="Also arm warn-tier silencing (a channel quiet, or a ban with NO "
+                     "kick where the network has no quiet mode) for `warn` verdicts? "
+                     "Real enforcement, independent of the kill switch above -- "
+                     "recommended to leave off until confirmed working on your network."),
+        Skip("silence.quietCapable", "per-network ircd capability, not yet live-verified on "
+                                      "either of this project's own networks; set live via "
+                                      "@config network <network> once confirmed"),
+        Skip("silence.durationSecs", "internal tuning, change later via @config if needed"),
+        Skip("silence.storePath", "derived path: runtime/shild_silences.json"),
+        Skip("silence.checkIntervalSecs", "internal tuning"),
         Ask("ollama.enabled", tier="advanced", kind="bool", default=True,
             question="Enable the local Ollama LLM second-opinion? (Needs a running Ollama server; off is fine, the classifier+evidence pipeline works without it.)"),
         Skip("ollama.url", "only relevant if ollama.enabled above is turned on; edit via @config"),
@@ -137,6 +148,7 @@ CATALOG: dict[str, list] = {
         Skip("report.checkIntervalSecs", "internal tuning"),
         Skip("shadowDataPath", "derived: data/shadow_decisions.jsonl"),
         Skip("enforcementLogPath", "derived path"),
+        Skip("silenceLogPath", "derived path"),
         Skip("moderationLogPath", "derived path"),
         Skip("budgetPath", "derived path"),
         Skip("banIdsPath", "derived path"),
@@ -240,6 +252,7 @@ CATALOG: dict[str, list] = {
         Skip("cloneScanMaxClones", "internal tuning"),
         Skip("cloneScanIntervalSecs", "internal tuning"),
         Skip("cloneScanRepeatSuppressSecs", "internal tuning"),
+        Skip("relayRepeatSuppressSecs", "internal tuning"),
         Skip("words", "legacy migration-only field, superseded by the `spamguard word add` command"),
         Skip("phrases", "legacy migration-only field"),
         Skip("patterns", "legacy migration-only field"),

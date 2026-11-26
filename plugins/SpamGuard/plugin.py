@@ -261,6 +261,13 @@ class SpamGuard(callbacks.Plugin):
         # _scan_clones's own docstring for why. The on-demand
         # spamguardclonescan command always ignores this.
         self._clone_scan_seen: dict[tuple[str, str, str], float] = {}
+        # (network, channel, host, field, outcome) -> last time a
+        # not-acted-on match relayed to ##relay for this exact
+        # combination (2026-09-02). Mirrors _clone_scan_seen's own
+        # unbounded-but-small, never-explicitly-pruned, cleared-on-
+        # @reload precedent -- see _relay_throttled's docstring for why
+        # this exists at all.
+        self._no_action_relay_seen: dict[tuple[str, str, str, str, str], float] = {}
         self._stats = {"messages": 0, "matches": 0, "enforced": 0}
         self._pending_unbans: dict[str, None] = {}
 
@@ -433,6 +440,39 @@ class SpamGuard(callbacks.Plugin):
             self._queue_wrapped(irc, relay_chan, text)
         except Exception:
             log.exception("SpamGuard: failed to relay match notice")
+
+    def _relay_throttled(self, irc, *, network: str, channel: str, host: str,
+                          field: str, outcome: str, text: str) -> None:
+        """Same as _relay, but for a NOT-acted-on outcome (exempt,
+        outside-window, killswitch, not-opped) that repeats for the same
+        (network, channel, host, field, outcome) within
+        relayRepeatSuppressSecs, skip the LIVE notice -- JSONL logging
+        (via _log, called separately by every caller) stays unconditional
+        either way, this only throttles the ##relay spam.
+
+        2026-09-02: a real, tolerated, registered-account bot (exempt via
+        exemptRegistered) flooding a channel it's allowed to flood in
+        re-triggered SpamGuard's `flood` heuristic every ~8-40s
+        (floodEnabled resets its own tracked window on every trigger, see
+        _check_heuristics), producing a fresh "exempt -- not acted on"
+        relay line to ##relay every single time, forever, for as long as
+        it kept talking -- same class of noise cloneScanRepeatSuppressSecs
+        already exists to prevent for the periodic clone-scan, just never
+        applied to the live match path. relayRepeatSuppressSecs=0
+        disables this entirely (relay every time, the pre-2026-09-02
+        behavior) since a genuinely new exempt/not-opped/killswitch case
+        for a DIFFERENT (host, field, outcome) combination always relays
+        immediately regardless -- only an exact repeat is throttled.
+        """
+        suppress = self.registryValue("relayRepeatSuppressSecs")
+        if suppress > 0:
+            key = (network, channel, host, field, outcome)
+            now = time.time()
+            last = self._no_action_relay_seen.get(key, 0.0)
+            if now - last < suppress:
+                return
+            self._no_action_relay_seen[key] = now
+        self._relay(irc, text)
 
     def _log(self, *, network, channel, nick, ident, host, term, field: str, outcome: str,
              via: str = "native") -> None:
@@ -916,25 +956,34 @@ class SpamGuard(callbacks.Plugin):
             if not within_window:
                 self._log(network=network, channel=channel, nick=nick, ident=ident,
                            host=host, term=term, field=field, outcome="outside-window")
-                self._relay(irc, f"[spamguard] matched {field} '{term.text}' [id:{term.id}] "
-                                  f"from {nick} ({ident}@{host}) in {network}/{channel} but "
-                                  f"outside join window -- not acted on")
+                self._relay_throttled(
+                    irc, network=network, channel=channel, host=host, field=field,
+                    outcome="outside-window",
+                    text=f"[spamguard] matched {field} '{term.text}' [id:{term.id}] "
+                         f"from {nick} ({ident}@{host}) in {network}/{channel} but "
+                         f"outside join window -- not acted on")
                 return
 
         if self._is_exempt(irc, channel, msg):
             self._log(network=network, channel=channel, nick=nick, ident=ident,
                        host=host, term=term, field=field, outcome="exempt")
-            self._relay(irc, f"[spamguard] matched {field} '{term.text}' [id:{term.id}] "
-                              f"from {nick} ({ident}@{host}) in {network}/{channel} but "
-                              f"sender is exempt -- not acted on")
+            self._relay_throttled(
+                irc, network=network, channel=channel, host=host, field=field,
+                outcome="exempt",
+                text=f"[spamguard] matched {field} '{term.text}' [id:{term.id}] "
+                     f"from {nick} ({ident}@{host}) in {network}/{channel} but "
+                     f"sender is exempt -- not acted on")
             return
 
         if self.registryValue("protection.killSwitch"):
             self._log(network=network, channel=channel, nick=nick, ident=ident,
                        host=host, term=term, field=field, outcome="killswitch")
-            self._relay(irc, f"[spamguard] would kban {nick} ({ident}@{host}) in "
-                              f"{network}/{channel} for {field} '{term.text}' [id:{term.id}] "
-                              f"-- killSwitch is on")
+            self._relay_throttled(
+                irc, network=network, channel=channel, host=host, field=field,
+                outcome="killswitch",
+                text=f"[spamguard] would kban {nick} ({ident}@{host}) in "
+                     f"{network}/{channel} for {field} '{term.text}' [id:{term.id}] "
+                     f"-- killSwitch is on")
             return
 
         xcb = None
@@ -962,9 +1011,12 @@ class SpamGuard(callbacks.Plugin):
                             suffix = " (X fallback unavailable)"
                     except Exception:
                         pass
-                self._relay(irc, f"[spamguard] would kban {nick} ({ident}@{host}) in "
-                                  f"{network}/{channel} for {field} '{term.text}' [id:{term.id}] "
-                                  f"-- not opped{suffix}")
+                self._relay_throttled(
+                    irc, network=network, channel=channel, host=host, field=field,
+                    outcome="not-opped",
+                    text=f"[spamguard] would kban {nick} ({ident}@{host}) in "
+                         f"{network}/{channel} for {field} '{term.text}' [id:{term.id}] "
+                         f"-- not opped{suffix}")
                 return
 
         self._enforce(irc, network, channel, nick, ident, host, term, field, xcb=xcb,

@@ -271,6 +271,7 @@ hilight/caps/mojibake/raid/repeatchars/clonescan enable state.
 | `plugins.SpamGuard.exemptRegistered` | global | Boolean | `True` | Whether any ircdb-registered user is exempt from enforcement, on top of the always-exempt voice+/channel-op cases. |
 | `plugins.SpamGuard.logPath` | global | String | `data/spamguard_actions.jsonl` | JSONL log of every match seen, acted on or not. |
 | `plugins.SpamGuard.relayChannel` | network | String | `""` | Channel to relay match notices to. Empty disables relaying (logging still happens). |
+| `plugins.SpamGuard.relayRepeatSuppressSecs` | global | Non-negative integer | `300` | How long an identical not-acted-on match (same network/channel/host/field/outcome, e.g. the same exempt host repeatedly tripping `flood`) is suppressed from generating a fresh relay notice. JSONL logging is never affected — only the live relay line. `0` disables suppression (relay every match, the original behavior). |
 | `plugins.SpamGuard.protection.killSwitch` | global | Boolean | `True` (safe) | While `True`, SpamGuard never takes real action anywhere. Independent of Shild's own kill switch. |
 | `plugins.SpamGuard.protection.banDurationSecs` | global | Positive integer | `3600` | How long a real ban lasts before automatic unban. |
 | `plugins.SpamGuard.protection.kickReason` | global | String | `You are not welcome here!` | Reason text embedded in the kick message (see format below). May contain a literal `{term}` placeholder, substituted with the matched term's text — a value with no placeholder is used as-is. |

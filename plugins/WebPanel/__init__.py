@@ -8,7 +8,7 @@ docstring for the full read/write boundary.
 import supybot
 from supybot import world
 
-__version__ = "1.13"
+__version__ = "1.14"
 __author__ = supybot.authors.unknown
 __contributors__ = {}
 __url__ = "https://github.com/Csurlee/shild"
